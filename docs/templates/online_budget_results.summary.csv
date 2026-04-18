@@ -1,0 +1,11 @@
+recipe,family,prior,budget_class,d_model,n_layers,n_bands,context_frames,layer_cache_fp16_kib,train_wallclock_per_epoch,best_val_loss,best_checkpoint,separation_metric_main,separation_metric_notes,onnx_export_ok,onnx_runtime_latency_ms,streaming_equivalence_ok,notes
+online-hard-band-sfc2d.rt128k.causal32dim.8l.64b,hard,musical,rt128k,32,8,64,16,128.00,,,,,,,,,
+online-hard-band-sfc2d.rt128k.mel.causal32dim.8l.64b,hard,mel,rt128k,32,8,64,16,128.00,,,,,,,,,
+online-hard-band-sfc2d.rt192k.causal48dim.8l.64b,hard,musical,rt192k,48,8,64,16,192.00,,,,,,,,,
+online-hard-band-sfc2d.rt192k.mel.causal48dim.8l.64b,hard,mel,rt192k,48,8,64,16,192.00,,,,,,,,,
+online-sfc2d.rt128k.causal16dim.6l.64b,plain,none,rt128k,16,6,64,14,112.06,,,,,,,,,
+online-sfc2d.rt192k.causal24dim.6l.64b,plain,none,rt192k,24,6,64,14,168.09,,,,,,,,,
+online-soft-band-sfc2d.rt128k.causal16dim.6l.64b,soft,musical,rt128k,16,6,64,14,112.06,,,,,,,,,
+online-soft-band-sfc2d.rt128k.mel.causal16dim.6l.64b,soft,mel,rt128k,16,6,64,14,112.06,,,,,,,,,
+online-soft-band-sfc2d.rt192k.causal24dim.6l.64b,soft,musical,rt192k,24,6,64,14,168.09,,,,,,,,,
+online-soft-band-sfc2d.rt192k.mel.causal24dim.6l.64b,soft,mel,rt192k,24,6,64,14,168.09,,,,,,,,,
