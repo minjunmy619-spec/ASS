@@ -64,7 +64,7 @@ def train(args) -> NoReturn:
         configs['datamodule']['args']['train_dataloader']['num_workers'] = args.batchsize
         if 'val_dataloader' in configs['datamodule']['args']:
             configs['datamodule']['args']['val_dataloader']['batch_size'] = args.batchsize
-        configs['datamodule']['args']['val_dataloader']['num_workers'] = args.batchsize
+            configs['datamodule']['args']['val_dataloader']['num_workers'] = args.batchsize
     
     logger.info('Initialize data module')
     data_module = initialize_config(configs['datamodule'])

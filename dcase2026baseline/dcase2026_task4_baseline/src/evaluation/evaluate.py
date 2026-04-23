@@ -64,7 +64,7 @@ class Evaluator:
         if labels is not None:
             with torch.no_grad():
                 batch_est_labels = labels
-                output = model.separate(mixture, batch_est_labels)
+                output = self.model.separate(mixture, batch_est_labels)
                 batch_est_waveforms = output['waveform'] # [bs, nsources, wlen]
                 output['label'] = labels # bs, nsources
                 output['probabilities'] = torch.ones(batch_est_waveforms.shape[:2], dtype=torch.float32)# bs, nsources

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchlibrosa.stft import STFT, ISTFT
+from torchlibrosa.stft import STFT, ISTFT, magphase
 
 
 def _reshape_label_vector(label_vector, target_sources_num):
@@ -193,3 +193,148 @@ class DeFTTSELike(nn.Module):
         )
         waveform = waveform.view(batch_size, self.target_sources_num, 1, samples)
         return {"waveform": waveform}
+
+
+class DeFTTSELikeSpatial(DeFTTSELike):
+    """Spatial TSE variant with magnitude/phase masks over all mixture channels.
+
+    The original ``DeFTTSELike`` uses multichannel magnitude/intensity features
+    for conditioning, but reconstructs the final waveform from channel 0 only.
+    This variant keeps the same input/output contract while predicting
+    [magnitude, phase_real, phase_imag] masks for every mixture channel and
+    learning a complex multi-channel projection before ISTFT.
+    """
+
+    def __init__(
+        self,
+        input_channels=4,
+        output_channels=1,
+        target_sources_num=3,
+        label_len=54,
+        window_size=1024,
+        hop_size=320,
+        subband=1,
+        base_channels=96,
+        n_blocks=3,
+        n_heads=4,
+    ):
+        super().__init__(
+            input_channels=input_channels,
+            output_channels=output_channels,
+            target_sources_num=target_sources_num,
+            label_len=label_len,
+            window_size=window_size,
+            hop_size=hop_size,
+            subband=subband,
+            base_channels=base_channels,
+            n_blocks=n_blocks,
+            n_heads=n_heads,
+        )
+        self.mask_components = 3
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.GELU(),
+            nn.Conv2d(base_channels, input_channels * self.mask_components, kernel_size=1),
+        )
+        self.out_conv = nn.Conv2d(input_channels, output_channels, kernel_size=1)
+
+    def _stft_features(self, mixture):
+        real, imag = self.stft(mixture.view(-1, mixture.shape[-1]))
+        batch_size, channels = mixture.shape[:2]
+        _, time_steps, freq_bins = real.shape[-3:]
+        real = real.view(batch_size, channels, time_steps, freq_bins)
+        imag = imag.view(batch_size, channels, time_steps, freq_bins)
+
+        mag = torch.sqrt(real.pow(2) + imag.pow(2) + 1e-8)
+        log_mag = torch.log1p(mag)
+
+        w_real = real[:, 0]
+        w_imag = imag[:, 0]
+        denom = mag[:, 0].pow(2) + 1e-8
+        intensity = []
+        for ch in range(1, min(4, channels)):
+            cross = w_real * real[:, ch] + w_imag * imag[:, ch]
+            intensity.append(cross / denom)
+        while len(intensity) < 3:
+            intensity.append(torch.zeros_like(denom))
+        intensity = torch.stack(intensity[:3], dim=1)
+
+        return log_mag, intensity, real, imag
+
+    def _spatial_mask_to_waveform(self, mask_features, real, imag, samples):
+        batch_size = real.shape[0]
+        _, _, time_steps, freq_bins = mask_features.shape
+
+        mask = self.mask_head(mask_features)
+        mask = mask.view(
+            batch_size,
+            self.target_sources_num,
+            self.input_channels,
+            self.mask_components,
+            time_steps,
+            freq_bins,
+        )
+
+        mask_mag = torch.sigmoid(mask[:, :, :, 0])
+        mask_real = torch.tanh(mask[:, :, :, 1])
+        mask_imag = torch.tanh(mask[:, :, :, 2])
+        _, mask_cos, mask_sin = magphase(mask_real, mask_imag)
+
+        mixture_mag, mixture_cos, mixture_sin = magphase(real, imag)
+        out_mag = F.relu(mixture_mag[:, None] * mask_mag)
+        out_cos = mixture_cos[:, None] * mask_cos - mixture_sin[:, None] * mask_sin
+        out_sin = mixture_sin[:, None] * mask_cos + mixture_cos[:, None] * mask_sin
+
+        est_real = out_mag * out_cos
+        est_imag = out_mag * out_sin
+        est_real = est_real.reshape(
+            batch_size * self.target_sources_num,
+            self.input_channels,
+            time_steps,
+            freq_bins,
+        )
+        est_imag = est_imag.reshape(
+            batch_size * self.target_sources_num,
+            self.input_channels,
+            time_steps,
+            freq_bins,
+        )
+
+        est_real = self.out_conv(est_real)
+        est_imag = self.out_conv(est_imag)
+
+        waveform = self.istft(
+            est_real.reshape(
+                batch_size * self.target_sources_num * self.output_channels,
+                1,
+                time_steps,
+                freq_bins,
+            ),
+            est_imag.reshape(
+                batch_size * self.target_sources_num * self.output_channels,
+                1,
+                time_steps,
+                freq_bins,
+            ),
+            samples,
+        )
+        return waveform.view(batch_size, self.target_sources_num, self.output_channels, samples)
+
+    def forward(self, input_dict):
+        mixture = input_dict["mixture"]
+        label_vector = _reshape_label_vector(input_dict["label_vector"], self.target_sources_num)
+        batch_size, _, samples = mixture.shape
+
+        log_mag, intensity, real, imag = self._stft_features(mixture)
+        features = torch.cat([log_mag, intensity], dim=1)
+        x = self.input_proj(features)
+        for block in self.blocks:
+            x = block(x)
+
+        gamma, beta = self.clue_encoder(label_vector)
+        x = x.unsqueeze(1).expand(-1, self.target_sources_num, -1, -1, -1)
+        x = x * (1.0 + gamma) + beta
+        x = x.reshape(batch_size * self.target_sources_num, x.shape[2], x.shape[3], x.shape[4])
+
+        return {"waveform": self._spatial_mask_to_waveform(x, real, imag, samples)}

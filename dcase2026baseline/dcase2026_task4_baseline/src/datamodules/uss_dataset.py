@@ -36,7 +36,7 @@ class USSDataset(torch.utils.data.Dataset):
         length = item["mixture"].shape[-1]
 
         int_events = metadata.get("int_events", metadata.get("interference_events", []))
-        background = metadata.get("background", metadata.get("bg_event", {}))
+        background = metadata.get("bg_events", metadata.get("background", metadata.get("bg_event", {})))
         background_events = [background] if isinstance(background, dict) else background
 
         labels = item["label"]

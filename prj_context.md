@@ -1,6 +1,7 @@
 # Audio source separation model edge device adapte.
+**The ultimate goal is to develop a audio three stems(Speech/Music/Effects) audio source separation model which could be depoyed in edge device(TV) with NPU for realtime usage.**
 
-Following instruction may in English or Chinese.
+Following instructions may in English or Chinese.
 
 **You should first connect to the docker in local host with name "/zealous_agnesi"**.
 
@@ -8,7 +9,37 @@ Following instruction may in English or Chinese.
 
 The directory: "/workdir" contains the tools for export onnx to mlir, which you should use in following steps.
 
-**The ultimate goal is to develop a audio three stems(Speech/Music/Effects) audio source separation model which could be depoyed in edge device(TV) with NPU for realtime usage.**
+The project's structure: /app/:
+```
+ASS         #The root dir for the project, your workspace
+├── .venv           #the virtual enviroment you should use for running/testing
+├── 2602.08671v1.pdf
+├── ASS
+├── ASS.code-workspace
+├── Dolphin      #Dolphin baseline
+├── DolphinSFC   #Dolphin integrate with SFC
+├── DolphinSFCNPU   #Dolphin SFC for NPU
+├── LICENSE
+├── LICENSES
+├── README.md
+├── TF-MLPNet      #TF-MLPNet model variants
+├── TIGER          #TIGER model variants
+├── aiaccel        #acaccel package for integrating torch  lightning training with configuration 
+├── data           #raw data folder
+├── dcase2026baseline               #please ignore this folder
+├── docs
+├── hydra         #hydra package for parse configuration
+├── logs
+├── model_weights
+├── prj_context.md
+├── pyproject.toml
+├── recipes      #recipes folder
+├── requirements.txt
+├── separate_sample.py
+├── spectral_feature_compression  #SFC main folder
+├── tests     #test cases
+└── tools     #kinds of tools
+```
 
 ## Your main tasks are:
 1. First help user find/research latest model structures with sota performance and suitable structure for online edge device deployment(TV).

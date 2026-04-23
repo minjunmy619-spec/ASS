@@ -76,7 +76,7 @@ lightning_module:
     args:
         model:
             module: src.models.deft.deft_tse
-            main: DeFTTSELike
+            main: DeFTTSELikeSpatial
             args:
                 input_channels: 4
                 output_channels: 1

@@ -1,6 +1,6 @@
 ---
-task_name: __
-description: __
+task_name: modified_deft_uss_5s
+description: 5-second on-the-fly USS training config for memory-heavy DeFT models.
 
 deterministic: True
 manual_seed: 0
@@ -10,8 +10,8 @@ datamodule:
     main: DataModule
     args:
         train_dataloader:
-            batch_size: 4
-            num_workers: 4
+            batch_size: 2
+            num_workers: 2
             persistent_workers: false
             dataset:
                 module: src.datamodules.uss_dataset
@@ -22,10 +22,10 @@ datamodule:
                             config:
                                 mode: generate
                                 spatial_sound_scene:
-                                    duration: 10.0
+                                    duration: 5.0
                                     sr: 32000
                                     max_event_overlap: 3
-                                    max_event_dur: 10.0
+                                    max_event_dur: 5.0
                                     ref_db: -55
                                     foreground_dir: data/dev_set/sound_event/train
                                     background_dir: data/dev_set/noise/train
@@ -61,7 +61,7 @@ lightning_module:
     args:
         model:
             module: src.models.deft.modified_deft
-            main: ModifiedDeFTUSSSpatial
+            main: ChunkedModifiedDeFTUSSSpatial
             args:
                 input_channels: 4
                 output_channels: 1
@@ -71,6 +71,11 @@ lightning_module:
                 n_foreground: 3
                 n_interference: 2
                 n_classes: 18
+                window_size: 1024
+                hop_size: 320
+                sample_rate: 32000
+                inference_chunk_seconds: 6.0
+                inference_chunk_hop_seconds: 5.0
         loss:
             module: src.training.loss.uss_loss
             main: get_loss_func
@@ -95,13 +100,13 @@ train:
             devices: auto
             strategy: ddp_find_unused_parameters_true
             num_nodes: 1
-            precision: 32-true
+            precision: bf16-mixed
             logger: null
             fast_dev_run: False
             max_epochs: 100
             log_every_n_steps: 100
             use_distributed_sampler: True
-            sync_batchnorm: False #True
+            sync_batchnorm: False
             num_sanity_val_steps: 0
             enable_checkpointing: True
             enable_progress_bar: True

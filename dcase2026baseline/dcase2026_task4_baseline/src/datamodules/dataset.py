@@ -129,22 +129,18 @@ class DatasetS3(torch.utils.data.Dataset):
             raise FileNotFoundError(f"Source directory '{source_dir}' does not exist.")
         all_wav = [f for f in os.listdir(source_dir) if f.endswith(".wav")]
         for d in data:
-            sources = sorted([w for w in all_wav if w.startswith(d['soundscape'])])
+            pattern = rf"^{re.escape(d['soundscape'])}(?:_(\d+))?_(.+)\.wav$" # d['soundscape']_number_label.wav     or    d['soundscape']_label.wav
+            matched_sources = []
+            for source in all_wav:
+                match = re.match(pattern, source)
+                if match:
+                    matched_sources.append((source, match.group(2)))
+            sources = sorted(matched_sources, key=lambda x: x[0])
             # if not sources: warnings.warn(f'No estimate for {d["mixture_path"]}')
 
             d[est_ref + '_label'] = []
             d[est_ref + '_source_paths'] = []
-            for source in sources:
-                # pattern = rf"^{re.escape(d['soundscape'])}_(\d+)_(.+)\.wav$"
-                pattern = rf"^{re.escape(d['soundscape'])}(?:_(\d+))?_(.+)\.wav$" # d['soundscape']_number_label.wav     or    d['soundscape']_label.wav
-                match = re.match(pattern, source)
-                if match:
-                    # source_number = int(match.group(1))
-                    label = match.group(2)
-                else:
-                    print(f"Error: filename '{source}' does not match expected pattern "
-                          f"'{d['soundscape']}_<number>_<label>.wav'")
-
+            for source, label in sources:
                 assert label in self.labels, f'"{source}" is not a valid filename of the estimates for {d["soundscape"]}'
                 d[est_ref + '_label'].append(label)
                 d[est_ref + '_source_paths'].append(os.path.join(source_dir, source))

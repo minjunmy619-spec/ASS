@@ -1,0 +1,13 @@
+*.pyc
+*.ckpt
+.ipynb_checkpoints
+*.pth
+*.pdf
+*.png
+
+external_data/
+data/
+.venv/
+workspace/
+__pycache__/
+src/modules/spatial_audio_synthesizer

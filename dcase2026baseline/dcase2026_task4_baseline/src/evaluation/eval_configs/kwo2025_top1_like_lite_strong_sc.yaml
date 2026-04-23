@@ -1,0 +1,76 @@
+dataset:
+    module: src.datamodules.dataset
+    main: DatasetS3
+    args:
+        config:
+            mode: waveform
+            soundscape_dir: data/dev_set/synthesized/test/soundscape
+            oracle_target_dir: data/dev_set/synthesized/test/oracle_target
+            sr: 32000
+        n_sources: 3
+        label_set: dcase2026t4
+        return_source: true
+        label_vector_mode: stack
+        silence_label_mode: onehot
+        return_meta: false
+model:
+    module: src.models.s5.kwo2025
+    main: Kwon2025S5
+    args:
+        label_set: dcase2026t4
+        uss_ckpt: checkpoint/modified_deft_uss_lite_6s.ckpt
+        sc_ckpt: checkpoint/m2d_sc_stage2_strong.ckpt
+        tse_ckpt: checkpoint/modified_deft_tse_lite_6s.ckpt
+        uss_config:
+            module: src.models.deft.modified_deft
+            main: ModifiedDeFTUSSMemoryEfficient
+            args:
+                input_channels: 4
+                output_channels: 1
+                hidden_channels: 96
+                n_deft_blocks: 6
+                n_heads: 4
+                n_foreground: 3
+                n_interference: 2
+                n_classes: 18
+                window_size: 1024
+                hop_size: 320
+                time_window_size: 128
+                freq_group_size: 64
+                shift_windows: true
+                sample_rate: 32000
+                inference_chunk_seconds: 10.0
+                inference_chunk_hop_seconds: 8.0
+        sc_config:
+            module: src.models.m2dat.m2d_sc
+            main: M2DSingleClassifierStrong
+            args:
+                weight_file: checkpoint/m2d_as_vit_base-80x1001p16x16p32k-240413_AS-FT_enconly/weights_ep69it3124-0.47998.pth
+                num_classes: 18
+                embedding_dim: 512
+                pooling_hidden_dim: 512
+                projection_hidden_dim: 1024
+                dropout: 0.2
+                finetuning_layers: 2_blocks
+                eval_crop_seconds: 5.0
+                eval_crop_hop_seconds: 2.5
+                energy_thresholds:
+                    default: -3.5
+        tse_config:
+            module: src.models.deft.modified_deft
+            main: ModifiedDeFTTSEMemoryEfficient
+            args:
+                mixture_channels: 4
+                enrollment_channels: 1
+                hidden_channels: 96
+                n_deft_blocks: 6
+                n_heads: 4
+                label_dim: 18
+                window_size: 1024
+                hop_size: 320
+                time_window_size: 128
+                freq_group_size: 64
+                shift_windows: true
+                sample_rate: 32000
+                inference_chunk_seconds: 10.0
+                inference_chunk_hop_seconds: 8.0

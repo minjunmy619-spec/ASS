@@ -1,0 +1,93 @@
+---
+task_name: m2d_sc_stage3_estimated_strong
+description: Fine-tune strong M2D-SC on cached USS/TSE estimated source waveforms.
+
+deterministic: True
+manual_seed: 0
+
+datamodule:
+    module: src.datamodules.datamodule
+    main: DataModule
+    args:
+        train_dataloader:
+            batch_size: 32
+            num_workers: 8
+            persistent_workers: false
+            dataset:
+                module: src.datamodules.source_classifier_dataset
+                main: EstimatedSourceClassifierDataset
+                args:
+                    source_prefix: est
+                    base_dataset:
+                        args:
+                            config:
+                                mode: waveform
+                                soundscape_dir: workspace/sc_finetune/soundscape
+                                oracle_target_dir: workspace/sc_finetune/oracle_target
+                                estimate_target_dir: workspace/sc_finetune/estimate_target
+                                sr: 32000
+                            n_sources: 3
+                            label_set: dcase2026t4
+                            return_source: true
+                            label_vector_mode: stack
+                            silence_label_mode: zeros
+                            return_meta: false
+lightning_module:
+    module: src.training.lightningmodule.single_label_classification
+    main: SingleLabelClassificationLightning
+    args:
+        model:
+            module: src.models.m2dat.m2d_sc
+            main: M2DSingleClassifierStrong
+            args:
+                weight_file: checkpoint/m2d_as_vit_base-80x1001p16x16p32k-240413_AS-FT_enconly/weights_ep69it3124-0.47998.pth
+                num_classes: 18
+                embedding_dim: 512
+                pooling_hidden_dim: 512
+                projection_hidden_dim: 1024
+                dropout: 0.2
+                finetuning_layers: 2_blocks
+                eval_crop_seconds: 5.0
+                eval_crop_hop_seconds: 2.5
+                energy_thresholds:
+                    default: -3.5
+        loss:
+            module: src.training.loss.m2d_sc_arcface
+            main: get_loss_func
+            args:
+                lambda_energy: 0.001
+                m_in: -6.0
+                m_out: -1.0
+        optimizer:
+            module: torch.optim
+            main: AdamW
+            args:
+                params: null
+                lr: 0.0002
+                betas: [0.9, 0.999]
+                eps: 0.00000001
+                weight_decay: 0.01
+                amsgrad: true
+        is_validation: false
+train:
+    callbacks: []
+    trainer:
+        module: lightning.pytorch
+        main: Trainer
+        args:
+            accelerator: auto
+            devices: auto
+            strategy: ddp_find_unused_parameters_true
+            num_nodes: 1
+            precision: bf16-mixed
+            logger: null
+            fast_dev_run: False
+            max_epochs: 30
+            log_every_n_steps: 100
+            use_distributed_sampler: True
+            sync_batchnorm: True
+            num_sanity_val_steps: 0
+            enable_checkpointing: True
+            enable_progress_bar: True
+            enable_model_summary: True
+            gradient_clip_val: 0.5
