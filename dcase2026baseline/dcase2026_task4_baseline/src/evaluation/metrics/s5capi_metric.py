@@ -43,11 +43,14 @@ class S5ClassAwareMetric():
 
         raw_sdr_mean = self._diagnostic_mean('raw_sdr')
         mix_sdr_mean = self._diagnostic_mean('mix_sdr')
+        reference_mix_sdr_mean = self._diagnostic_mean('reference_mix_sdr')
         sdri_mean = self._diagnostic_mean('sdri')
         if raw_sdr_mean is not None:
             reobj['raw_sdr'] = raw_sdr_mean
         if mix_sdr_mean is not None:
             reobj['mix_sdr'] = mix_sdr_mean
+        if reference_mix_sdr_mean is not None:
+            reobj['reference_mix_sdr'] = reference_mix_sdr_mean
         if sdri_mean is not None:
             reobj['sdri'] = sdri_mean
 
@@ -57,6 +60,8 @@ class S5ClassAwareMetric():
                 print('raw_sdr: %.3f'%raw_sdr_mean)
             if mix_sdr_mean is not None:
                 print('mix_sdr: %.3f'%mix_sdr_mean)
+            if reference_mix_sdr_mean is not None:
+                print('reference_mix_sdr: %.3f'%reference_mix_sdr_mean)
             if sdri_mean is not None:
                 print('sdri: %.3f'%sdri_mean)
         return reobj
@@ -81,6 +86,18 @@ class S5ClassAwareMetric():
             'sdri': sdri,
         })
         return raw_sdr, mix_sdr, sdri
+
+    def _record_reference_mix_sdr(self, ref_lb, ref_wf, mixture):
+        active_indices = [idx for idx, label in enumerate(ref_lb) if label != 'silence']
+        if not active_indices:
+            return None
+        active_ref_wf = ref_wf[active_indices]
+        mixture_repeat = mixture.view(1, -1).expand(active_ref_wf.shape[0], -1)
+        reference_mix_sdr = self.metric_func(mixture_repeat, active_ref_wf).mean().item()
+        self.diagnostic_values.append({
+            'reference_mix_sdr': reference_mix_sdr,
+        })
+        return reference_mix_sdr
 
 
     def _pi_metric(self,
@@ -148,6 +165,7 @@ class S5ClassAwareMetric():
                   mixture, # [wlen, ]
                   ):
     
+        self._record_reference_mix_sdr(ref_lb, ref_wf, mixture)
         all_labels = (set(est_lb) | set(ref_lb)) - {'silence'}
         if not all_labels: return None # true silence prediction
     
