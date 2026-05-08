@@ -213,4 +213,5 @@ if __name__ == "__main__":
         train(args)
     except:
         traceback.print_exc()
+        raise
     print('The program is terminated normally')

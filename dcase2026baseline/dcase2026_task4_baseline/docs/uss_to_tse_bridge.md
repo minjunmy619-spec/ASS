@@ -1,6 +1,7 @@
 # USS -> TSE Semantic-Acoustic Bridge
 
-This is an opt-in path. Existing USS/TSE configs and model classes remain unchanged.
+This is an opt-in path. Existing USS/TSE configs keep their old behavior unless
+they set a bridge/query conditioning dimension or enable S5 handoff.
 
 ## 1. Train bridge-aware USS
 
@@ -60,6 +61,56 @@ This uses:
 - `src.models.deft.modified_deft_tse_bridge.BridgeModifiedDeFTTSEMemoryEfficientTemporal`
 
 The TSE wrapper preserves the old input contract. If `bridge_condition` is absent, it behaves like the base TSE model. If present, it projects the bridge feature into an additive residual over the original `label_vector` condition.
+
+The base TSE classes now also have a direct query-condition receiver. Setting
+`query_condition_dim > 0` on `ModifiedDeFTTSE`,
+`ModifiedDeFTTSEMemoryEfficient`, `ModifiedDeFTTSETemporal`, or
+`ModifiedDeFTTSEMemoryEfficientTemporal` adds a per-query FiLM projection for
+`query_condition`, `tse_condition`, `bridge_condition`, or
+`proposal_condition`. The conditioned estimated-enrollment configs use this
+path:
+
+```bash
+python -m src.train \
+  -c config/separation/modified_deft_tse_lite_6s_temporal_estimated_enrollment_uss_conditioned.yaml \
+  -w workspace/separation
+
+python -m src.train \
+  -c config/separation/modified_deft_tse_lite_10s_temporal_estimated_enrollment_uss_conditioned.yaml \
+  -w workspace/separation
+```
+
+For live S5 inference, enable the handoff explicitly:
+
+```yaml
+model:
+  args:
+    tse_uss_conditioning_enabled: true
+    tse_config:
+      args:
+        query_condition_dim: 256
+```
+
+With this flag, `Kwon2025S5` and `Kwon2025TemporalS5` first use explicit USS
+proposal tensors such as `tse_condition`; if they are absent, they synthesize a
+compact condition from USS class logits, silence logits, count logits, spatial
+embeddings, DoA vectors, activity summaries, and slot RMS. The ready-to-run
+temporal sibling is
+`src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse.yaml`.
+
+`src/evaluation.export_sc_finetune_cache --mode pseudo_s5` preserves that same
+condition when the S5 output includes it. Alongside `soundscape/`,
+`oracle_target/`, and `estimate_target/`, the exporter writes:
+
+```text
+workspace/sc_finetune/uss_bridge_features/<soundscape>.pt
+```
+
+with both `query_condition` and `tse_condition` keys. `evaluate_stage.py
+--stage tse` forwards bridge/query/proposal tensors when they are present in the
+stage dataset and warns when a query-conditioned TSE is evaluated without any
+condition tensor. Full `evaluate.py` is still the correct check for live
+USS-to-TSE handoff.
 
 ## Recommended schedule
 

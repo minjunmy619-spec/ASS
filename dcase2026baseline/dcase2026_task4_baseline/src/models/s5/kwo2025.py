@@ -20,6 +20,7 @@ class Kwon2025S5(torch.nn.Module):
         uss_gate_count0_threshold=0.65,
         uss_gate_slot_active_threshold=0.45,
         uss_gate_slot_energy_threshold=1e-4,
+        tse_uss_conditioning_enabled=False,
     ):
         super().__init__()
         self.uss = initialize_config(uss_config)
@@ -35,6 +36,7 @@ class Kwon2025S5(torch.nn.Module):
         self.uss_gate_count0_threshold = float(uss_gate_count0_threshold)
         self.uss_gate_slot_active_threshold = float(uss_gate_slot_active_threshold)
         self.uss_gate_slot_energy_threshold = float(uss_gate_slot_energy_threshold)
+        self.tse_uss_conditioning_enabled = bool(tse_uss_conditioning_enabled)
 
         if uss_ckpt is not None:
             self._load_ckpt(uss_ckpt, self.uss)
@@ -105,12 +107,62 @@ class Kwon2025S5(torch.nn.Module):
                 label_vector[batch_idx, source_idx] = raw_label_vector[batch_idx, source_idx]
         return label_vector
 
-    def _run_tse(self, mixture, enroll, label_vector):
-        return self.tse({
+    def _match_condition_slots(self, tensor, n_sources, device, dtype):
+        tensor = tensor.to(device=device, dtype=dtype)
+        if tensor.dim() == 2:
+            if tensor.shape[1] == n_sources:
+                tensor = tensor.unsqueeze(-1)
+            else:
+                tensor = tensor.unsqueeze(1).expand(-1, n_sources, -1)
+        if tensor.dim() != 3:
+            raise ValueError(f"USS TSE condition tensors must be [B,S,D], got {tuple(tensor.shape)}")
+        if tensor.shape[1] < n_sources:
+            pad = tensor.new_zeros(tensor.shape[0], n_sources - tensor.shape[1], tensor.shape[-1])
+            tensor = torch.cat([tensor, pad], dim=1)
+        elif tensor.shape[1] > n_sources:
+            tensor = tensor[:, :n_sources]
+        return tensor
+
+    def _build_tse_query_condition(self, uss_out, stage_waveform):
+        if not getattr(self, "tse_uss_conditioning_enabled", False):
+            return None
+        n_sources = stage_waveform.shape[1]
+        device = stage_waveform.device
+        dtype = stage_waveform.dtype
+
+        for key in ("tse_condition", "query_condition", "bridge_condition", "proposal_condition"):
+            if key in uss_out:
+                return self._match_condition_slots(uss_out[key], n_sources, device, dtype)
+
+        parts = []
+        if "class_logits" in uss_out:
+            parts.append(self._match_condition_slots(uss_out["class_logits"].softmax(dim=-1), n_sources, device, dtype))
+        if "silence_logits" in uss_out:
+            parts.append(self._match_condition_slots(uss_out["silence_logits"].sigmoid().unsqueeze(-1), n_sources, device, dtype))
+        if "count_logits" in uss_out:
+            count_prob = uss_out["count_logits"].softmax(dim=-1).to(device=device, dtype=dtype)
+            parts.append(count_prob.unsqueeze(1).expand(-1, n_sources, -1))
+        for key in ("spatial_embedding", "doa_vector", "pred_doa_vector", "used_spatial_vector"):
+            if key in uss_out:
+                parts.append(self._match_condition_slots(uss_out[key], n_sources, device, dtype))
+        if "foreground_activity_logits" in uss_out:
+            activity = uss_out["foreground_activity_logits"].sigmoid()
+            activity = torch.stack([activity.mean(dim=-1), activity.amax(dim=-1)], dim=-1)
+            parts.append(self._match_condition_slots(activity, n_sources, device, dtype))
+
+        slot_rms = stage_waveform[:, :, 0].float().pow(2).mean(dim=-1).sqrt().to(dtype=dtype).unsqueeze(-1)
+        parts.append(slot_rms)
+        return torch.cat(parts, dim=-1) if parts else None
+
+    def _run_tse(self, mixture, enroll, label_vector, query_condition=None):
+        input_dict = {
             "mixture": mixture,
             "enrollment": enroll,
             "label_vector": label_vector,
-        })["waveform"]
+        }
+        if query_condition is not None:
+            input_dict["query_condition"] = query_condition
+        return self.tse(input_dict)["waveform"]
 
     def _slot_silence_mask(self, label_vector):
         return label_vector.abs().sum(dim=-1) == 0
@@ -172,34 +224,41 @@ class Kwon2025S5(torch.nn.Module):
             stage1_waveform, stage1_labels, stage1_probs, stage1_vector = self._apply_uss_gate_to_stage1(
                 uss_out, stage1_waveform, stage1_labels, stage1_probs, stage1_vector
             )
+            stage1_condition = self._build_tse_query_condition(uss_out, stage1_waveform)
             silent_slots = self._slot_silence_mask(stage1_vector)
             stage1_waveform, stage1_labels, stage1_probs, stage1_vector = self._force_silent_slots(
                 stage1_waveform, stage1_labels, stage1_probs, stage1_vector, silent_slots
             )
             if silent_slots.all().item():
                 zero_waveform = torch.zeros_like(stage1_waveform)
-                return {
+                output = {
                     "label": [["silence"] * stage1_waveform.shape[1] for _ in range(stage1_waveform.shape[0])],
                     "probabilities": torch.zeros_like(stage1_probs),
                     "waveform": zero_waveform,
                 }
+                if stage1_condition is not None:
+                    output["query_condition"] = stage1_condition
+                return output
 
-            stage2_waveform = self._run_tse(mixture, stage1_waveform, stage1_vector)
+            stage2_waveform = self._run_tse(mixture, stage1_waveform, stage1_vector, stage1_condition)
             stage2_labels, stage2_probs, stage2_vector = self._classify_sources(stage2_waveform)
             silent_slots = silent_slots | self._slot_silence_mask(stage2_vector)
             stage2_waveform, stage2_labels, stage2_probs, stage2_vector = self._force_silent_slots(
                 stage2_waveform, stage2_labels, stage2_probs, stage2_vector, silent_slots
             )
 
-            stage3_waveform = self._run_tse(mixture, stage2_waveform, stage2_vector)
+            stage3_waveform = self._run_tse(mixture, stage2_waveform, stage2_vector, stage1_condition)
             stage3_labels, stage3_probs, stage3_vector = self._classify_sources(stage3_waveform)
             silent_slots = silent_slots | self._slot_silence_mask(stage3_vector)
             stage3_waveform, stage3_labels, stage3_probs, _ = self._force_silent_slots(
                 stage3_waveform, stage3_labels, stage3_probs, stage3_vector, silent_slots
             )
 
-            return {
+            output = {
                 "label": stage3_labels,
                 "probabilities": stage3_probs,
                 "waveform": stage3_waveform,
             }
+            if stage1_condition is not None:
+                output["query_condition"] = stage1_condition
+            return output

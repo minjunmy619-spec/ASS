@@ -1,6 +1,5 @@
-task_name: m2d_sc_stage3_estimated_strong
-description: Fine-tune strong M2D-SC on cached USS/TSE estimated source
-  waveforms.
+task_name: m2d_sc_stage1_pretrainedsed_fusion
+description: M2D source classifier fused with frozen PretrainedSED BEATs, ATST-F, and fPaSST branches.
 
 deterministic: true
 manual_seed: 0
@@ -10,22 +9,43 @@ datamodule:
   main: DataModule
   args:
     train_dataloader:
-      batch_size: 32
+      batch_size: 24
       num_workers: 8
       persistent_workers: false
       dataset:
         module: src.datamodules.source_classifier_dataset
-        main: EstimatedSourceClassifierDataset
+        main: SourceClassifierDataset
         args:
-          source_prefix: est
           base_dataset:
             args:
               config:
-                mode: waveform
-                soundscape_dir: workspace/sc_finetune/soundscape
-                oracle_target_dir: workspace/sc_finetune/oracle_target
-                estimate_target_dir: workspace/sc_finetune/estimate_target
-                sr: 32000
+                mode: generate
+                spatial_sound_scene:
+                  duration: 10.0
+                  sr: 32000
+                  max_event_overlap: 3
+                  max_event_dur: 10.0
+                  ref_db: -55
+                  foreground_dir: data/dev_set/sound_event/train
+                  background_dir: data/dev_set/noise/train
+                  interference_dir: data/dev_set/interference/train
+                  room_config:
+                    module: src.modules.spatial_audio_synthesizer.room
+                    main: SofaRoom
+                    args:
+                      path: data/dev_set/room_ir/train
+                      direct_range_ms: [6, 50]
+                dupse_rate: 0.5
+                dupse_min_angle: 60.0
+                max_n_dupse: 2
+                dupse_exclusion_folder_depth: 1
+                snr_range: [5, 20]
+                nevent_range: [0, 3]
+                ninterference_range: [0, 2]
+                inteference_snr_range: [0, 15]
+                dataset_length: 25088
+                shuffle_label: true
+                fg_return: {dry: true, dry_channel: 0, metadata: true}
               n_sources: 3
               label_set: dcase2026t4
               return_source: true
@@ -33,21 +53,22 @@ datamodule:
               silence_label_mode: zeros
               return_meta: false
     val_dataloader:
-      batch_size: 32
+      batch_size: 24
       num_workers: 8
       persistent_workers: false
       dataset:
         module: src.datamodules.source_classifier_dataset
-        main: EstimatedSourceClassifierDataset
+        main: SourceClassifierDataset
         args:
-          source_prefix: est
           base_dataset:
             args:
               config:
-                mode: waveform
-                soundscape_dir: workspace/sc_finetune_valid/soundscape
-                oracle_target_dir: workspace/sc_finetune_valid/oracle_target
-                estimate_target_dir: workspace/sc_finetune_valid/estimate_target
+                mode: metadata
+                metadata_list: data/dev_set/metadata/valid.json
+                fg_return:
+                  dry: true
+                  dry_channel: 0
+                  metadata: true
                 sr: 32000
               n_sources: 3
               label_set: dcase2026t4
@@ -61,33 +82,40 @@ lightning_module:
   args:
     model:
       module: src.models.m2dat.m2d_sc
-      main: M2DSingleClassifierStrong
+      main: M2DPretrainedSEDFusionClassifier
       args:
         weight_file:
           checkpoint/m2d_as_vit_base-80x1001p16x16p32k-240413_AS-FT_enconly/weights_ep69it3124-0.47998.pth
         num_classes: 18
         embedding_dim: 512
+        m2d_embedding_dim: 512
         pooling_hidden_dim: 512
         projection_hidden_dim: 1024
         dropout: 0.2
         finetuning_layers: 2_blocks
-        eval_crop_seconds: 5.0
-        eval_crop_hop_seconds: 2.5
-        energy_thresholds:
-          default: -3.5
+        pretrainedsed_repo_root: external/PretrainedSED
+        pretrainedsed_checkpoint_dir: checkpoint/pretrainedsed
+        pretrainedsed_models: [BEATs, ATST-F, fpasst]
+        pretrainedsed_checkpoint_variant: strong_1
+        pretrainedsed_pooling: mean
+        pretrainedsed_seq_len: 250
+        pretrainedsed_embed_dim: 768
+        pretrainedsed_download_if_missing: true
+        freeze_pretrainedsed: true
+        fusion_strategy: weighted_avg
+        fusion_hidden_dim: 1024
+        input_sample_rate: 32000
     loss:
       module: src.training.loss.m2d_sc_arcface
       main: get_loss_func
       args:
-        lambda_energy: 0.001
-        m_in: -6.0
-        m_out: -1.0
+        lambda_energy: 0.0
     optimizer:
       module: torch.optim
       main: AdamW
       args:
         params:
-        lr: 0.0002
+        lr: 0.0003
         betas: [0.9, 0.999]
         eps: 0.00000001
         weight_decay: 0.01
@@ -124,7 +152,7 @@ train:
       precision: bf16-mixed
       logger:
       fast_dev_run: false
-      max_epochs: 30
+      max_epochs: 100
       log_every_n_steps: 100
       use_distributed_sampler: true
       sync_batchnorm: true

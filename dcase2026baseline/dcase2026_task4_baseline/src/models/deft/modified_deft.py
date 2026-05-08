@@ -37,6 +37,42 @@ def _temporal_film_from_conditioning(
     return beta.unsqueeze(-1), gamma.unsqueeze(-1)
 
 
+def _match_query_condition_shape(query_condition, label_vector, condition_dim):
+    query_condition = query_condition.to(device=label_vector.device, dtype=label_vector.dtype)
+    if label_vector.dim() == 2:
+        if query_condition.dim() == 3:
+            query_condition = query_condition[:, 0]
+        if query_condition.dim() != 2:
+            raise ValueError("query_condition must have shape [B,D] or [B,Q,D]")
+        if query_condition.shape[0] != label_vector.shape[0]:
+            raise ValueError("query_condition batch dimension does not match TSE input")
+    elif label_vector.dim() == 3:
+        if query_condition.dim() == 2:
+            query_condition = query_condition.unsqueeze(1).expand(-1, label_vector.shape[1], -1)
+        if query_condition.dim() != 3:
+            raise ValueError("query_condition must have shape [B,D] or [B,Q,D]")
+        if query_condition.shape[0] != label_vector.shape[0]:
+            raise ValueError("query_condition batch dimension does not match TSE input")
+        if query_condition.shape[1] < label_vector.shape[1]:
+            pad = query_condition.new_zeros(
+                query_condition.shape[0],
+                label_vector.shape[1] - query_condition.shape[1],
+                query_condition.shape[-1],
+            )
+            query_condition = torch.cat([query_condition, pad], dim=1)
+        elif query_condition.shape[1] > label_vector.shape[1]:
+            query_condition = query_condition[:, : label_vector.shape[1]]
+    else:
+        raise ValueError(f"Unsupported label_vector shape: {tuple(label_vector.shape)}")
+
+    if query_condition.shape[-1] < condition_dim:
+        pad = query_condition.new_zeros(*query_condition.shape[:-1], condition_dim - query_condition.shape[-1])
+        query_condition = torch.cat([query_condition, pad], dim=-1)
+    elif query_condition.shape[-1] > condition_dim:
+        query_condition = query_condition[..., :condition_dim]
+    return query_condition
+
+
 class ResFiLM(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -1019,11 +1055,20 @@ class ModifiedDeFTTSE(_BaseSpectralModel):
         label_dim=18,
         window_size=1024,
         hop_size=320,
+        query_condition_dim=0,
+        query_condition_hidden_dim=256,
+        query_condition_scale=1.0,
+        query_condition_dropout=0.0,
+        require_query_condition=False,
     ):
         super().__init__(window_size=window_size, hop_size=hop_size)
         self.mixture_channels = mixture_channels
         self.enrollment_channels = enrollment_channels
         self.label_dim = label_dim
+        self.hidden_channels = hidden_channels
+        self.query_condition_dim = int(query_condition_dim or 0)
+        self.query_condition_scale = float(query_condition_scale)
+        self.require_query_condition = bool(require_query_condition)
 
         self.encoder = nn.Sequential(
             nn.Conv2d((mixture_channels + enrollment_channels) * 2, hidden_channels, kernel_size=3, padding=1, bias=False),
@@ -1035,6 +1080,37 @@ class ModifiedDeFTTSE(_BaseSpectralModel):
         )
         self.class_conditioner = ClassConditioner(label_dim, hidden_channels)
         self.audio_head = nn.Conv2d(hidden_channels, 2, kernel_size=1)
+        if self.query_condition_dim > 0:
+            self.query_conditioner = nn.Sequential(
+                nn.LayerNorm(self.query_condition_dim),
+                nn.Linear(self.query_condition_dim, int(query_condition_hidden_dim)),
+                nn.GELU(),
+                nn.Dropout(float(query_condition_dropout)),
+                nn.Linear(int(query_condition_hidden_dim), hidden_channels * 2),
+            )
+        else:
+            self.query_conditioner = None
+
+    def _get_query_condition(self, input_dict):
+        for key in ("query_condition", "tse_condition", "bridge_condition", "proposal_condition"):
+            if key in input_dict:
+                return input_dict[key]
+        if self.require_query_condition:
+            raise ValueError("query_condition is required")
+        return None
+
+    def _query_film(self, input_dict, label_vector, batch_size, n_queries, device, dtype):
+        query_condition = self._get_query_condition(input_dict)
+        if self.query_conditioner is None:
+            return None, None
+        if query_condition is None:
+            return None, None
+        condition = _match_query_condition_shape(query_condition, label_vector, self.query_condition_dim)
+        condition = condition.to(device=device, dtype=dtype)
+        beta_gamma = self.query_conditioner(condition.reshape(batch_size * n_queries, -1))
+        beta, gamma = beta_gamma.chunk(2, dim=-1)
+        scale = self.query_condition_scale
+        return beta[:, :, None, None] * scale, gamma[:, :, None, None] * scale
 
     def forward(self, input_dict):
         mixture = input_dict["mixture"]
@@ -1062,6 +1138,10 @@ class ModifiedDeFTTSE(_BaseSpectralModel):
 
         x = self.encoder(features)
         beta, gamma = self.class_conditioner(label_vector.reshape(batch_size * n_queries, -1))
+        query_beta, query_gamma = self._query_film(input_dict, label_vector, batch_size, n_queries, x.device, x.dtype)
+        if query_beta is not None:
+            beta = beta + query_beta
+            gamma = gamma + query_gamma
         for block in self.blocks:
             x = block(x, beta=beta, gamma=gamma)
 
@@ -1112,6 +1192,10 @@ class ModifiedDeFTTSETemporal(ModifiedDeFTTSE):
 
         x = self.encoder(features)
         beta, gamma = self.class_conditioner(label_vector.reshape(batch_size * n_queries, -1))
+        query_beta, query_gamma = self._query_film(input_dict, label_vector, batch_size, n_queries, x.device, x.dtype)
+        if query_beta is not None:
+            beta = beta + query_beta
+            gamma = gamma + query_gamma
         time_beta, time_gamma = _temporal_film_from_conditioning(
             self.temporal_conditioner,
             temporal_conditioning,
@@ -1164,6 +1248,11 @@ class ModifiedDeFTTSEMemoryEfficient(ModifiedDeFTTSE):
         inference_chunk_seconds=10.0,
         inference_chunk_hop_seconds=8.0,
         sample_rate=32000,
+        query_condition_dim=0,
+        query_condition_hidden_dim=256,
+        query_condition_scale=1.0,
+        query_condition_dropout=0.0,
+        require_query_condition=False,
     ):
         super().__init__(
             mixture_channels=mixture_channels,
@@ -1174,6 +1263,11 @@ class ModifiedDeFTTSEMemoryEfficient(ModifiedDeFTTSE):
             label_dim=label_dim,
             window_size=window_size,
             hop_size=hop_size,
+            query_condition_dim=query_condition_dim,
+            query_condition_hidden_dim=query_condition_hidden_dim,
+            query_condition_scale=query_condition_scale,
+            query_condition_dropout=query_condition_dropout,
+            require_query_condition=require_query_condition,
         )
         self.time_window_size = int(time_window_size)
         self.freq_group_size = int(freq_group_size)
@@ -1215,6 +1309,7 @@ class ModifiedDeFTTSEMemoryEfficient(ModifiedDeFTTSE):
         mixture = input_dict["mixture"]
         enrollment = input_dict["enrollment"]
         label_vector = input_dict["label_vector"]
+        query_condition = self._get_query_condition(input_dict)
         batch_size, n_queries, _, samples = enrollment.shape
 
         chunk_samples = int(round(float(self.inference_chunk_seconds) * self.sample_rate))
@@ -1243,6 +1338,7 @@ class ModifiedDeFTTSEMemoryEfficient(ModifiedDeFTTSE):
                     "mixture": mixture_chunk,
                     "enrollment": enrollment_chunk,
                     "label_vector": label_vector,
+                    "query_condition": query_condition,
                 }
             )
             waveform_sum[..., start : start + valid] += out["waveform"][..., :valid] * weight[..., :valid]
@@ -1302,6 +1398,10 @@ class ModifiedDeFTTSEMemoryEfficientTemporal(ModifiedDeFTTSEMemoryEfficient):
 
         x = self.encoder(features)
         beta, gamma = self.class_conditioner(label_vector.reshape(batch_size * n_queries, -1))
+        query_beta, query_gamma = self._query_film(input_dict, label_vector, batch_size, n_queries, x.device, x.dtype)
+        if query_beta is not None:
+            beta = beta + query_beta
+            gamma = gamma + query_gamma
         time_beta, time_gamma = self._temporal_film(
             temporal_conditioning,
             batch_size,
@@ -1338,6 +1438,7 @@ class ModifiedDeFTTSEMemoryEfficientTemporal(ModifiedDeFTTSEMemoryEfficient):
         enrollment = input_dict["enrollment"]
         label_vector = input_dict["label_vector"]
         temporal_conditioning = input_dict.get("temporal_conditioning")
+        query_condition = self._get_query_condition(input_dict)
         batch_size, n_queries, _, samples = enrollment.shape
 
         chunk_samples = int(round(float(self.inference_chunk_seconds) * self.sample_rate))
@@ -1381,6 +1482,7 @@ class ModifiedDeFTTSEMemoryEfficientTemporal(ModifiedDeFTTSEMemoryEfficient):
                     "enrollment": enrollment_chunk,
                     "label_vector": label_vector,
                     "temporal_conditioning": temporal_conditioning_chunk,
+                    "query_condition": query_condition,
                 }
             )
             waveform_sum[..., start : start + valid] += out["waveform"][..., :valid] * weight[..., :valid]

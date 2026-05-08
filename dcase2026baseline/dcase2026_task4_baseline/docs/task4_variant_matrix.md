@@ -21,6 +21,7 @@ distribution when judging final quality.
 | 5 | SC estimated-source adaptation | `config/label/m2d_sc_stage3_estimated_strong.yaml` | `checkpoint/m2d_sc_stage3_estimated_strong.ckpt` | Adapts SC to distorted USS/TSE estimates. |
 | 6 | TSE estimated-enrollment adaptation | `config/separation/modified_deft_tse_lite_6s_estimated_enrollment.yaml` | `checkpoint/modified_deft_tse_lite_6s_estimated_enrollment.ckpt` | Fine-tunes TSE on USS/S5 estimates as enrollment using random 6s crops. |
 | 7 | TSE final 10s alignment | `config/separation/modified_deft_tse_lite_10s_estimated_enrollment.yaml` | final TSE candidate checkpoint | Short full-10s fine-tune to match official/eval clip length. |
+| 7b | TSE USS-conditioned alignment | `config/separation/modified_deft_tse_lite_6s_temporal_estimated_enrollment_uss_conditioned.yaml` -> `config/separation/modified_deft_tse_lite_10s_temporal_estimated_enrollment_uss_conditioned.yaml` | `checkpoint/modified_deft_tse_lite_10s_temporal_estimated_enrollment_uss_conditioned.ckpt` | Aligns temporal TSE with USS proposal context in addition to estimated enrollment. |
 | 8 | Main S5 eval | `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_sc.yaml` | result directory | Full S5 validation; this is the real promotion gate. |
 | 9 | Duplicate-recall eval | `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_sc_duplicate_recall.yaml` | result directory | Tests same-class duplicate recovery. Promote only if CAPI-SDRi improves without false positives. |
 
@@ -32,6 +33,11 @@ distribution when judging final quality.
 | Full spatial DeFT USS | `config/separation/modified_deft_uss.yaml` | `ModifiedDeFTUSSSpatial` | S5 / cache export | Stronger but heavier spatial DeFT USS. | Uses 4ch spatial STFT and phase-aware masks. Expensive; use as final candidate if A6000 memory/time allows. |
 | 5s chunked spatial USS | `config/separation/modified_deft_uss_5s.yaml` | `ChunkedModifiedDeFTUSSSpatial` | S5 / cache export | Memory-reduced training with global DeFT blocks. | Trains 5s; eval chunks longer input. Useful middle ground. |
 | 6s lite spatial USS | `config/separation/modified_deft_uss_lite_6s.yaml` | `ModifiedDeFTUSSMemoryEfficient` | Main cache, SC stage3, TSE estimated enrollment, lite S5 eval | Recommended first serious USS. | Same 96 channels / 6 blocks / 4 heads, but memory-efficient local time and grouped frequency attention. Spatial 4ch input, mono output. |
+| 6s lite USS + count head | `config/separation/modified_deft_uss_lite_6s_count_head.yaml` | `ModifiedDeFTUSSMemoryEfficientCountHead` | Count-gated S5 eval | Predicts foreground count in addition to waveforms. | Use with `kwo2025_top1_like_lite_uss_count_gate.yaml`; hard/soft CAPI siblings exist for loss ablation. |
+| 6s lite USS + FOA features | `config/separation/modified_deft_uss_lite_6s_foa_spatial_features.yaml` | `ModifiedDeFTUSSMemoryEfficientSpatialFeatures` | FOA/count-gated S5 eval | Adds FOA logmag/AIV/IPD spatial features. | Stronger spatial input path than waveform STFT alone. |
+| 6s lite USS + FOA count head | `config/separation/modified_deft_uss_lite_6s_foa_spatial_features_count_head.yaml` | `ModifiedDeFTUSSMemoryEfficientSpatialFeaturesCountHead` | FOA count-gated S5 eval | Combines FOA spatial features with foreground count prediction. | Use with `kwo2025_top1_like_lite_uss_foa_count_gate.yaml`. |
+| 6s lite USS + residual slots | `config/separation/modified_deft_uss_lite_6s_residual.yaml` | `ModifiedDeFTUSSMemoryEfficientResidual` | USS ablation / cleanup | Splits extra non-foreground slots into `residual_waveform`. | Residual/trash slots should not be classified or submitted as foreground. |
+| 6s lite USS spatial CAPI strong | `config/separation/modified_deft_uss_lite_6s_spatial_capi_strong.yaml` | `ModifiedDeFTUSSMemoryEfficientSpatialFeaturesCountSpatialHead` | High-feature USS candidate | FOA features, count head, per-slot spatial embedding, DoA head, and CAPI-oriented losses. | Current strongest USS-start candidate; keep as an opt-in sibling until measured. |
 | Full temporal spatial USS | `config/separation/modified_deft_uss_temporal.yaml` | `ModifiedDeFTUSSSpatialTemporal` | Temporal S5 / temporal cache | Adds per-object activity heads. | Higher risk/heavier. Useful if temporal gating clearly helps. |
 | 5s temporal chunked USS | `config/separation/modified_deft_uss_5s_temporal.yaml` | `ChunkedModifiedDeFTUSSSpatialTemporal` | Temporal S5 / temporal cache | Temporal activity with chunked eval. | Keeps global block style but adds activity outputs. |
 | 6s lite temporal USS | `config/separation/modified_deft_uss_lite_6s_temporal.yaml` | `ModifiedDeFTUSSMemoryEfficientTemporal` | `Kwon2025TemporalS5`, temporal TSE, temporal SC | Recommended temporal USS candidate. | Memory-efficient plus foreground/interference/noise activity logits. |
@@ -50,6 +56,8 @@ distribution when judging final quality.
 | 6s lite temporal TSE bootstrap | `config/separation/modified_deft_tse_lite_6s_temporal.yaml` | `ModifiedDeFTTSEMemoryEfficientTemporal` | Temporal estimated-enrollment fine-tune | Temporal TSE bootstrap. | Oracle-enrollment training plus activity loss. |
 | 6s lite temporal estimated-enrollment TSE | `config/separation/modified_deft_tse_lite_6s_temporal_estimated_enrollment.yaml` | `ModifiedDeFTTSEMemoryEfficientTemporal` | 10s temporal estimated-enrollment TSE | Temporal TSE aligned to estimated enrollments. | Loads `checkpoint/modified_deft_tse_lite_6s_temporal.ckpt`; random 6s crops. |
 | 10s lite temporal estimated-enrollment TSE | `config/separation/modified_deft_tse_lite_10s_temporal_estimated_enrollment.yaml` | `ModifiedDeFTTSEMemoryEfficientTemporal` | Final temporal S5 | Final temporal official-length alignment. | Loads `checkpoint/modified_deft_tse_lite_6s_temporal_estimated_enrollment.ckpt`; full cached 10s. |
+| 6s lite temporal estimated-enrollment USS-conditioned TSE | `config/separation/modified_deft_tse_lite_6s_temporal_estimated_enrollment_uss_conditioned.yaml` | `ModifiedDeFTTSEMemoryEfficientTemporal` | 10s USS-conditioned temporal TSE | Adds query/proposal FiLM from USS bridge or proposal features. | Loads `checkpoint/modified_deft_tse_lite_6s_temporal_estimated_enrollment.ckpt`; accepts `query_condition`, `tse_condition`, `bridge_condition`, or `proposal_condition`. |
+| 10s lite temporal estimated-enrollment USS-conditioned TSE | `config/separation/modified_deft_tse_lite_10s_temporal_estimated_enrollment_uss_conditioned.yaml` | `ModifiedDeFTTSEMemoryEfficientTemporal` | USS-conditioned temporal S5 | Final official-length alignment for proposal-conditioned TSE. | Loads `checkpoint/modified_deft_tse_lite_6s_temporal_estimated_enrollment_uss_conditioned.ckpt`; use with `tse_uss_conditioning_enabled: true`. |
 
 ## SC Variants
 
@@ -73,6 +81,7 @@ distribution when judging final quality.
 | fPaSST fusion stage2 | `config/label/m2d_sc_stage2_fpasst_fusion.yaml` | `M2DPretrainedFusionClassifier` | fPaSST stage3 | fPaSST fusion with energy/silence. | Good ablation against BEATs. |
 | fPaSST estimated fusion | `config/label/m2d_sc_stage3_estimated_fpasst_fusion.yaml` | `M2DPretrainedFusionClassifier` | fPaSST S5 eval | Estimated-source fPaSST SC adaptation. | Try if BEATs is weak or extra GPU time exists. |
 | fPaSST estimated fusion robust | `config/label/m2d_sc_stage3_estimated_fpasst_fusion_robust.yaml` | `M2DPretrainedFusionClassifier` | fPaSST S5 eval if noisy labels | Robust fPaSST estimated-source SC. | Lower priority than BEATs robust unless fPaSST wins. |
+| PretrainedSED multi-branch stage1 | `config/label/m2d_sc_stage1_pretrainedsed_fusion.yaml` | `M2DPretrainedSEDFusionClassifier` | future PretrainedSED stage2/stage3 siblings | Official PretrainedSED BEATs + ATST-F + fPaSST fusion. | Frozen branches, `weighted_avg` default, `AST` aliases to `fpasst`; currently stage1 only. |
 | Old 1ch M2D-AT | `config/label/m2dat_1c.yaml`, `config/label/m2dat_1c_2blks.yaml` | `M2dAt` | legacy eval | Older 1-channel classifier. | Keep for baseline/compatibility. |
 | Old 4ch M2D-AT | `config/label/m2dat_4c.yaml`, `config/label/m2dat_4c_2blks.yaml` | `M2dAtSpatial` | legacy eval | Older 4-channel classifier. | Assumes old 19-class silence-style contract in some paths. |
 
@@ -91,7 +100,10 @@ distribution when judging final quality.
 | Lite BEATs + duplicate recall | `src/evaluation/eval_configs/kwo2025_top1_like_lite_beats_fusion_sc_duplicate_recall.yaml` | `Kwon2025S5` | same as above | Duplicate recall on BEATs SC. | Good if BEATs improves duplicate confidence. |
 | Lite with fPaSST estimated SC | `src/evaluation/eval_configs/kwo2025_top1_like_lite_fpasst_fusion_sc.yaml` | `Kwon2025S5` | lite USS/TSE + `m2d_sc_stage3_estimated_fpasst_fusion.ckpt` | Frame-oriented pretrained SC ablation. | Lower priority unless BEATs underperforms. |
 | Lite fPaSST + duplicate recall | `src/evaluation/eval_configs/kwo2025_top1_like_lite_fpasst_fusion_sc_duplicate_recall.yaml` | `Kwon2025S5` | same as above | Duplicate recall on fPaSST SC. | Promote only from measured S5 score. |
+| Lite USS count-gated S5 | `src/evaluation/eval_configs/kwo2025_top1_like_lite_uss_count_gate.yaml` | `Kwon2025S5` | count-head USS + lite TSE/SC | Uses predicted foreground count to gate slots. | Diagnostic for over/under-separation behavior. |
+| Lite FOA count-gated S5 | `src/evaluation/eval_configs/kwo2025_top1_like_lite_uss_foa_count_gate.yaml` | `Kwon2025S5` | FOA count-head USS + lite TSE/SC | Count-gated S5 with FOA spatial-feature USS. | Main eval sibling for FOA/count-head USS variants. |
 | Temporal lite S5 | `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc.yaml` | `Kwon2025TemporalS5` | temporal lite USS/TSE + temporal estimated SC | Uses USS/SC/TSE activity for gating and time-FiLM conditioning. | Main temporal candidate. |
+| Temporal lite S5 + USS-conditioned TSE | `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse.yaml` | `Kwon2025TemporalS5` | temporal USS/SC + USS-conditioned temporal TSE | Forwards USS proposal context into stage-2 and stage-3 TSE. | Main SOTA-oriented temporal alignment sibling after training the conditioned TSE checkpoint. |
 | Temporal lite S5 + duplicate recall | `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_duplicate_recall.yaml` | `Kwon2025TemporalS5` | same as above | Duplicate recall requires temporal support. | Safer duplicate-recall variant. |
 | Old m2dat/resunet 1ch | `src/evaluation/eval_configs/m2dat_1c_resunetk.yaml` | `S5` | old SC/separator stack | Legacy baseline. | Beware old silence contract assumptions. |
 | Old m2dat/resunet 4ch | `src/evaluation/eval_configs/m2dat_4c_resunetk.yaml` | `S5` | old SC/separator stack | Legacy spatial baseline. | Compatibility only. |
@@ -103,9 +115,25 @@ distribution when judging final quality.
   before final comparison.
 - If the final USS changes, regenerate `workspace/sc_finetune` and redo SC
   stage3 plus TSE estimated-enrollment fine-tunes.
+- If the final USS exposes new proposal keys such as `tse_condition`,
+  `spatial_embedding`, DoA vectors, count logits, or activity logits, use the
+  USS-conditioned TSE siblings and the matching S5 eval config instead of
+  evaluating those USS upgrades through an unconditioned TSE bottleneck.
+- `export_sc_finetune_cache.py --mode pseudo_s5` writes
+  `workspace/sc_finetune/uss_bridge_features/` when the S5 output contains a
+  query condition. `evaluate_stage.py --stage tse` forwards those conditions
+  from bridge-aware TSE datasets, while full `evaluate.py` is the promotion gate
+  for live USS-conditioned handoff.
 - `*_duplicate_recall.yaml` should be treated as an S5-level evaluation variant,
   not a training stage.
 - `*_robust.yaml` SC configs are stage3 estimated-source fine-tunes only; use
   them after the matching non-robust branch establishes a useful baseline.
 - Gated fusion is enabled by changing `fusion_mode: gated_mlp` in a sibling
   BEATs/fPaSST config; do not overwrite the default concat configs.
+- PretrainedSED multi-branch fusion is a new stage1 SC sibling. Add matching
+  stage2, stage3 estimated-source, and S5 eval configs before comparing it as a
+  final system branch.
+- AudioSet-Strong source-pool training is documented in
+  `docs/audioset_strong_augmentation.md`; keep it as explicit
+  `spatial_sound_scene_sources` ratios rather than merging folders when doing
+  curriculum ablations.

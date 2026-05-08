@@ -144,7 +144,7 @@ class Kwon2025TemporalS5(Kwon2025S5):
         labels = [self._vector_to_label(label_vector[i]) for i in range(batch_size)]
         return labels, probs, label_vector, activity
 
-    def _run_tse_temporal(self, mixture, enroll, label_vector, activity):
+    def _run_tse_temporal(self, mixture, enroll, label_vector, activity, query_condition=None):
         input_dict = {
             "mixture": mixture,
             "enrollment": enroll,
@@ -152,6 +152,8 @@ class Kwon2025TemporalS5(Kwon2025S5):
         }
         if self.temporal_conditioning_enabled and activity is not None:
             input_dict["temporal_conditioning"] = activity
+        if query_condition is not None:
+            input_dict["query_condition"] = query_condition
         out = self.tse(input_dict)
         waveform = out["waveform"]
         tse_activity = out.get("activity_logits")
@@ -181,6 +183,7 @@ class Kwon2025TemporalS5(Kwon2025S5):
             if uss_activity is not None:
                 uss_activity = torch.sigmoid(uss_activity)
             stage1_waveform = self._gate_waveforms(stage1_waveform, uss_activity)
+            stage1_condition = self._build_tse_query_condition(uss_out, stage1_waveform)
 
             stage1_labels, stage1_probs, stage1_vector, stage1_activity = self._classify_sources_temporal(
                 stage1_waveform,
@@ -196,13 +199,22 @@ class Kwon2025TemporalS5(Kwon2025S5):
                 silent_slots,
             )
             if silent_slots.all().item():
-                return {
+                output = {
                     "label": [["silence"] * stage1_waveform.shape[1] for _ in range(stage1_waveform.shape[0])],
                     "probabilities": torch.zeros_like(stage1_probs),
                     "waveform": torch.zeros_like(stage1_waveform),
                 }
+                if stage1_condition is not None:
+                    output["query_condition"] = stage1_condition
+                return output
 
-            stage2_waveform, tse2_activity = self._run_tse_temporal(mixture, stage1_waveform, stage1_vector, stage1_activity)
+            stage2_waveform, tse2_activity = self._run_tse_temporal(
+                mixture,
+                stage1_waveform,
+                stage1_vector,
+                stage1_activity,
+                stage1_condition,
+            )
             stage2_activity_prior = self._combine_activity(stage1_activity, tse2_activity)
             stage2_waveform = self._gate_waveforms(stage2_waveform, stage2_activity_prior)
             stage2_labels, stage2_probs, stage2_vector, stage2_activity = self._classify_sources_temporal(
@@ -219,7 +231,13 @@ class Kwon2025TemporalS5(Kwon2025S5):
                 silent_slots,
             )
 
-            stage3_waveform, tse3_activity = self._run_tse_temporal(mixture, stage2_waveform, stage2_vector, stage2_activity)
+            stage3_waveform, tse3_activity = self._run_tse_temporal(
+                mixture,
+                stage2_waveform,
+                stage2_vector,
+                stage2_activity,
+                stage1_condition,
+            )
             stage3_activity_prior = self._combine_activity(stage2_activity, tse3_activity)
             stage3_waveform = self._gate_waveforms(stage3_waveform, stage3_activity_prior)
             stage3_labels, stage3_probs, stage3_vector, stage3_activity = self._classify_sources_temporal(
@@ -236,8 +254,11 @@ class Kwon2025TemporalS5(Kwon2025S5):
                 silent_slots,
             )
 
-            return {
+            output = {
                 "label": stage3_labels,
                 "probabilities": stage3_probs,
                 "waveform": stage3_waveform,
             }
+            if stage1_condition is not None:
+                output["query_condition"] = stage1_condition
+            return output

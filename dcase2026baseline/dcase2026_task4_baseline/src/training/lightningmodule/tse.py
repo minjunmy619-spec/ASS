@@ -10,6 +10,15 @@ class TSELightning(BaseLightningModule):
         }
         if "span_sec" in batch_data_dict:
             input_dict["span_sec"] = batch_data_dict["span_sec"]
+        for key in (
+            "query_condition",
+            "bridge_condition",
+            "tse_condition",
+            "proposal_condition",
+            "temporal_conditioning",
+        ):
+            if key in batch_data_dict:
+                input_dict[key] = batch_data_dict[key]
         return input_dict
 
     def _get_target_dict(self, batch_data_dict):

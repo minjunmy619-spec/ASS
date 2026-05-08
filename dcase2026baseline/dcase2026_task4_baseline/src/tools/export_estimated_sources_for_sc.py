@@ -43,6 +43,11 @@ def _load_model(config_path: str, checkpoint_path: str, device: torch.device):
         print(f"[export_estimated_sources_for_sc] missing model keys: {len(missing)}")
     if unexpected:
         print(f"[export_estimated_sources_for_sc] unexpected model keys: {len(unexpected)}")
+    if missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint/config mismatch while exporting estimated sources: "
+            f"missing={list(missing)[:10]}, unexpected={list(unexpected)[:10]}"
+        )
     model.to(device)
     model.eval()
     return model

@@ -13,6 +13,27 @@ The baseline system consists of two models, audio tagging (AT) and source separa
 The AT model uses a pre-trained feature extractor backbone (M2D) and a head layer.
 For the AT model, we provide two variants: one that uses a single channel of the mixture as input and another that uses all four channels.
 
+### Experimental Task 4 System Variants
+This checkout also contains opt-in research variants beyond the official-style
+baseline. The original `M2dAt` + `ResUNet30` configs are still available; the
+newer variants are added as sibling configs so existing baseline pipelines do
+not change silently.
+
+| Area | Main files | What was added |
+| --- | --- | --- |
+| Stage map and commands | `recipes.md`, `docs/task4_variant_matrix.md` | Recommended `USS -> SC -> TSE -> S5` promotion path, stage isolation, and checkpoint naming. |
+| Strong source classification | `src/models/m2dat/m2d_sc.py`, `config/label/m2d_sc_stage*_strong.yaml` | Attentive-statistics M2D source classifier, multi-crop prediction, ArcFace training, and energy-based silence filtering. |
+| Pretrained SC fusion | `config/label/m2d_sc_stage*_beats_fusion.yaml`, `config/label/m2d_sc_stage*_fpasst_fusion.yaml`, `config/label/m2d_sc_stage1_pretrainedsed_fusion.yaml` | Single-branch BEATs/fPaSST fusion plus a multi-branch official PretrainedSED BEATs/ATST-F/fPaSST variant. |
+| DeFT separation stack | `config/separation/modified_deft_*.yaml`, `src/models/deft/` | Spatial USS, oracle and estimated-enrollment TSE, memory-efficient 6s recipes, temporal variants, count heads, FOA spatial features, residual slots, and bridge variants. |
+| Estimated-source adaptation | `src/evaluation/export_sc_finetune_cache.py`, `config/label/m2d_sc_stage3_estimated_*.yaml`, `config/separation/*estimated_enrollment*.yaml` | Cached USS/TSE estimates for SC adaptation and TSE fine-tuning on the same enrollment distribution used by S5 inference. |
+| USS-conditioned TSE | `config/separation/*uss_conditioned.yaml`, `src/models/s5/kwo2025*.py` | Opt-in query/proposal FiLM in TSE and S5 handoff from USS outputs such as `tse_condition`, class logits, count logits, spatial embeddings, DoA vectors, and activity summaries. |
+| Robust and duplicate-aware paths | `src/training/loss/m2d_sc_arcface.py`, `src/models/s5/kwo2025.py`, `src/evaluation/eval_configs/*duplicate_recall.yaml` | Soft truncation for noisy estimated-source labels and S5 duplicate recall for same-class source recovery. |
+| Diagnostics and calibration | `src/evaluation/calibrate_sc_energy_thresholds.py`, `src/evaluation/evaluate_stage.py`, `src/evaluation/debug_sc_loss_flow.py` | Per-class SC energy-threshold calibration, USS/SC/TSE stage-only evaluation, and SC loss-flow debugging. |
+| AudioSet-Strong source pools | `docs/audioset_strong_augmentation.md`, `src/datamodules/dataset.py` | Opt-in `spatial_sound_scene_sources` mixing for controlled official-vs-AudioSet-Strong source-pool curricula. |
+
+For a compact overview, start from `recipes.md`. For a complete stage-aware
+variant table, use `docs/task4_variant_matrix.md`.
+
 ### Dataset and folder structure
 The data consists of two parts: the development dataset and the evaluation dataset.
 The development dataset (provided as [DCASE2026 Task4 Dataset](https://zenodo.org/records/19328046)) is constructed based on the previous [DCASE2025 Task4 Dataset](https://zenodo.org/records/15117227) by incorporating newly recorded target events, RIRs, and background noise, using a similar recording setup.
@@ -78,6 +99,24 @@ cd dcase2026_task4_baseline
 wget -P checkpoint https://github.com/nttcslab/m2d/releases/download/v0.3.0/m2d_as_vit_base-80x1001p16x16p32k-240413_AS-FT_enconly.zip
 unzip checkpoint/m2d_as_vit_base-80x1001p16x16p32k-240413_AS-FT_enconly.zip -d checkpoint
 ```
+
+Optional pretrained source-classifier fusion branches need extra local assets:
+
+```bash
+# BEATs single-branch fusion
+git clone https://github.com/microsoft/unilm.git external/unilm
+ln -s unilm/beats external/BEATs
+
+# PretrainedSED fPaSST and multi-branch BEATs/ATST-F/fPaSST fusion
+git clone https://github.com/fschmid56/PretrainedSED.git external/PretrainedSED
+mkdir -p checkpoint/pretrainedsed
+```
+
+`M2DPretrainedSEDFusionClassifier` can download the official PretrainedSED
+v0.0.1 release checkpoints into `checkpoint/pretrainedsed` when
+`pretrainedsed_download_if_missing: true` is set. To prepare them explicitly,
+download `BEATs_strong_1.pt`, `ATST-F_strong_1.pt`, and `fpasst_strong_1.pt`
+from the PretrainedSED v0.0.1 release into that folder.
 
 Install environment (identical to *dcase2025_task4_baseline*)
 ```
@@ -165,6 +204,51 @@ The separation model can be trained using
 python -m src.train -c config/separation/resunetk_capisdr.yaml -w workspace/separation
 ```
 
+### Extended S5 Recipes
+The current experimental system is documented in `recipes.md`. A typical
+memory-efficient path is:
+
+```bash
+python -m src.train -c config/separation/modified_deft_uss_lite_6s.yaml -w workspace/separation
+python -m src.train -c config/label/m2d_sc_stage1_strong.yaml -w workspace/label
+python -m src.train -c config/label/m2d_sc_stage2_strong.yaml -w workspace/label
+python -m src.train -c config/separation/modified_deft_tse_lite_6s.yaml -w workspace/separation
+```
+
+Then export estimated slots and adapt downstream stages:
+
+```bash
+python -m src.evaluation.export_sc_finetune_cache \
+  -c src/evaluation/eval_configs/kwo2025_top1_like_lite_strong_sc.yaml \
+  --output_root workspace/sc_finetune \
+  --mode pseudo_s5 \
+  --batchsize 1
+
+python -m src.train -c config/label/m2d_sc_stage3_estimated_strong.yaml -w workspace/label
+python -m src.train -c config/separation/modified_deft_tse_lite_6s_estimated_enrollment.yaml -w workspace/separation
+python -m src.train -c config/separation/modified_deft_tse_lite_10s_estimated_enrollment.yaml -w workspace/separation
+```
+
+For temporal systems where USS proposal cues should guide TSE, use the opt-in
+conditioned siblings after exporting bridge features or cached estimated
+enrollments:
+
+```bash
+python -m src.train -c config/separation/modified_deft_tse_lite_6s_temporal_estimated_enrollment_uss_conditioned.yaml -w workspace/separation
+python -m src.train -c config/separation/modified_deft_tse_lite_10s_temporal_estimated_enrollment_uss_conditioned.yaml -w workspace/separation
+```
+
+When the cache is exported from a conditioned S5 config, the exporter stores the
+matching proposal tensors in `workspace/sc_finetune/uss_bridge_features/` so the
+conditioned TSE fine-tune sees the same USS context that S5 will pass at
+inference.
+
+For stronger SC branches, use sibling configs such as
+`m2d_sc_stage*_beats_fusion.yaml`, `m2d_sc_stage*_fpasst_fusion.yaml`, or
+`m2d_sc_stage1_pretrainedsed_fusion.yaml`. Robust estimated-source configs end
+in `_robust.yaml` and should be used only after a matching non-robust branch has
+been measured.
+
 ### Training hyperparameters
 
 Some hyperparameters that affect training time and performance can be set in the YAML configuration files
@@ -205,6 +289,41 @@ Accuracy (source) : 70.394
 """
 ```
 To evaluate other model checkpoints, specify their paths under `tagger_ckpt` and `separator_ckpt` in the corresponding config files located in `src/evaluation/eval_configs`.
+
+The newer S5 evaluation configs live in the same folder. Common entry points:
+
+```bash
+# Main lite USS/TSE system with estimated-source-adapted SC
+python -m src.evaluation.evaluate \
+  -c src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_sc.yaml \
+  --result_dir workspace/evaluation
+
+# Duplicate-recall ablation for same-class source recovery
+python -m src.evaluation.evaluate \
+  -c src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_sc_duplicate_recall.yaml \
+  --result_dir workspace/evaluation
+
+# Temporal S5 with USS-conditioned TSE handoff
+python -m src.evaluation.evaluate \
+  -c src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse.yaml \
+  --result_dir workspace/evaluation
+
+# Stage-only diagnostics against the same eval config
+python -m src.evaluation.evaluate_stage \
+  -c src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_sc.yaml \
+  --stage sc \
+  --result_dir workspace/evaluation_stage
+```
+
+Before final S5 comparison, calibrate SC energy thresholds on the validation
+slots for the exact SC checkpoint/config being evaluated:
+
+```bash
+python -m src.evaluation.calibrate_sc_energy_thresholds \
+  -c config/label/m2d_sc_stage3_estimated_strong.yaml \
+  --checkpoint checkpoint/m2d_sc_stage3_estimated_strong.ckpt \
+  --output-dir workspace/calibration/sc_energy
+```
 
 ## License 
 This project is licensed under the terms described in [LICENSE.pdf](LICENSE.pdf).

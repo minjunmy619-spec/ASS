@@ -8,8 +8,7 @@ import random
 import warnings
 import json
 
-from src.modules.spatial_audio_synthesizer.spatial_audio_synthesizer import SpAudSyn
-from src.temporal import event_to_span_sec, pad_spans, waveform_to_span_sec
+from src.temporal import SILENCE_SPAN_SEC, event_to_span_sec, pad_spans, waveform_to_span_sec
 from src.utils import LABELS
 
 SPATIAL_SOUND_SCENE_KEYS = {
@@ -24,6 +23,18 @@ SPATIAL_SOUND_SCENE_KEYS = {
     'room_config',
     'verbose',
 }
+
+def _get_spatial_audio_synthesizer():
+    try:
+        from src.modules.spatial_audio_synthesizer.spatial_audio_synthesizer import SpAudSyn
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "DatasetS3 generate/metadata synthesis requires "
+            "src.modules.spatial_audio_synthesizer. Waveform-mode datasets do "
+            "not need it; check the SpAudSyn checkout or symlink before using "
+            "generate/metadata synthesis."
+        ) from exc
+    return SpAudSyn
 
 def collate_fn(list_data_dict):
     data = {k: [] for k in list_data_dict[0].keys()}
@@ -152,41 +163,87 @@ class DatasetS3(torch.utils.data.Dataset):
             for source in all_wav:
                 match = re.match(pattern, source)
                 if match:
-                    matched_sources.append((source, match.group(2)))
-            sources = sorted(matched_sources, key=lambda x: x[0])
+                    slot = int(match.group(1)) if match.group(1) is not None else None
+                    matched_sources.append((slot, source, match.group(2)))
+            numbered = [slot for slot, _, _ in matched_sources if slot is not None]
+            if numbered and len(numbered) != len(matched_sources):
+                raise ValueError(
+                    f"Mixed numbered and unnumbered source files for {d['soundscape']} in {source_dir}. "
+                    "Use either '<soundscape>_<slot>_<label>.wav' for all files or no slot for all files."
+                )
+            if len(numbered) != len(set(numbered)):
+                raise ValueError(f"Duplicate source slot ids for {d['soundscape']} in {source_dir}.")
+            if numbered and (min(numbered) < 0 or max(numbered) >= self.n_sources):
+                raise ValueError(
+                    f"Source slot ids for {d['soundscape']} in {source_dir} must be in "
+                    f"[0, {self.n_sources - 1}], got {sorted(numbered)}."
+                )
+            if len(matched_sources) > self.n_sources:
+                files = [source for _, source, _ in sorted(matched_sources, key=lambda x: (x[0] is None, x[0] if x[0] is not None else x[1]))]
+                raise ValueError(
+                    f"Found {len(matched_sources)} source files for {d['soundscape']} in {source_dir}, "
+                    f"but n_sources={self.n_sources}. Remove stale cache files or regenerate the cache. Files: {files}"
+                )
             # if not sources: warnings.warn(f'No estimate for {d["mixture_path"]}')
 
-            d[est_ref + '_label'] = []
-            d[est_ref + '_source_paths'] = []
-            for source, label in sources:
-                assert label in self.labels, f'"{source}" is not a valid filename of the estimates for {d["soundscape"]}'
-                d[est_ref + '_label'].append(label)
-                d[est_ref + '_source_paths'].append(os.path.join(source_dir, source))
+            if numbered:
+                labels = ['silence'] * self.n_sources
+                source_paths = [None] * self.n_sources
+                sources = sorted(matched_sources, key=lambda x: x[0])
+                for slot, source, label in sources:
+                    assert label in self.labels, f'"{source}" is not a valid filename of the estimates for {d["soundscape"]}'
+                    labels[slot] = label
+                    source_paths[slot] = os.path.join(source_dir, source)
+            else:
+                labels = []
+                source_paths = []
+                sources = sorted(matched_sources, key=lambda x: x[1])
+                for _, source, label in sources:
+                    assert label in self.labels, f'"{source}" is not a valid filename of the estimates for {d["soundscape"]}'
+                    labels.append(label)
+                    source_paths.append(os.path.join(source_dir, source))
+
+            d[est_ref + '_label'] = labels
+            d[est_ref + '_source_paths'] = source_paths
 
     def _get_label_waveform(self, info, est_ref):
         labels = list(info[est_ref + '_label'])
+        if len(labels) > self.n_sources:
+            raise ValueError(
+                f"{est_ref}_label for {info['soundscape']} has {len(labels)} slots, "
+                f"but n_sources={self.n_sources}."
+            )
         if len(labels) < self.n_sources:
             labels.extend(['silence'] * (self.n_sources - len(labels)))
         return labels
 
     def _get_source_waveform(self, info, est_ref, wlen):
         dry_sources = []
-        for source_path in info[est_ref + '_source_paths']:
+        labels = self._get_label_waveform(info, est_ref)
+        source_paths = list(info[est_ref + '_source_paths'])
+        if len(source_paths) < self.n_sources:
+            source_paths.extend([None] * (self.n_sources - len(source_paths)))
+        for label, source_path in zip(labels, source_paths):
+            if label == 'silence' or source_path is None:
+                dry_sources.append(np.zeros(wlen, dtype=np.float32))
+                continue
             dry_source, sr = librosa.load(source_path, sr = None)
             assert sr == self.sr, f'sr of {source_path} ({sr}) is different from the target sr ({self.sr})'
             dry_sources.append(dry_source)
-        assert len(dry_sources) == len(info[est_ref + '_label'])
-
-        if len(dry_sources) < self.n_sources:
-            for _ in range(self.n_sources - len(dry_sources)):
-                dry_sources.append(np.zeros(wlen, dtype=np.float32))
-        assert len(dry_sources) >= self.n_sources # some may output more than n_sources
+        assert len(dry_sources) == self.n_sources
 
         return torch.from_numpy(np.stack(dry_sources))[:, None, :].to(torch.float32) # [nevents, 1, wlen]
 
     def _get_source_span_waveform(self, info, est_ref, wlen):
         spans = []
-        for source_path in info[est_ref + '_source_paths']:
+        labels = self._get_label_waveform(info, est_ref)
+        source_paths = list(info[est_ref + '_source_paths'])
+        if len(source_paths) < self.n_sources:
+            source_paths.extend([None] * (self.n_sources - len(source_paths)))
+        for label, source_path in zip(labels, source_paths):
+            if label == 'silence' or source_path is None:
+                spans.append(SILENCE_SPAN_SEC)
+                continue
             dry_source, sr = librosa.load(source_path, sr=None)
             assert sr == self.sr, f'sr of {source_path} ({sr}) is different from the target sr ({self.sr})'
             spans.append(waveform_to_span_sec(dry_source, self.sr))
@@ -338,6 +395,7 @@ class DatasetS3(torch.utils.data.Dataset):
 
 
     def _get_item_generate(self, idx):
+        SpAudSyn = _get_spatial_audio_synthesizer()
         spatial_sound_scene, source_pool_name = self._select_spatial_sound_scene()
         s3 = SpAudSyn(**spatial_sound_scene)
         if source_pool_name is not None:
@@ -409,6 +467,7 @@ class DatasetS3(torch.utils.data.Dataset):
     # Utilizations for metadata mode
     #=====================================================
     def _get_item_metadata(self, idx):
+        SpAudSyn = _get_spatial_audio_synthesizer()
         metadata_path = os.path.join(self.metadata_dir, self.data[idx]['metadata_path'])
         s3 = SpAudSyn.from_metadata(metadata_path)
         return self._generate(s3)

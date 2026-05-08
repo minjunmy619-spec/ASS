@@ -15,6 +15,15 @@ from .metrics import label_metric, s5capi_metric
 from .metrics.s5_validation_breakdown import S5ValidationBreakdownMetric
 
 
+_TSE_CONDITION_KEYS = (
+    "query_condition",
+    "tse_condition",
+    "bridge_condition",
+    "proposal_condition",
+    "temporal_conditioning",
+)
+
+
 def _load_yaml(path, base_dir=None):
     candidate = path
     if not os.path.isabs(candidate) and not os.path.exists(candidate) and base_dir:
@@ -323,6 +332,11 @@ class StageEvaluator:
         _load_checkpoint(self.model, checkpoint)
         self.model.eval()
         self.model.to(self.device)
+        self.tse_conditioning_configured = bool(
+            getattr(self.model, "query_conditioner", None) is not None
+            or getattr(self.model, "bridge_to_label", None) is not None
+        )
+        self.tse_condition_keys_seen = set()
 
     def _write_waveforms(self, batch, labels, waveforms):
         if not self.waveform_output_dir:
@@ -388,8 +402,17 @@ class StageEvaluator:
         label_dim = getattr(self.model, "label_dim", None)
         if label_dim is not None and label_vector.shape[-1] > label_dim:
             label_vector = label_vector[..., :label_dim]
+        input_dict = {
+            "mixture": mixture,
+            "enrollment": enrollment,
+            "label_vector": label_vector,
+        }
+        for key in _TSE_CONDITION_KEYS:
+            if key in batch:
+                input_dict[key] = batch[key].to(self.device) if torch.is_tensor(batch[key]) else batch[key]
+                self.tse_condition_keys_seen.add(key)
         with torch.no_grad():
-            output = self.model({"mixture": mixture, "enrollment": enrollment, "label_vector": label_vector})
+            output = self.model(input_dict)
         est_waveforms = output["waveform"][:, :, 0, :].detach().cpu()
         probabilities = torch.ones(est_waveforms.shape[:2], dtype=torch.float32)
         return batch["label"], est_waveforms, probabilities, batch["label"]
@@ -464,6 +487,15 @@ class StageEvaluator:
             print("Active source top-1 accuracy: %.3f" % summary["source_classification"]["active_source_top1_accuracy"])
             print("Silence accuracy: %.3f" % summary["source_classification"]["silence_accuracy"])
             print("Source F1: %.3f" % summary["source_classification"]["source_f1"])
+        if self.stage == "tse":
+            summary["tse_conditioning_configured"] = self.tse_conditioning_configured
+            summary["tse_condition_keys_seen"] = sorted(self.tse_condition_keys_seen)
+            if self.tse_conditioning_configured and not self.tse_condition_keys_seen:
+                print(
+                    "WARNING: TSE has query conditioning layers, but this stage dataset "
+                    "did not provide query/bridge/proposal conditions. Full S5 evaluation "
+                    "is required to test live USS-conditioned handoff."
+                )
 
         if self.result_dir:
             os.makedirs(self.result_dir, exist_ok=True)
@@ -508,7 +540,7 @@ if __name__ == "__main__":
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--batchsize", "-b", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=None)
-    parser.add_argument("--sc_prediction_mode", choices=["raw", "gated"], default="raw", help="For --stage sc: raw matches training active_top1 from plain logits; gated applies predict() energy/silence thresholds.")
+    parser.add_argument("--sc_prediction_mode", choices=["raw", "gated"], default="gated", help="For --stage sc: gated matches final S5 predict() energy/silence thresholds; raw reports plain-logit top-1 diagnostics.")
     parser.add_argument("--compare_assignment", action="store_true", help="For --stage uss/tse: also log official raw-SDR assignment vs paper SDRi-assignment CAPI-SDRi diagnostics.")
     parser.add_argument("--validation_breakdown", action="store_true", help="For --stage uss/tse: also log CAPI-SDRi, zero-target FP, silence, leakage, and scene-bucket diagnostics.")
     parser.add_argument(

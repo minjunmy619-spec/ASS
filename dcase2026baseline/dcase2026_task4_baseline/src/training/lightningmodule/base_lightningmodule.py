@@ -65,7 +65,25 @@ class BaseLightningModule(pl.LightningModule, PyTorchModelHubMixin):
             }
             if stripped:
                 state_dict = stripped
-        self.model.load_state_dict(state_dict, strict=bool(strict))
+        if strict:
+            self.model.load_state_dict(state_dict, strict=True)
+            return
+
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        allowed_missing_prefixes = (
+            "query_conditioner.",
+            "bridge_to_label.",
+        )
+        disallowed_missing = [
+            key for key in missing
+            if not key.startswith(allowed_missing_prefixes)
+        ]
+        if disallowed_missing or unexpected:
+            raise RuntimeError(
+                "Checkpoint/config mismatch while loading pretrained model "
+                f"'{path}': missing={disallowed_missing[:20]}, "
+                f"unexpected={list(unexpected)[:20]}"
+            )
 
     def forward(self, x):
         pass

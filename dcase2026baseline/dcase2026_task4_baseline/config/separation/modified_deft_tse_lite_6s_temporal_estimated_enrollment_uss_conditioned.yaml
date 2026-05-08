@@ -1,6 +1,8 @@
-task_name: modified_deft_tse_lite_6s_temporal_estimated_enrollment_bridge
-manual_seed: 0
+task_name: modified_deft_tse_lite_6s_temporal_estimated_enrollment_uss_conditioned
+description: Fine-tune temporal memory-efficient DeFT TSE with estimated enrollments plus USS proposal/query conditions.
+
 deterministic: true
+manual_seed: 0
 
 datamodule:
   module: src.datamodules.datamodule
@@ -66,16 +68,15 @@ datamodule:
               label_vector_mode: stack
               silence_label_mode: zeros
               return_meta: false
-
 lightning_module:
   module: src.training.lightningmodule.tse_bridge
   main: TSEBridgeLightning
   args:
-    pretrained_model_ckpt: checkpoint/modified_deft_tse_lite_6s_temporal.ckpt
+    pretrained_model_ckpt: checkpoint/modified_deft_tse_lite_6s_temporal_estimated_enrollment.ckpt
     pretrained_model_strict: false
     model:
-      module: src.models.deft.modified_deft_tse_bridge
-      main: BridgeModifiedDeFTTSEMemoryEfficientTemporal
+      module: src.models.deft.modified_deft
+      main: ModifiedDeFTTSEMemoryEfficientTemporal
       args:
         mixture_channels: 4
         enrollment_channels: 1
@@ -91,11 +92,11 @@ lightning_module:
         sample_rate: 32000
         inference_chunk_seconds: 10.0
         inference_chunk_hop_seconds: 8.0
-        bridge_condition_dim: 256
-        bridge_hidden_dim: 256
-        bridge_label_scale: 0.5
-        bridge_dropout: 0.0
-        require_bridge_condition: false
+        query_condition_dim: 256
+        query_condition_hidden_dim: 256
+        query_condition_scale: 0.5
+        query_condition_dropout: 0.0
+        require_query_condition: true
     loss:
       module: src.training.loss.masked_snr
       main: get_loss_func
@@ -106,19 +107,34 @@ lightning_module:
     optimizer:
       module: torch.optim
       main: AdamW
-      args: {params: null, lr: 0.00005, betas: [0.9, 0.999], eps: 0.00000001, weight_decay: 0.0, amsgrad: true}
+      args:
+        params:
+        lr: 0.00005
+        betas: [0.9, 0.999]
+        eps: 0.00000001
+        weight_decay: 0.0
+        amsgrad: true
     is_validation: true
-
 train:
   callbacks:
   - name: checkpoint
     module: lightning.pytorch.callbacks
     main: ModelCheckpoint
-    args: {every_n_epochs: 1, filename: '{epoch}', save_top_k: 1, save_last: true, monitor: epoch_val/loss, mode: min, dirpath: null}
+    args:
+      every_n_epochs: 1
+      filename: '{epoch}'
+      save_top_k: 1
+      save_last: true
+      monitor: epoch_val/loss
+      mode: min
+      verbose: false
+      dirpath:
   - name: tqdm
     module: lightning.pytorch.callbacks
     main: TQDMProgressBar
-    args: {refresh_rate: 60, process_position: 0}
+    args:
+      refresh_rate: 60
+      process_position: 0
   trainer:
     module: lightning.pytorch
     main: Trainer
@@ -126,7 +142,10 @@ train:
       accelerator: auto
       devices: auto
       strategy: ddp_find_unused_parameters_true
+      num_nodes: 1
       precision: bf16-mixed
+      logger:
+      fast_dev_run: false
       max_epochs: 30
       log_every_n_steps: 100
       use_distributed_sampler: true

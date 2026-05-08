@@ -1,6 +1,7 @@
 import torch
 
 from src.models.deft.uss_count_head import ForegroundCountHead
+from src.models.deft.modified_deft import _match_query_condition_shape
 from src.training.loss.uss_loss import get_loss_func
 from src.models.s5.kwo2025 import Kwon2025S5
 
@@ -128,3 +129,82 @@ def test_kwon_uss_gate_suppresses_count_zero_slots():
     assert torch.all(gated_probs[0] == 0)
     assert torch.all(gated_vectors[0] == 0)
     assert torch.all(gated_waveforms[1] != 0)
+
+
+def test_tse_query_condition_shape_matching_pads_slots_and_features():
+    label_vector = torch.zeros(2, 3, 18)
+    query_condition = torch.ones(2, 2, 5)
+
+    matched = _match_query_condition_shape(query_condition, label_vector, condition_dim=8)
+
+    assert matched.shape == (2, 3, 8)
+    assert torch.allclose(matched[:, :2, :5], torch.ones(2, 2, 5))
+    assert torch.all(matched[:, 2] == 0)
+    assert torch.all(matched[..., 5:] == 0)
+
+
+def test_tse_query_condition_shape_matching_broadcasts_clip_condition():
+    label_vector = torch.zeros(2, 3, 18)
+    query_condition = torch.randn(2, 12)
+
+    matched = _match_query_condition_shape(query_condition, label_vector, condition_dim=8)
+
+    assert matched.shape == (2, 3, 8)
+    assert torch.allclose(matched[:, 0], query_condition[:, :8])
+    assert torch.allclose(matched[:, 1], query_condition[:, :8])
+    assert torch.allclose(matched[:, 2], query_condition[:, :8])
+
+
+def test_kwon_build_tse_query_condition_prefers_explicit_uss_condition():
+    obj = object.__new__(Kwon2025S5)
+    obj.tse_uss_conditioning_enabled = True
+
+    stage_waveform = torch.randn(2, 3, 1, 32)
+    explicit = torch.randn(2, 2, 7)
+    condition = obj._build_tse_query_condition({"tse_condition": explicit}, stage_waveform)
+
+    assert condition.shape == (2, 3, 7)
+    assert torch.allclose(condition[:, :2], explicit)
+    assert torch.all(condition[:, 2] == 0)
+
+
+def test_kwon_build_tse_query_condition_broadcasts_clip_condition():
+    obj = object.__new__(Kwon2025S5)
+    obj.tse_uss_conditioning_enabled = True
+
+    stage_waveform = torch.randn(2, 3, 1, 32)
+    explicit = torch.randn(2, 7)
+    condition = obj._build_tse_query_condition({"tse_condition": explicit}, stage_waveform)
+
+    assert condition.shape == (2, 3, 7)
+    assert torch.allclose(condition[:, 0], explicit)
+    assert torch.allclose(condition[:, 1], explicit)
+    assert torch.allclose(condition[:, 2], explicit)
+
+
+def test_kwon_build_tse_query_condition_from_uss_outputs():
+    obj = object.__new__(Kwon2025S5)
+    obj.tse_uss_conditioning_enabled = True
+
+    stage_waveform = torch.randn(2, 3, 1, 32)
+    uss_out = {
+        "class_logits": torch.randn(2, 3, 18),
+        "silence_logits": torch.randn(2, 3),
+        "count_logits": torch.randn(2, 4),
+        "spatial_embedding": torch.randn(2, 3, 6),
+        "foreground_activity_logits": torch.randn(2, 3, 5),
+    }
+
+    condition = obj._build_tse_query_condition(uss_out, stage_waveform)
+
+    assert condition.shape == (2, 3, 32)
+    assert torch.isfinite(condition).all()
+
+
+def test_kwon_build_tse_query_condition_is_opt_in():
+    obj = object.__new__(Kwon2025S5)
+    obj.tse_uss_conditioning_enabled = False
+
+    stage_waveform = torch.randn(2, 3, 1, 32)
+
+    assert obj._build_tse_query_condition({"class_logits": torch.randn(2, 3, 18)}, stage_waveform) is None

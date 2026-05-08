@@ -70,6 +70,32 @@ def _save_estimates(batch, waveforms, labels, output_root, sample_rate, overwrit
             _write_wav(estimate_path, waveforms[i, slot, 0], sample_rate, overwrite=overwrite)
 
 
+def _condition_from_batch(batch, device):
+    for key in ("query_condition", "tse_condition", "bridge_condition", "proposal_condition"):
+        if key in batch:
+            value = batch[key]
+            return value.to(device) if torch.is_tensor(value) else value
+    return None
+
+
+def _save_query_conditions(batch, output, output_root, overwrite=False):
+    condition = output.get("query_condition")
+    if condition is None:
+        return
+    condition = condition.detach().cpu()
+    feature_dir = os.path.join(output_root, "uss_bridge_features")
+    os.makedirs(feature_dir, exist_ok=True)
+    for i, soundscape in enumerate(batch["soundscape"]):
+        path = os.path.join(feature_dir, f"{soundscape}.pt")
+        if os.path.exists(path) and not overwrite:
+            obj = torch.load(path, map_location="cpu")
+        else:
+            obj = {}
+        obj["query_condition"] = condition[i]
+        obj["tse_condition"] = condition[i]
+        torch.save(obj, path)
+
+
 def _build_dataset_index(dataset):
     if hasattr(dataset, "data"):
         dataset.data_index = {item["soundscape"]: idx for idx, item in enumerate(dataset.data)}
@@ -112,8 +138,12 @@ def export_cache(args):
                     raise TypeError("oracle_tse mode requires a Kwon2025S5-like model with _run_tse")
                 enroll = batch["dry_sources"].to(device)
                 label_vector = _label_vectors(batch, len(model.labels), device)
-                waveforms = model._run_tse(mixture, enroll, label_vector)
+                query_condition = _condition_from_batch(batch, device)
+                waveforms = model._run_tse(mixture, enroll, label_vector, query_condition)
                 labels = batch["label"]
+                output = {"waveform": waveforms, "label": labels}
+                if query_condition is not None:
+                    output["query_condition"] = query_condition
             elif args.mode == "pseudo_s5":
                 output = model.predict_label_separate(mixture)
                 waveforms = output["waveform"]
@@ -129,6 +159,7 @@ def export_cache(args):
             dataset.sr,
             overwrite=args.overwrite,
         )
+        _save_query_conditions(batch, output, args.output_root, overwrite=args.overwrite)
 
 
 def main():

@@ -45,6 +45,19 @@ python -m src.train -c config/label/m2d_sc_stage2_fpasst_fusion.yaml -w workspac
 python -m src.train -c config/label/m2d_sc_stage3_estimated_fpasst_fusion.yaml -w workspace/label
 ```
 
+For the official PretrainedSED multi-branch variant, start with the clean
+stage-1 sibling:
+
+```bash
+python -m src.train -c config/label/m2d_sc_stage1_pretrainedsed_fusion.yaml -w workspace/label
+```
+
+This variant uses frozen BEATs, ATST-F, and fPaSST branches from the
+PretrainedSED v0.0.1 release, projects every branch to the M2D embedding size,
+and defaults to `fusion_strategy: weighted_avg`. It is currently a clean-source
+stage-1 recipe; add stage-2 and stage-3 siblings before treating it as a final
+S5 SC branch.
+
 For pseudo-label or noisy estimated-source caches, keep the earlier stages the
 same and switch only the optional stage-3 SC fine-tuning config to a robust
 sibling:
@@ -149,9 +162,11 @@ attention instead of global full-clip attention.
 | Memory-efficient spatial USS | `config/separation/modified_deft_uss_lite_6s.yaml` | `ModifiedDeFTUSSMemoryEfficient` | Recommended new USS path; local time attention and grouped frequency attention. |
 | KAIST-like oracle TSE, full global DeFT | `config/separation/modified_deft_tse.yaml` | `ModifiedDeFTTSE` | You want the original oracle-enrollment TSE structure and can afford memory. |
 | Memory-efficient oracle TSE | `config/separation/modified_deft_tse_lite_6s.yaml` | `ModifiedDeFTTSEMemoryEfficient` | Recommended new TSE path; fixes the TSE global-attention memory issue. |
+| USS-conditioned temporal TSE | `config/separation/modified_deft_tse_lite_*_temporal_estimated_enrollment_uss_conditioned.yaml` | `ModifiedDeFTTSEMemoryEfficientTemporal` | You want TSE to receive USS proposal/bridge context, not only waveform enrollment plus class label. |
 | Strong M2D source classifier | `config/label/m2d_sc_stage*_strong.yaml` | `M2DSingleClassifierStrong` | Recommended SC path; attentive statistics pooling and multi-crop prediction. |
 | Estimated-source SC fine-tuning | `config/label/m2d_sc_stage3_estimated_strong.yaml` | `EstimatedSourceClassifierDataset` + `M2DSingleClassifierStrong` | Optional final SC adaptation on cached USS/TSE outputs. |
 | Robust estimated-source SC fine-tuning | `config/label/m2d_sc_stage3_estimated_strong_robust.yaml` | `EstimatedSourceClassifierDataset` + robust `m2d_sc_arcface` | Opt-in soft truncation for noisy estimated-source labels. |
+| Temporal strong M2D source classifier | `config/label/m2d_sc_stage*_temporal_strong.yaml` | `M2DSingleClassifierTemporalStrong` | Use when you want span-supervised activity outputs for temporal S5. |
 | Robust temporal estimated-source SC | `config/label/m2d_sc_stage3_estimated_temporal_strong_robust.yaml` | `EstimatedSourceClassifierDataset` + robust/activity `m2d_sc_arcface` | Temporal strong branch with the same noisy-label handling. |
 | M2D + BEATs fusion SC | `config/label/m2d_sc_stage*_beats_fusion.yaml` | `M2DPretrainedFusionClassifier` | Best first pretrained upgrade for classification; keep M2D and add frozen BEATs semantics. |
 | Estimated-source BEATs fusion SC | `config/label/m2d_sc_stage3_estimated_beats_fusion.yaml` | `EstimatedSourceClassifierDataset` + `M2DPretrainedFusionClassifier` | Strongest current SC recipe; adapt the fused classifier to USS/TSE artifacts. |
@@ -159,6 +174,13 @@ attention instead of global full-clip attention.
 | M2D + fPaSST fusion SC | `config/label/m2d_sc_stage*_fpasst_fusion.yaml` | `M2DPretrainedFusionClassifier` | Strong frame-oriented pretrained upgrade; useful when partial event timing cues matter. |
 | Estimated-source fPaSST fusion SC | `config/label/m2d_sc_stage3_estimated_fpasst_fusion.yaml` | `EstimatedSourceClassifierDataset` + `M2DPretrainedFusionClassifier` | Good ablation against BEATs fusion on distorted USS/TSE outputs. |
 | Robust estimated-source fPaSST fusion SC | `config/label/m2d_sc_stage3_estimated_fpasst_fusion_robust.yaml` | `EstimatedSourceClassifierDataset` + robust `m2d_sc_arcface` | Same fPaSST fusion branch with noisy-label soft truncation. |
+| Multi-branch PretrainedSED fusion SC | `config/label/m2d_sc_stage1_pretrainedsed_fusion.yaml` | `M2DPretrainedSEDFusionClassifier` | Clean-source stage-1 experiment that fuses M2D with official BEATs, ATST-F, and fPaSST release branches. |
+| USS count gate | `config/separation/modified_deft_uss_lite_6s_count_head*.yaml` | `ModifiedDeFTUSSMemoryEfficientCountHead` | Predict foreground count and gate excess slots in S5. |
+| USS FOA spatial features | `config/separation/modified_deft_uss_lite_6s_foa_spatial_features*.yaml` | `ModifiedDeFTUSSMemoryEfficientSpatialFeatures*` | Add FOA log-magnitude, AIV, and IPD features before the DeFT separator. |
+| USS residual slots | `config/separation/modified_deft_uss_lite_6s_residual.yaml` | `ModifiedDeFTUSSMemoryEfficientResidual` | Keep extra non-foreground residual/trash slots separate from foreground predictions. |
+| USS spatial-head CAPI candidate | `config/separation/modified_deft_uss_lite_6s_spatial_capi_strong.yaml` | `ModifiedDeFTUSSMemoryEfficientSpatialFeaturesCountSpatialHead` | Current high-feature USS candidate with FOA features, count head, DoA/spatial heads, and CAPI-oriented losses. |
+| AudioSet-Strong source-pool curriculum | See `docs/audioset_strong_augmentation.md` | `DatasetS3(mode=generate)` with `spatial_sound_scene_sources` | Mix official and AudioSet-Strong dry-source pools with explicit ratios instead of folder merges. |
+| Stage diagnostics and calibration | `src/evaluation/evaluate_stage.py`, `src/evaluation/calibrate_sc_energy_thresholds.py` | `StageEvaluator`, calibration CLI | Isolate USS/SC/TSE quality and calibrate per-class SC silence thresholds before final S5 comparisons. |
 | One-stage label-query separator | `config/separation/deft_tse_like.yaml` | `DeFTTSELikeSpatial` | You want a simpler label-query separator instead of `USS -> SC -> TSE`. |
 
 ## What Changed
@@ -255,7 +277,7 @@ have trained mostly the output head instead of the intended backbone blocks.
 
 ### Pretrained Fusion Source Classifier
 
-`M2DPretrainedFusionClassifier` is the first recommended upgrade when the
+`M2DPretrainedFusionClassifier` is the one-auxiliary-branch upgrade when the
 classification branch becomes the bottleneck:
 
 ```text
@@ -274,14 +296,14 @@ embedding, logits, plain_logits, energy
 so the same lightning module, `m2d_sc_arcface` loss, and S5 inference code can
 use it directly.
 
-Recommended model order:
+Recommended one-branch model order:
 
 | Priority | Aux model | Why |
 | ---: | --- | --- |
 | 1 | BEATs | Best first upgrade. It is strong for AudioSet-like event semantics and tends to be useful for noisy separated sources. |
 | 2 | fPaSST | Strong next option when frame-level event timing cues matter more than broad semantic priors. |
-| 3 | ATST / ATST-F | Very attractive when temporal event cues matter, especially for partial source estimates. Use it when you already have the ATST-F code/checkpoints ready. |
-| 4 | AST | Easy to wire through Hugging Face tooling, but usually not the first choice over BEATs/fPaSST/ATST unless your AST checkpoint path is already stable. |
+| 3 | ATST / ATST-F | Attractive when temporal event cues matter. For official PretrainedSED ATST-F, use the multi-branch class below instead of the older single-branch wrapper. |
+| 4 | AST | Not provided as a distinct official PretrainedSED branch. In `M2DPretrainedSEDFusionClassifier`, `AST` is accepted only as a compatibility alias to `fpasst`. |
 
 Current backend support:
 
@@ -296,6 +318,24 @@ Current backend support:
   `embedding`, `features`, or `logits`.
 - `aux_backend: identity`: tiny smoke-test-only fallback; do not use for real
   experiments.
+
+`M2DPretrainedSEDFusionClassifier` is the official PretrainedSED multi-branch
+path. It supports:
+
+```yaml
+pretrainedsed_repo_root: external/PretrainedSED
+pretrainedsed_checkpoint_dir: checkpoint/pretrainedsed
+pretrainedsed_models: [BEATs, ATST-F, fpasst]
+pretrainedsed_checkpoint_variant: strong_1
+freeze_pretrainedsed: true
+fusion_strategy: weighted_avg
+```
+
+The class imports the official PretrainedSED wrappers, loads v0.0.1 release
+assets such as `BEATs_strong_1.pt`, `ATST-F_strong_1.pt`, and
+`fpasst_strong_1.pt`, removes prediction heads for feature-only mode, and
+preserves the same SC `forward()` and `predict()` contracts used by S5. Fusion
+strategies are `weighted_avg`, `concat_head`, and `late_fusion`.
 
 The BEATs config defaults use frozen AudioSet fine-tuned outputs as the
 auxiliary semantic vector:
@@ -320,7 +360,8 @@ aux_embedding_dim: 768
 beats_use_finetuned_logits: false
 ```
 
-For AST through Hugging Face, use this shape of override:
+For a distinct AST checkpoint outside PretrainedSED, the older
+`M2DPretrainedFusionClassifier` can still use Hugging Face:
 
 ```yaml
 aux_model: ast
@@ -471,6 +512,40 @@ after placing the temporal bootstrap weights at
 `config/separation/modified_deft_tse_lite_10s_temporal_estimated_enrollment.yaml`
 after placing the temporal 6s estimated-enrollment checkpoint at
 `checkpoint/modified_deft_tse_lite_6s_temporal_estimated_enrollment.ckpt`.
+
+If the USS branch emits proposal features, or if you want S5 to synthesize a
+compact proposal vector from USS class/count/spatial/activity outputs, use the
+USS-conditioned temporal TSE siblings:
+
+```bash
+python -m src.train \
+  -c config/separation/modified_deft_tse_lite_6s_temporal_estimated_enrollment_uss_conditioned.yaml \
+  -w workspace/separation
+
+python -m src.train \
+  -c config/separation/modified_deft_tse_lite_10s_temporal_estimated_enrollment_uss_conditioned.yaml \
+  -w workspace/separation
+```
+
+These configs add `query_condition_dim: 256` to
+`ModifiedDeFTTSEMemoryEfficientTemporal`. The TSE model accepts
+`query_condition`, `tse_condition`, `bridge_condition`, or
+`proposal_condition`; missing features are allowed so old cache exports still
+run. During full S5 inference, enable `tse_uss_conditioning_enabled: true` so
+USS proposal cues are forwarded into stage-2 and stage-3 TSE:
+
+```bash
+python -m src.evaluation.evaluate \
+  -c src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse.yaml \
+  --result_dir workspace/evaluation
+```
+
+When `export_sc_finetune_cache.py --mode pseudo_s5` is run with a conditioned
+S5 config, it writes the usual `estimate_target/` waveforms and also saves the
+matching per-soundscape proposal tensors under
+`workspace/sc_finetune/uss_bridge_features/`. The conditioned TSE configs read
+those files through `bridge_feature_dir`, keeping the training cache aligned
+with the live S5 handoff.
 
 ### BEATs + M2D Fusion Classifier
 
@@ -1248,11 +1323,23 @@ PY
   `temporal_conditioning` with an optional time-FiLM conditioner, so the TSE
   blocks can change their computation from the predicted active span rather than
   using activity only as a post-hoc waveform gate.
-
-- The current TSE training wrapper uses oracle foreground enrollments from the
-  dataset. The 2025 KAIST-style system trained TSE with USS-generated
-  enrollments, so a future fidelity upgrade is to cache or generate USS
-  enrollments from a trained USS checkpoint.
+- The TSE models also accept `query_condition`, `tse_condition`,
+  `bridge_condition`, or `proposal_condition`. When `query_condition_dim > 0`,
+  this proposal vector is projected into per-query FiLM offsets alongside the
+  class label condition. The S5 wrappers forward USS context only when
+  `tse_uss_conditioning_enabled: true`, so existing evaluation configs keep the
+  old behavior.
+- TSE-only evaluation with `evaluate_stage.py --stage tse` forwards
+  `query_condition`, `tse_condition`, `bridge_condition`,
+  `proposal_condition`, and `temporal_conditioning` when the stage dataset
+  provides them. For live USS-derived proposal handoff, use full S5 evaluation,
+  because oracle TSE stage evaluation does not know the USS proposal-to-oracle
+  slot assignment.
+- Estimated-enrollment TSE configs train on USS/S5-generated enrollment
+  waveforms from `workspace/sc_finetune/estimate_target`. The
+  `*_uss_conditioned.yaml` siblings additionally train TSE to use USS proposal
+  context; this is the preferred alignment path after USS gains new
+  spatial/temporal/activity heads.
 - Per-class energy thresholds for `M2D-SC` should be calibrated from validation
   data instead of relying on a placeholder default.
 - `m2d_sc_arcface.get_loss_func` has an opt-in duplicate-recall term for reducing

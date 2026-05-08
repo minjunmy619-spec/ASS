@@ -26,6 +26,11 @@ def load_bridge_model(config_path, checkpoint_path, device):
         print(f"missing model keys: {len(missing)}")
     if unexpected:
         print(f"unexpected model keys: {len(unexpected)}")
+    if missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint/config mismatch while exporting USS bridge features: "
+            f"missing={list(missing)[:10]}, unexpected={list(unexpected)[:10]}"
+        )
     model.to(device)
     model.eval()
     return model

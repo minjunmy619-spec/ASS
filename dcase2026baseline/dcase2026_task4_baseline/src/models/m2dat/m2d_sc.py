@@ -1,9 +1,11 @@
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.hub import download_url_to_file
 
 from .portable_m2d import PortableM2D
 
@@ -69,6 +71,124 @@ def _resample_waveform(waveform, input_sample_rate, target_sample_rate):
             mode="linear",
             align_corners=False,
         ).squeeze(1)
+
+
+_PRETRAINEDSED_RELEASE_URL = "https://github.com/fschmid56/PretrainedSED/releases/download/v0.0.1"
+_PRETRAINEDSED_ASSETS = {
+    "BEATs_strong_1": f"{_PRETRAINEDSED_RELEASE_URL}/BEATs_strong_1.pt",
+    "ATST-F_strong_1": f"{_PRETRAINEDSED_RELEASE_URL}/ATST-F_strong_1.pt",
+    "fpasst_strong_1": f"{_PRETRAINEDSED_RELEASE_URL}/fpasst_strong_1.pt",
+    "BEATs_weak": f"{_PRETRAINEDSED_RELEASE_URL}/BEATs_weak.pt",
+    "ATST-F_weak": f"{_PRETRAINEDSED_RELEASE_URL}/ATST-F_weak.pt",
+    "fpasst_weak": f"{_PRETRAINEDSED_RELEASE_URL}/fpasst_weak.pt",
+    "BEATs_ssl": f"{_PRETRAINEDSED_RELEASE_URL}/BEATs_ssl.pt",
+    "ATST-F_ssl": f"{_PRETRAINEDSED_RELEASE_URL}/ATST-F_ssl.pt",
+    "fpasst_ssl": f"{_PRETRAINEDSED_RELEASE_URL}/fpasst_ssl.pt",
+}
+
+
+def _canonical_pretrainedsed_model_name(name):
+    aliases = {
+        "beats": "BEATs",
+        "BEATS": "BEATs",
+        "atst": "ATST-F",
+        "ATST": "ATST-F",
+        "atst-f": "ATST-F",
+        "ATST_Frame": "ATST-F",
+        "ATST-Frame": "ATST-F",
+        "ast": "fpasst",
+        "AST": "fpasst",
+        "fPaSST": "fpasst",
+        "PaSST": "fpasst",
+        "passt": "fpasst",
+    }
+    return aliases.get(str(name), str(name))
+
+
+def _checkpoint_name_for_pretrainedsed(model_name, variant="strong_1"):
+    model_name = _canonical_pretrainedsed_model_name(model_name)
+    if model_name not in {"BEATs", "ATST-F", "fpasst"}:
+        raise ValueError(
+            f"Unsupported PretrainedSED model {model_name!r}. "
+            "Use one of: BEATs, ATST-F, fpasst. AST is accepted as a fpasst alias."
+        )
+    if variant not in {"strong_1", "weak", "ssl"}:
+        raise ValueError(f"Unsupported PretrainedSED checkpoint variant: {variant!r}")
+    return f"{model_name}_{variant}"
+
+
+def _resolve_pretrainedsed_checkpoint(checkpoint_dir, checkpoint_name, download_if_missing=True):
+    path = Path(checkpoint_dir) / f"{checkpoint_name}.pt"
+    if path.exists():
+        return path
+    if not download_if_missing:
+        raise FileNotFoundError(
+            f"Missing PretrainedSED checkpoint {path}. Download it from "
+            f"{_PRETRAINEDSED_ASSETS[checkpoint_name]} or enable download_if_missing."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    download_url_to_file(_PRETRAINEDSED_ASSETS[checkpoint_name], str(path))
+    return path
+
+
+def _load_torch_checkpoint(path):
+    try:
+        return torch.load(str(path), map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(str(path), map_location="cpu")
+
+
+def _remap_pretrainedsed_state_dict(checkpoint_name, state_dict):
+    if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
+        state_dict = state_dict["state_dict"]
+
+    if "fpasst" in checkpoint_name:
+        return {
+            ("model.fpasst." + k[len("model."):]) if k.startswith("model.") else k: v
+            for k, v in state_dict.items()
+        }
+    if "M2D" in checkpoint_name:
+        return {
+            ("model.m2d." + k[len("model."):]) if (k.startswith("model.") and not k.startswith("model.m2d.")) else k: v
+            for k, v in state_dict.items()
+        }
+    if "BEATs" in checkpoint_name:
+        return {
+            ("model.beats." + k[len("model.model."):]) if k.startswith("model.model.") else k: v
+            for k, v in state_dict.items()
+        }
+    if "ASIT" in checkpoint_name:
+        return {
+            ("model.asit." + k[len("model."):]) if k.startswith("model.") else k: v
+            for k, v in state_dict.items()
+        }
+    return dict(state_dict)
+
+
+def _drop_pretrainedsed_prediction_heads(state_dict):
+    return {
+        k: v for k, v in state_dict.items()
+        if not (k.startswith("weak_head.") or k.startswith("strong_head."))
+    }
+
+
+def _load_pretrainedsed_feature_checkpoint(model, checkpoint_name, checkpoint_path):
+    state_dict = _load_torch_checkpoint(checkpoint_path)
+    state_dict = _remap_pretrainedsed_state_dict(checkpoint_name, state_dict)
+    state_dict = _drop_pretrainedsed_prediction_heads(state_dict)
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing = [
+        k for k in missing
+        if not (k.startswith("weak_head.") or k.startswith("strong_head.") or "mel_transform" in k)
+    ]
+    unexpected = [k for k in unexpected if "mel_transform" not in k]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint load mismatch for {checkpoint_name}: "
+            f"missing={missing[:10]}, unexpected={unexpected[:10]}"
+        )
+    return missing, unexpected
 
 
 class FrozenPretrainedAudioEncoder(nn.Module):
@@ -459,6 +579,156 @@ class PretrainedFusionHead(nn.Module):
         aux_projected = self.aux_projection(aux_embedding)
         gate = self.gate(torch.cat([m2d_embedding, aux_embedding], dim=-1))
         return self.fusion(m2d_embedding + gate * aux_projected)
+
+
+class _PretrainedSEDFeatureBranch(nn.Module):
+    def __init__(
+        self,
+        repo_root,
+        model_name,
+        checkpoint_dir="checkpoint/pretrainedsed",
+        checkpoint_variant="strong_1",
+        pooling="mean",
+        freeze=True,
+        seq_len=250,
+        embed_dim=768,
+        download_if_missing=True,
+    ):
+        super().__init__()
+        self.model_name = _canonical_pretrainedsed_model_name(model_name)
+        self.pooling = pooling
+        self.freeze = freeze
+        self.output_dim = int(embed_dim)
+
+        repo_root = Path(repo_root).expanduser().resolve()
+        if not repo_root.exists():
+            raise FileNotFoundError(f"pretrainedsed_repo_root does not exist: {repo_root}")
+        repo_root = str(repo_root)
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+
+        try:
+            from models.atstframe.ATSTF_wrapper import ATSTWrapper
+            from models.beats.BEATs_wrapper import BEATsWrapper
+            from models.frame_passt.fpasst_wrapper import FPaSSTWrapper
+            from models.prediction_wrapper import PredictionsWrapper
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Could not import official PretrainedSED wrappers. Set pretrainedsed_repo_root "
+                "to a clone of https://github.com/fschmid56/PretrainedSED."
+            ) from exc
+
+        if self.model_name == "BEATs":
+            base_model = BEATsWrapper()
+        elif self.model_name == "ATST-F":
+            base_model = ATSTWrapper()
+        elif self.model_name == "fpasst":
+            base_model = FPaSSTWrapper()
+        else:
+            raise ValueError(f"Unsupported PretrainedSED model: {self.model_name}")
+
+        self.wrapper = PredictionsWrapper(
+            base_model,
+            checkpoint=None,
+            embed_dim=self.output_dim,
+            seq_len=seq_len,
+            head_type=None,
+        )
+        checkpoint_name = _checkpoint_name_for_pretrainedsed(self.model_name, checkpoint_variant)
+        checkpoint_path = _resolve_pretrainedsed_checkpoint(
+            checkpoint_dir,
+            checkpoint_name,
+            download_if_missing=download_if_missing,
+        )
+        _load_pretrainedsed_feature_checkpoint(self.wrapper, checkpoint_name, checkpoint_path)
+
+        if self.freeze:
+            _set_requires_grad(self.wrapper, False)
+            self.wrapper.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze:
+            self.wrapper.eval()
+        return self
+
+    def _pool_sequence(self, sequence):
+        if sequence.dim() == 2:
+            return sequence
+        if self.pooling == "cls":
+            return sequence[:, 0]
+        if self.pooling == "max":
+            return sequence.amax(dim=1)
+        if self.pooling == "mean":
+            return sequence.mean(dim=1)
+        raise ValueError(f"Unsupported PretrainedSED pooling: {self.pooling}")
+
+    def forward(self, waveform_16k):
+        grad_enabled = torch.is_grad_enabled() and not self.freeze
+        with torch.set_grad_enabled(grad_enabled):
+            mel = self.wrapper.mel_forward(waveform_16k)
+            sequence = self.wrapper(mel)
+            if isinstance(sequence, (tuple, list)):
+                raise RuntimeError("Expected sequence output from PretrainedSED head_type=None branch.")
+            embedding = self._pool_sequence(sequence)
+        return embedding.detach() if self.freeze else embedding
+
+
+class _MultiBranchPretrainedSEDFusion(nn.Module):
+    def __init__(
+        self,
+        branch_dims,
+        output_dim,
+        hidden_dim=1024,
+        dropout=0.2,
+        fusion_strategy="weighted_avg",
+    ):
+        super().__init__()
+        self.branch_names = tuple(branch_dims.keys())
+        self.fusion_strategy = fusion_strategy
+        self.projectors = nn.ModuleDict({
+            name: nn.Sequential(
+                nn.LayerNorm(dim),
+                nn.Linear(dim, output_dim),
+            )
+            for name, dim in branch_dims.items()
+        })
+        self.branch_weight_logits = nn.Parameter(torch.zeros(len(self.branch_names)))
+
+        if fusion_strategy == "concat_head":
+            concat_dim = output_dim * len(self.branch_names)
+            self.concat_head = nn.Sequential(
+                nn.LayerNorm(concat_dim),
+                nn.Linear(concat_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+                nn.LayerNorm(output_dim),
+            )
+        elif fusion_strategy in {"weighted_avg", "late_fusion"}:
+            self.concat_head = None
+        else:
+            raise ValueError(
+                f"Unsupported fusion_strategy: {fusion_strategy}. "
+                "Use weighted_avg, concat_head, or late_fusion."
+            )
+
+    def global_weights(self):
+        return torch.softmax(self.branch_weight_logits, dim=0)
+
+    def project(self, branch_embeddings):
+        return OrderedDict(
+            (name, self.projectors[name](branch_embeddings[name]))
+            for name in self.branch_names
+        )
+
+    def fuse(self, projected):
+        if self.fusion_strategy == "concat_head":
+            return self.concat_head(torch.cat([projected[name] for name in self.branch_names], dim=-1)), None
+
+        weights = self.global_weights()
+        fused = sum(weights[i] * projected[name] for i, name in enumerate(self.branch_names))
+        return fused, weights
 
 
 class M2DSingleClassifier(PortableM2D):
@@ -942,3 +1212,203 @@ class M2DPretrainedFusionClassifier(M2DSingleClassifierStrong):
         m2d_embedding = super()._embed_waveform(waveform)
         aux_embedding = self.aux_encoder(waveform)
         return self.fusion_head(m2d_embedding, aux_embedding)
+
+
+class M2DPretrainedSEDFusionClassifier(M2DSingleClassifierStrong):
+    """M2D source classifier fused with official PretrainedSED release branches.
+
+    This opt-in variant keeps the same public source-classifier return contract
+    as ``M2DSingleClassifierStrong`` while adding frozen BEATs, ATST-F, and
+    fPaSST feature branches from PretrainedSED v0.0.1.
+    """
+
+    def __init__(
+        self,
+        weight_file,
+        num_classes=18,
+        embedding_dim=512,
+        m2d_embedding_dim=None,
+        finetuning_layers="2_blocks",
+        pooling_hidden_dim=512,
+        projection_hidden_dim=1024,
+        dropout=0.2,
+        energy_thresholds=None,
+        ref_channel=None,
+        eval_crop_seconds=None,
+        eval_crop_hop_seconds=None,
+        pretrainedsed_repo_root=None,
+        pretrainedsed_checkpoint_dir="checkpoint/pretrainedsed",
+        pretrainedsed_models=("BEATs", "ATST-F", "fpasst"),
+        pretrainedsed_checkpoint_variant="strong_1",
+        pretrainedsed_pooling="mean",
+        pretrainedsed_seq_len=250,
+        pretrainedsed_embed_dim=768,
+        pretrainedsed_download_if_missing=True,
+        freeze_pretrainedsed=True,
+        fusion_strategy="weighted_avg",
+        fusion_hidden_dim=1024,
+        input_sample_rate=None,
+    ):
+        self.m2d_embedding_dim = m2d_embedding_dim or embedding_dim
+        super().__init__(
+            weight_file=weight_file,
+            num_classes=num_classes,
+            embedding_dim=self.m2d_embedding_dim,
+            finetuning_layers=finetuning_layers,
+            pooling_hidden_dim=pooling_hidden_dim,
+            projection_hidden_dim=projection_hidden_dim,
+            dropout=dropout,
+            energy_thresholds=energy_thresholds,
+            ref_channel=ref_channel,
+            eval_crop_seconds=eval_crop_seconds,
+            eval_crop_hop_seconds=eval_crop_hop_seconds,
+        )
+
+        if pretrainedsed_repo_root is None:
+            raise ValueError("pretrainedsed_repo_root must point to a PretrainedSED clone.")
+
+        canonical_models = tuple(_canonical_pretrainedsed_model_name(name) for name in pretrainedsed_models)
+        if len(set(canonical_models)) != len(canonical_models):
+            raise ValueError(f"Duplicate PretrainedSED branches after alias resolution: {canonical_models}")
+        self.pretrainedsed_models = canonical_models
+
+        self.pretrainedsed_branches = nn.ModuleDict({
+            name: _PretrainedSEDFeatureBranch(
+                repo_root=pretrainedsed_repo_root,
+                model_name=name,
+                checkpoint_dir=pretrainedsed_checkpoint_dir,
+                checkpoint_variant=pretrainedsed_checkpoint_variant,
+                pooling=pretrainedsed_pooling,
+                freeze=freeze_pretrainedsed,
+                seq_len=pretrainedsed_seq_len,
+                embed_dim=pretrainedsed_embed_dim,
+                download_if_missing=pretrainedsed_download_if_missing,
+            )
+            for name in self.pretrainedsed_models
+        })
+
+        branch_dims = OrderedDict([("m2d", self.m2d_embedding_dim)])
+        for name, branch in self.pretrainedsed_branches.items():
+            branch_dims[name] = branch.output_dim
+
+        self.fusion = _MultiBranchPretrainedSEDFusion(
+            branch_dims=branch_dims,
+            output_dim=embedding_dim,
+            hidden_dim=fusion_hidden_dim,
+            dropout=dropout,
+            fusion_strategy=fusion_strategy,
+        )
+        self.arc_head = ArcMarginProduct(embedding_dim, out_features=num_classes)
+        self.input_sample_rate = input_sample_rate or getattr(
+            self.cfg,
+            "sample_rate",
+            32000 if getattr(self.cfg, "sr", "32k") == "32k" else 16000,
+        )
+
+    def _collect_branch_embeddings(self, waveform):
+        branch_embeddings = OrderedDict()
+        branch_embeddings["m2d"] = super()._embed_waveform(waveform)
+
+        waveform_16k = _resample_waveform(waveform, self.input_sample_rate, 16000)
+        for name, branch in self.pretrainedsed_branches.items():
+            branch_embeddings[name] = branch(waveform_16k)
+        return branch_embeddings
+
+    def _fused_outputs(self, waveform, class_index=None):
+        branch_embeddings = self._collect_branch_embeddings(waveform)
+        projected = self.fusion.project(branch_embeddings)
+
+        if self.fusion.fusion_strategy == "late_fusion":
+            weights = self.fusion.global_weights()
+            plain_logits = sum(
+                weights[i] * self.arc_head(projected[name], None)
+                for i, name in enumerate(self.fusion.branch_names)
+            )
+            logits = sum(
+                weights[i] * self.arc_head(projected[name], class_index)
+                for i, name in enumerate(self.fusion.branch_names)
+            )
+            embedding = sum(
+                weights[i] * projected[name]
+                for i, name in enumerate(self.fusion.branch_names)
+            )
+            return embedding, plain_logits, logits, weights
+
+        embedding, weights = self.fusion.fuse(projected)
+        plain_logits = self.arc_head(embedding, None)
+        logits = self.arc_head(embedding, class_index)
+        return embedding, plain_logits, logits, weights
+
+    def _plain_logits_from_waveform(self, waveform):
+        embedding, plain_logits, _, _ = self._fused_outputs(waveform, class_index=None)
+        return embedding, plain_logits
+
+    def forward(self, input_dict):
+        waveform = self._prepare_audio(input_dict["waveform"])
+        class_index = input_dict.get("class_index")
+
+        if (not self.training) and (self.eval_crop_seconds is not None):
+            embeddings = []
+            plain_logits_all = []
+            logits_all = []
+            branch_weights_all = []
+            for crop in self._iter_eval_crops(waveform):
+                embedding, plain_logits, logits, branch_weights = self._fused_outputs(crop, class_index)
+                embeddings.append(embedding)
+                plain_logits_all.append(plain_logits)
+                logits_all.append(logits)
+                if branch_weights is not None:
+                    branch_weights_all.append(branch_weights)
+            embedding = torch.stack(embeddings, dim=0).mean(dim=0)
+            plain_logits = torch.stack(plain_logits_all, dim=0).mean(dim=0)
+            logits = torch.stack(logits_all, dim=0).mean(dim=0)
+            branch_weights = torch.stack(branch_weights_all, dim=0).mean(dim=0) if branch_weights_all else None
+        else:
+            embedding, plain_logits, logits, branch_weights = self._fused_outputs(waveform, class_index)
+
+        energy = -torch.logsumexp(plain_logits, dim=-1)
+        output = {
+            "embedding": embedding,
+            "logits": logits,
+            "plain_logits": plain_logits,
+            "energy": energy,
+        }
+        if branch_weights is not None:
+            output["branch_weights"] = branch_weights
+        return output
+
+    def predict(self, input_dict):
+        waveform = self._prepare_audio(input_dict["waveform"])
+        plain_logits_all = []
+        branch_weights_all = []
+        for crop in self._iter_eval_crops(waveform):
+            _, plain_logits, _, branch_weights = self._fused_outputs(crop, class_index=None)
+            plain_logits_all.append(plain_logits)
+            if branch_weights is not None:
+                branch_weights_all.append(branch_weights)
+        plain_logits = torch.stack(plain_logits_all, dim=0).mean(dim=0)
+        energy = -torch.logsumexp(plain_logits, dim=-1)
+
+        probs = torch.softmax(plain_logits, dim=-1)
+        values, indices = torch.max(probs, dim=-1)
+        raw_labels = F.one_hot(indices, num_classes=self.num_classes).float()
+        labels = raw_labels.clone()
+
+        silence = []
+        for idx, evalue in zip(indices.tolist(), energy.tolist()):
+            threshold = self.energy_thresholds.get(str(idx), self.energy_thresholds.get(idx, self.energy_thresholds.get("default", None)))
+            silence.append(False if threshold is None else evalue > threshold)
+        silence = torch.tensor(silence, device=labels.device, dtype=torch.bool)
+        labels[silence] = 0.0
+
+        output = {
+            "label_vector": labels,
+            "raw_label_vector": raw_labels,
+            "class_indices": indices,
+            "probabilities": values,
+            "energy": energy,
+            "silence": silence,
+        }
+        if branch_weights_all:
+            output["branch_weights"] = torch.stack(branch_weights_all, dim=0).mean(dim=0)
+        return output

@@ -1,5 +1,5 @@
 task_name: modified_deft_uss_lite_6s_spatial_capi_strong
-description: Current strongest USS training start: FOA logmag/AIV/IPD features, count head, per-slot spatial head, soft CAPI-SDRi assignment, DoA supervision, and same-class anti-collapse losses.
+description: "Current strongest USS training start: FOA logmag/AIV/IPD features, count head, per-slot spatial head, soft CAPI-SDRi assignment, DoA supervision, and same-class anti-collapse losses."
 
 deterministic: true
 manual_seed: 0

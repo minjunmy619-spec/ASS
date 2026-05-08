@@ -37,17 +37,16 @@ datamodule:
       persistent_workers: false
       dataset:
         module: src.datamodules.source_classifier_dataset
-        main: SourceClassifierDataset
+        main: EstimatedSourceClassifierDataset
         args:
+          source_prefix: est
           base_dataset:
             args:
               config:
-                mode: metadata
-                metadata_list: data/dev_set/metadata/valid.json
-                fg_return:
-                  dry: true
-                  dry_channel: 0
-                  metadata: true
+                mode: waveform
+                soundscape_dir: workspace/sc_finetune_valid/soundscape
+                oracle_target_dir: workspace/sc_finetune_valid/oracle_target
+                estimate_target_dir: workspace/sc_finetune_valid/estimate_target
                 sr: 32000
               n_sources: 3
               label_set: dcase2026t4
