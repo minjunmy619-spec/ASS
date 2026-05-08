@@ -33,6 +33,17 @@ def _crop_spans(span_sec, start_sample, length, sample_rate):
     return out
 
 
+def _span_active_mask(span_sec):
+    if span_sec is None:
+        return None
+    return (span_sec[..., 0] >= 0.0) & (span_sec[..., 1] > span_sec[..., 0])
+
+
+def _waveform_active_mask(waveform, energy_eps):
+    flat = waveform.flatten(start_dim=1).float()
+    return flat.pow(2).sum(dim=-1) > float(energy_eps)
+
+
 class TSEDataset(torch.utils.data.Dataset):
     def __init__(self, base_dataset):
         args = base_dataset["args"].copy()
@@ -79,6 +90,7 @@ class EstimatedEnrollmentTSEDataset(torch.utils.data.Dataset):
         crop_seconds=None,
         random_crop=True,
         require_estimate_for_active=True,
+        active_energy_eps=1e-8,
     ):
         args = base_dataset["args"].copy() if isinstance(base_dataset, dict) else None
         if args is not None:
@@ -91,6 +103,7 @@ class EstimatedEnrollmentTSEDataset(torch.utils.data.Dataset):
         self.crop_seconds = crop_seconds
         self.random_crop = bool(random_crop)
         self.require_estimate_for_active = bool(require_estimate_for_active)
+        self.active_energy_eps = float(active_energy_eps)
 
         if self.label_source not in {"oracle", "estimate"}:
             raise ValueError("label_source must be 'oracle' or 'estimate'")
@@ -141,7 +154,17 @@ class EstimatedEnrollmentTSEDataset(torch.utils.data.Dataset):
         estimate_present = torch.tensor([label != "silence" for label in item["est_label"]], dtype=torch.bool)
         label_active = torch.tensor([label != "silence" for label in labels], dtype=torch.bool)
         active_mask = label_active & oracle_active
+        target_span_active = _span_active_mask(item.get("span_sec"))
+        if target_span_active is not None:
+            active_mask = active_mask & target_span_active
+        else:
+            active_mask = active_mask & _waveform_active_mask(item["dry_sources"], self.active_energy_eps)
         if self.require_estimate_for_active:
+            estimate_span_active = _span_active_mask(item.get("est_span_sec"))
+            if estimate_span_active is not None:
+                estimate_present = estimate_present & estimate_span_active
+            elif "est_dry_sources" in item:
+                estimate_present = estimate_present & _waveform_active_mask(item["est_dry_sources"], self.active_energy_eps)
             active_mask = active_mask & estimate_present
 
         waveform = item["dry_sources"].clone()

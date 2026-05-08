@@ -39,6 +39,73 @@ def pairwise_mse_loss(waveform_pred, waveform_target):
     return (pred.unsqueeze(1) - target.unsqueeze(2)).pow(2).mean(dim=-1)
 
 
+class _DummyBaseDataset:
+    n_sources = 3
+    sr = 1
+    collate_fn = None
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, idx):
+        dry_sources = torch.zeros(3, 1, 10)
+        est_dry_sources = torch.zeros(3, 1, 10)
+        dry_sources[0, 0, 0:1] = 1.0
+        est_dry_sources[0, 0, 0:1] = 1.0
+        dry_sources[1, 0, 3:5] = 1.0
+        est_dry_sources[1, 0, 3:5] = 1.0
+        label_vector = torch.eye(18)[:3]
+        return {
+            "mixture": torch.zeros(4, 10),
+            "dry_sources": dry_sources,
+            "est_dry_sources": est_dry_sources,
+            "label": ["AlarmClock", "BicycleBell", "silence"],
+            "est_label": ["AlarmClock", "BicycleBell", "silence"],
+            "label_vector": label_vector,
+            "est_label_vector": label_vector.clone(),
+            "span_sec": torch.tensor([[0.0, 1.0], [3.0, 5.0], [-1.0, -1.0]]),
+            "est_span_sec": torch.tensor([[0.0, 1.0], [3.0, 5.0], [-1.0, -1.0]]),
+        }
+
+
+def test_estimated_enrollment_crop_deactivates_out_of_window_sources():
+    dataset = EstimatedEnrollmentTSEDataset(
+        _DummyBaseDataset(),
+        crop_seconds=6.0,
+        random_crop=False,
+        require_estimate_for_active=True,
+    )
+
+    item = dataset[0]
+
+    assert item["active_mask"].tolist() == [False, True, False]
+    assert item["waveform"][0].abs().sum() == 0
+    assert item["label_vector"][0].abs().sum() == 0
+    assert item["label_vector"][1].abs().sum() > 0
+
+
+def test_temporal_sc_eval_activity_is_stitched_across_crops():
+    model = object.__new__(M2DSingleClassifierTemporalStrong)
+    activity_chunks = [
+        torch.ones(1, 5),
+        torch.ones(1, 5) * 2.0,
+        torch.ones(1, 5) * 3.0,
+    ]
+
+    stitched = model._stitch_eval_activity(
+        activity_chunks,
+        crop_starts=[0, 2, 5],
+        total_samples=10,
+        crop_samples=5,
+    )
+
+    assert stitched.shape == (1, 10)
+    assert torch.allclose(stitched[:, :2], torch.ones(1, 2))
+    assert torch.allclose(stitched[:, 2:5], torch.full((1, 3), 1.5))
+    assert torch.allclose(stitched[:, 5:7], torch.full((1, 2), 2.5))
+    assert torch.allclose(stitched[:, 7:], torch.full((1, 3), 3.0))
+
+
 def test_duplicate_same_class_target_swap_gives_low_loss():
     pred = torch.tensor([[[[0.0, 1.0, 0.0, 0.0]], [[1.0, 0.0, 0.0, 0.0]], [[0.0, 0.0, 1.0, 0.0]]]])
     target = torch.tensor([[[[1.0, 0.0, 0.0, 0.0]], [[0.0, 1.0, 0.0, 0.0]], [[0.0, 0.0, 1.0, 0.0]]]])

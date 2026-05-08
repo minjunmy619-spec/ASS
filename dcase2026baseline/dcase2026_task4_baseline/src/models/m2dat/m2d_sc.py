@@ -940,21 +940,27 @@ class M2DSingleClassifierStrong(PortableM2D):
             "energy": energy,
         }
 
-    def _iter_eval_crops(self, waveform):
+    def _eval_sample_rate(self):
+        return getattr(self.cfg, "sample_rate", 32000 if getattr(self.cfg, "sr", "32k") == "32k" else 16000)
+
+    def _iter_eval_crop_slices(self, waveform):
         if self.eval_crop_seconds is None:
-            return [waveform]
-        sample_rate = getattr(self.cfg, "sample_rate", 32000 if getattr(self.cfg, "sr", "32k") == "32k" else 16000)
+            return [(0, waveform)]
+        sample_rate = self._eval_sample_rate()
         crop_samples = int(round(float(self.eval_crop_seconds) * sample_rate))
         hop_seconds = self.eval_crop_hop_seconds or self.eval_crop_seconds
         hop_samples = int(round(float(hop_seconds) * sample_rate))
         if crop_samples <= 0 or hop_samples <= 0 or waveform.shape[-1] <= crop_samples:
-            return [waveform]
+            return [(0, waveform)]
 
         starts = list(range(0, waveform.shape[-1] - crop_samples + 1, hop_samples))
         last_start = waveform.shape[-1] - crop_samples
         if starts[-1] != last_start:
             starts.append(last_start)
-        return [waveform[..., start : start + crop_samples] for start in starts]
+        return [(start, waveform[..., start : start + crop_samples]) for start in starts]
+
+    def _iter_eval_crops(self, waveform):
+        return [crop for _, crop in self._iter_eval_crop_slices(waveform)]
 
     def predict(self, input_dict):
         waveform = self._prepare_audio(input_dict["waveform"])
@@ -1047,19 +1053,49 @@ class M2DSingleClassifierTemporalStrong(M2DSingleClassifierStrong):
         pooled = self._temporal_pool(features, activity_logits)
         return self.embedding(pooled), activity_logits
 
+    def _stitch_eval_activity(self, activity_chunks, crop_starts, total_samples, crop_samples):
+        if len(activity_chunks) == 1 and crop_starts[0] == 0 and crop_samples >= total_samples:
+            return activity_chunks[0]
+        crop_frames = activity_chunks[0].shape[-1]
+        total_frames = max(1, int(round(float(crop_frames) * float(total_samples) / float(crop_samples))))
+        stitched = activity_chunks[0].new_zeros(activity_chunks[0].shape[0], total_frames)
+        weights = activity_chunks[0].new_zeros(1, total_frames)
+        for start, activity in zip(crop_starts, activity_chunks):
+            frame_start = int(round(float(start) * float(total_frames) / float(total_samples)))
+            frame_end = int(round(float(start + crop_samples) * float(total_frames) / float(total_samples)))
+            frame_start = max(0, min(frame_start, total_frames - 1))
+            frame_end = max(frame_start + 1, min(frame_end, total_frames))
+            target_frames = frame_end - frame_start
+            if activity.shape[-1] != target_frames:
+                activity = F.interpolate(
+                    activity.unsqueeze(1),
+                    size=target_frames,
+                    mode="linear",
+                    align_corners=False,
+                ).squeeze(1)
+            stitched[:, frame_start:frame_end] += activity
+            weights[:, frame_start:frame_end] += 1.0
+        return stitched / weights.clamp_min(1.0)
+
     def forward(self, input_dict):
         waveform = self._prepare_audio(input_dict["waveform"])
         if (not self.training) and (self.eval_crop_seconds is not None):
             embeddings = []
             activity_logits_all = []
             plain_logits_all = []
-            for crop in self._iter_eval_crops(waveform):
+            crop_slices = self._iter_eval_crop_slices(waveform)
+            for _, crop in crop_slices:
                 crop_embedding, crop_activity_logits = self._embed_waveform_with_activity(crop)
                 embeddings.append(crop_embedding)
                 activity_logits_all.append(crop_activity_logits)
                 plain_logits_all.append(self.arc_head(crop_embedding, None))
             embedding = torch.stack(embeddings, dim=0).mean(dim=0)
-            activity_logits = torch.stack(activity_logits_all, dim=0).mean(dim=0)
+            activity_logits = self._stitch_eval_activity(
+                activity_logits_all,
+                [start for start, _ in crop_slices],
+                waveform.shape[-1],
+                crop_slices[0][1].shape[-1],
+            )
             plain_logits = torch.stack(plain_logits_all, dim=0).mean(dim=0)
         else:
             embedding, activity_logits = self._embed_waveform_with_activity(waveform)
@@ -1086,7 +1122,8 @@ class M2DSingleClassifierTemporalStrong(M2DSingleClassifierStrong):
         plain_logits_all = []
         activity_all = []
         energy_all = []
-        for crop in self._iter_eval_crops(waveform):
+        crop_slices = self._iter_eval_crop_slices(waveform)
+        for _, crop in crop_slices:
             embedding, activity_logits = self._embed_waveform_with_activity(crop)
             plain_logits = self.arc_head(embedding, None)
             plain_logits_all.append(plain_logits)
@@ -1114,7 +1151,12 @@ class M2DSingleClassifierTemporalStrong(M2DSingleClassifierStrong):
             "probabilities": values,
             "energy": energy,
             "silence": silence,
-            "activity_probabilities": activity_all[0],
+            "activity_probabilities": self._stitch_eval_activity(
+                activity_all,
+                [start for start, _ in crop_slices],
+                waveform.shape[-1],
+                crop_slices[0][1].shape[-1],
+            ),
         }
 
 
