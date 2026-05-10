@@ -92,9 +92,48 @@ def rt192k(
     )
 
 
+def rt192k_plus(
+    n_freq: int,
+    *,
+    n_src: int = 3,
+    n_chan: int = 1,
+    masking: bool = True,
+) -> BandSCNetNPU:
+    """Quality-biased preset with wider separator channels.
+
+    Separator width C_s=56, L=2, Kt=3 with bounded causal attention in every
+    NarrowBandBlock (W=16, heads=4, head_dim=8). Wider than rt192k (56 vs 40)
+    but fewer stages (2 vs 3) to stay under 192 KiB.
+
+    At n_freq=2049: ~73K params, ~178 KiB streaming state (fp16).
+    Use this when the DSP 192 KiB quota is confirmed and maximum per-frame
+    capacity is desired without exceeding the budget.
+    """
+    return BandSCNetNPU(
+        n_freq=n_freq,
+        n_src=n_src,
+        n_chan=n_chan,
+        channels=56,
+        pyramid_channels=8,
+        num_stages=2,
+        time_kernel=3,
+        freq_kernel=3,
+        pyramid_time_kernel=3,
+        pyramid_freq_kernel=3,
+        pyramid_conv_blocks=(1, 1, 1),
+        pyramid_strides=(2, 2, 4),
+        use_attn=True,
+        attn_window=16,
+        num_heads=4,
+        head_dim=8,
+        masking=masking,
+    )
+
+
 _PRESETS = {
     "edge_small": edge_small,
     "rt192k": rt192k,
+    "rt192k_plus": rt192k_plus,
 }
 
 
