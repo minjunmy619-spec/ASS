@@ -13,6 +13,7 @@ from .tiger_online import (
     TIGERStreamingTrainingWrapper,
 )
 from .tiger_npu_edge import NPUEdgeCtxExportWrapper, TIGERNPUEdgeV1, export_tiger_npu_edge_onnx
+from .tiger_npu_edge_v2 import TIGERNPUEdgeV2, NPUEdgeV2ExportWrapper, export_tiger_npu_edge_v2_onnx
 
 __all__ = [
     "OfflineTIGER",
@@ -31,4 +32,7 @@ __all__ = [
     "TIGERNPUEdgeV1",
     "NPUEdgeCtxExportWrapper",
     "export_tiger_npu_edge_onnx",
+    "TIGERNPUEdgeV2",
+    "NPUEdgeV2ExportWrapper",
+    "export_tiger_npu_edge_v2_onnx",
 ]
