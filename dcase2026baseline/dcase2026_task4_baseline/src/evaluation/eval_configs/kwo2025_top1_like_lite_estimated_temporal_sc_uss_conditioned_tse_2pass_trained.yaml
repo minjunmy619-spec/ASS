@@ -20,7 +20,7 @@ model:
         label_set: dcase2026t4
         uss_ckpt: checkpoint/modified_deft_uss_lite_6s_unified_all_features.ckpt
         sc_ckpt: checkpoint/m2d_sc_stage3_estimated_pretrainedsed_fusion.ckpt
-        tse_ckpt: checkpoint/modified_deft_tse_lite_6s_online_teacher_unified_uss_sc.ckpt
+        tse_ckpt: checkpoint/modified_deft_tse_lite_6s_online_teacher_unified_uss_sc_2pass.ckpt
         activity_threshold: 0.5
         temporal_conditioning_enabled: true
         activity_gating_enabled: true

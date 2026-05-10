@@ -3,6 +3,7 @@ import torch.nn.functional as F
 
 from src.training.loss.uss_loss import get_loss_func as get_base_uss_loss_func
 from src.training.loss.class_aware_pit import pairwise_sa_sdr_loss, pit_from_pairwise_loss
+from src.training.loss.uss_residual_loss import _mix_loss, _residual_loss
 
 
 def _active_mask(target):
@@ -54,11 +55,21 @@ def _doa_loss(output, target, best_perm, active):
         return output["class_logits"].new_zeros(())
     pred = _gather_slots(output["pred_doa_vector"], best_perm)
     target_doa = target["spatial_vector"].to(device=pred.device, dtype=pred.dtype)
+    doa_mask = target.get("foreground_doa_mask", target.get("spatial_vector_mask"))
     if target_doa.shape[1] < pred.shape[1]:
         pad = target_doa.new_zeros(target_doa.shape[0], pred.shape[1] - target_doa.shape[1], target_doa.shape[-1])
         target_doa = torch.cat([target_doa, pad], dim=1)
     elif target_doa.shape[1] > pred.shape[1]:
         target_doa = target_doa[:, : pred.shape[1]]
+    active = active.to(device=pred.device, dtype=torch.bool)
+    if doa_mask is not None:
+        doa_mask = doa_mask.to(device=pred.device, dtype=torch.bool)
+        if doa_mask.shape[1] < pred.shape[1]:
+            pad = torch.zeros(doa_mask.shape[0], pred.shape[1] - doa_mask.shape[1], device=pred.device, dtype=torch.bool)
+            doa_mask = torch.cat([doa_mask, pad], dim=1)
+        elif doa_mask.shape[1] > pred.shape[1]:
+            doa_mask = doa_mask[:, : pred.shape[1]]
+        active = active & doa_mask
     pred = F.normalize(pred, dim=-1)
     target_doa = F.normalize(target_doa, dim=-1)
     loss = 1.0 - (pred * target_doa).sum(dim=-1)
@@ -122,6 +133,10 @@ def get_loss_func(
     lambda_bridge_infonce=0.02,
     lambda_bridge_doa=0.05,
     lambda_bridge_norm=0.001,
+    lambda_residual_slot=0.0,
+    lambda_mix=0.0,
+    residual_stft_fft_sizes=(512, 1024, 2048),
+    residual_ref_channel=0,
     bridge_temperature=0.1,
     lambda_class_match=1.0,
     **base_uss_loss_kwargs,
@@ -132,6 +147,8 @@ def get_loss_func(
     all bridge losses are zero and the returned main loss equals the base USS loss.
     """
     base_loss_func = get_base_uss_loss_func(**base_uss_loss_kwargs)
+    residual_stft_fft_sizes = tuple(int(x) for x in residual_stft_fft_sizes)
+    residual_ref_channel = int(residual_ref_channel)
 
     def loss_func(output, target):
         loss_dict = base_loss_func(output, target)
@@ -168,7 +185,15 @@ def get_loss_func(
             + lambda_bridge_doa * loss_doa
             + lambda_bridge_norm * loss_norm
         )
-        loss_dict["loss"] = loss_dict["loss"] + bridge_loss
+        loss_residual_slot, loss_residual_slot_mae, loss_residual_slot_stft = _residual_loss(
+            output,
+            target,
+            residual_ref_channel,
+            residual_stft_fft_sizes,
+        )
+        loss_mix = _mix_loss(output, target, residual_ref_channel)
+        residual_loss = lambda_residual_slot * loss_residual_slot + lambda_mix * loss_mix
+        loss_dict["loss"] = loss_dict["loss"] + bridge_loss + residual_loss
         loss_dict.update(
             {
                 "loss_bridge": bridge_loss,
@@ -177,6 +202,10 @@ def get_loss_func(
                 "loss_bridge_infonce": loss_infonce,
                 "loss_bridge_doa": loss_doa,
                 "loss_bridge_norm": loss_norm,
+                "loss_residual_slot": loss_residual_slot,
+                "loss_residual_slot_mae": loss_residual_slot_mae,
+                "loss_residual_slot_stft": loss_residual_slot_stft,
+                "loss_mix": loss_mix,
             }
         )
         return loss_dict

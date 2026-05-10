@@ -1,0 +1,151 @@
+task_name: m2d_sc_stage3_estimated_pretrainedsed_fusion
+description: >
+  Fine-tune the multi-branch PretrainedSED-fusion M2D source classifier on
+  cached Universal USS estimated source waveforms.
+
+deterministic: true
+manual_seed: 0
+
+datamodule:
+  module: src.datamodules.datamodule
+  main: DataModule
+  args:
+    train_dataloader:
+      batch_size: 24
+      num_workers: 8
+      persistent_workers: false
+      dataset:
+        module: src.datamodules.source_classifier_dataset
+        main: EstimatedSourceClassifierDataset
+        args:
+          source_prefix: est
+          base_dataset:
+            args:
+              config:
+                mode: waveform
+                soundscape_dir: workspace/sc_finetune_universal/soundscape
+                oracle_target_dir: workspace/sc_finetune_universal/oracle_target
+                estimate_target_dir: workspace/sc_finetune_universal/estimate_target
+                sr: 32000
+              n_sources: 3
+              label_set: dcase2026t4
+              return_source: true
+              label_vector_mode: stack
+              silence_label_mode: zeros
+              return_meta: false
+    val_dataloader:
+      batch_size: 24
+      num_workers: 8
+      persistent_workers: false
+      dataset:
+        module: src.datamodules.source_classifier_dataset
+        main: EstimatedSourceClassifierDataset
+        args:
+          source_prefix: est
+          base_dataset:
+            args:
+              config:
+                mode: waveform
+                soundscape_dir: workspace/sc_finetune_universal_valid/soundscape
+                oracle_target_dir: workspace/sc_finetune_universal_valid/oracle_target
+                estimate_target_dir: workspace/sc_finetune_universal_valid/estimate_target
+                sr: 32000
+              n_sources: 3
+              label_set: dcase2026t4
+              return_source: true
+              label_vector_mode: stack
+              silence_label_mode: zeros
+              return_meta: false
+lightning_module:
+  module: src.training.lightningmodule.single_label_classification
+  main: SingleLabelClassificationLightning
+  args:
+    pretrained_model_ckpt: checkpoint/m2d_sc_stage1_pretrainedsed_fusion.ckpt
+    pretrained_model_strict: true
+    model:
+      module: src.models.m2dat.m2d_sc
+      main: M2DPretrainedSEDFusionClassifier
+      args:
+        weight_file:
+          checkpoint/m2d_as_vit_base-80x1001p16x16p32k-240413_AS-FT_enconly/weights_ep69it3124-0.47998.pth
+        num_classes: 18
+        embedding_dim: 512
+        m2d_embedding_dim: 512
+        pooling_hidden_dim: 512
+        projection_hidden_dim: 1024
+        dropout: 0.2
+        finetuning_layers: 2_blocks
+        eval_crop_seconds: 5.0
+        eval_crop_hop_seconds: 2.5
+        energy_thresholds:
+          default: -3.5
+        pretrainedsed_repo_root: external/PretrainedSED
+        pretrainedsed_checkpoint_dir: checkpoint/pretrainedsed
+        pretrainedsed_models: [BEATs, ATST-F, fpasst]
+        pretrainedsed_checkpoint_variant: strong_1
+        pretrainedsed_pooling: mean
+        pretrainedsed_seq_len: 250
+        pretrainedsed_embed_dim: 768
+        pretrainedsed_download_if_missing: true
+        freeze_pretrainedsed: true
+        fusion_strategy: weighted_avg
+        fusion_hidden_dim: 1024
+        input_sample_rate: 32000
+    loss:
+      module: src.training.loss.m2d_sc_arcface
+      main: get_loss_func
+      args:
+        lambda_energy: 0.001
+        m_in: -6.0
+        m_out: -1.0
+    optimizer:
+      module: torch.optim
+      main: AdamW
+      args:
+        params:
+        lr: 0.00015
+        betas: [0.9, 0.999]
+        eps: 0.00000001
+        weight_decay: 0.01
+        amsgrad: true
+    is_validation: true
+train:
+  callbacks:
+  - name: checkpoint
+    module: lightning.pytorch.callbacks
+    main: ModelCheckpoint
+    args:
+      every_n_epochs: 1
+      filename: '{epoch}'
+      save_top_k: 1
+      save_last: true
+      monitor: epoch_val/loss
+      mode: min
+      verbose: false
+      dirpath:
+  - name: tqdm
+    module: lightning.pytorch.callbacks
+    main: TQDMProgressBar
+    args:
+      refresh_rate: 60
+      process_position: 0
+  trainer:
+    module: lightning.pytorch
+    main: Trainer
+    args:
+      accelerator: auto
+      devices: auto
+      strategy: ddp_find_unused_parameters_true
+      num_nodes: 1
+      precision: bf16-mixed
+      logger:
+      fast_dev_run: false
+      max_epochs: 30
+      log_every_n_steps: 100
+      use_distributed_sampler: true
+      sync_batchnorm: true
+      num_sanity_val_steps: 0
+      enable_checkpointing: true
+      enable_progress_bar: true
+      enable_model_summary: true
+      gradient_clip_val: 0.5

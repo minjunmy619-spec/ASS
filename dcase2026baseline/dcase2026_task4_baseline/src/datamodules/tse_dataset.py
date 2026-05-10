@@ -75,6 +75,47 @@ class TSEDataset(torch.utils.data.Dataset):
         return item
 
 
+class OnlineTeacherTSEDataset(torch.utils.data.Dataset):
+    """Dynamic TSE dataset for frozen-USS/SC online teacher training.
+
+    The dataset emits only the synthesized mixture and oracle TSE targets.  The
+    enrollment/query side is intentionally produced inside the Lightning module
+    by frozen USS and SC models, so dynamic generate-mode samples do not need
+    pre-exported estimate or bridge-feature caches.
+    """
+
+    def __init__(self, base_dataset, active_energy_eps=1e-8):
+        args = base_dataset["args"].copy()
+        args["return_source"] = True
+        self.base_dataset = DatasetS3(**args)
+        self.active_energy_eps = float(active_energy_eps)
+        self.collate_fn = self.base_dataset.collate_fn
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        item = self.base_dataset[idx]
+        label_vector = item["label_vector"].view(self.base_dataset.n_sources, -1).clone()
+        label_active = torch.tensor([label != "silence" for label in item["label"]], dtype=torch.bool)
+        span_active = _span_active_mask(item.get("span_sec"))
+        if span_active is not None:
+            active_mask = label_active & span_active
+        else:
+            active_mask = label_active & _waveform_active_mask(item["dry_sources"], self.active_energy_eps)
+
+        waveform = item["dry_sources"].clone()
+        waveform[~active_mask] = 0.0
+
+        return {
+            "mixture": item["mixture"],
+            "waveform": waveform,
+            "label_vector": _zero_inactive(label_vector, active_mask),
+            "active_mask": active_mask,
+            "span_sec": item.get("span_sec", torch.full((self.base_dataset.n_sources, 2), -1.0, dtype=torch.float32)),
+        }
+
+
 class EstimatedEnrollmentTSEDataset(torch.utils.data.Dataset):
     """TSE fine-tuning dataset that uses separator estimates as enrollment.
 

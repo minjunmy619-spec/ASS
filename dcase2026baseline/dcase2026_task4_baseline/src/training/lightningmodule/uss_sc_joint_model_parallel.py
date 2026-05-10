@@ -8,7 +8,12 @@ import torch
 import torch.nn.functional as F
 
 from src.temporal import SILENCE_SPAN_SEC
-from src.tools.estimated_source_matching import pairwise_match_score, source_energy_db
+from src.tools.estimated_source_matching import (
+    pairwise_match_score,
+    quality_and_weight,
+    second_best_and_margin,
+    source_energy_db,
+)
 from src.utils import initialize_config
 
 
@@ -89,7 +94,12 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         consistency_temperature: float = 1.0,
         match_metric: str = "sa_sdr",
         min_match_score: float = -1.0e9,
+        min_match_margin: float = -1.0e9,
         min_energy_db: float = -80.0,
+        clean_match_score: float = -1.0e9,
+        clean_match_margin: float = -1.0e9,
+        uncertain_weight: float = 0.35,
+        use_uncertain_matches: bool = False,
         sc_update_every: int = 1,
         detach_waveform_for_sc: bool = False,
         is_validation: bool = True,
@@ -117,7 +127,12 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         self.consistency_temperature = float(consistency_temperature)
         self.match_metric = match_metric
         self.min_match_score = float(min_match_score)
+        self.min_match_margin = float(min_match_margin)
         self.min_energy_db = float(min_energy_db)
+        self.clean_match_score = float(clean_match_score)
+        self.clean_match_margin = float(clean_match_margin)
+        self.uncertain_weight = float(uncertain_weight)
+        self.use_uncertain_matches = bool(use_uncertain_matches)
         self.sc_update_every = max(1, int(sc_update_every))
         self.detach_waveform_for_sc = bool(detach_waveform_for_sc)
         self.is_validation = bool(is_validation)
@@ -175,12 +190,16 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
             "interference_span_sec",
             "noise_span_sec",
             "spatial_vector",
+            "foreground_doa",
+            "foreground_doa_mask",
             "class_confidence",
             "soft_class_target",
             "uncertain_slot_mask",
             "bad_slot_mask",
         )
         target = {key: self._to_uss(batch[key]) for key in keys if key in batch}
+        if "spatial_vector" not in target and "foreground_doa" in target:
+            target["spatial_vector"] = target["foreground_doa"]
         target["current_epoch"] = self.current_epoch
         return target
 
@@ -195,6 +214,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         class_idx = torch.zeros(bsz, n_est, dtype=torch.long, device=self.uss_device)
         is_silence = torch.ones(bsz, n_est, dtype=torch.bool, device=self.uss_device)
         sample_weight = torch.zeros(bsz, n_est, dtype=sep.dtype, device=self.uss_device)
+        quality_code = torch.zeros(bsz, n_est, dtype=torch.long, device=self.uss_device)
         span_sec = None
         if span_ref is not None:
             span_sec = torch.tensor(SILENCE_SPAN_SEC, dtype=sep.dtype, device=self.uss_device).view(1, 1, 2).expand(bsz, n_est, 2).clone()
@@ -206,21 +226,39 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
                 est_to_ref = _best_assignment(scores[b], active_refs, n_est)
                 for est_idx, ref_idx in est_to_ref.items():
                     score = float(scores[b, ref_idx, est_idx].item())
+                    _, margin = second_best_and_margin(scores[b], ref_idx, est_idx)
                     energy = source_energy_db(sep[b, est_idx].detach().cpu())
-                    if score < self.min_match_score or energy < self.min_energy_db:
+                    quality, weight, valid = quality_and_weight(
+                        score=score,
+                        margin=margin,
+                        energy_db=energy,
+                        min_match_score=self.min_match_score,
+                        min_match_margin=self.min_match_margin,
+                        min_energy_db=self.min_energy_db,
+                        clean_match_score=self.clean_match_score,
+                        clean_match_margin=self.clean_match_margin,
+                        uncertain_weight=self.uncertain_weight,
+                    )
+                    if quality == "clean":
+                        quality_code[b, est_idx] = 1
+                    elif quality == "uncertain":
+                        quality_code[b, est_idx] = 2
+                    else:
+                        quality_code[b, est_idx] = 3
+                    if not valid or (quality == "uncertain" and not self.use_uncertain_matches):
                         continue
                     class_idx[b, est_idx] = class_index_ref[b, ref_idx]
                     is_silence[b, est_idx] = False
-                    sample_weight[b, est_idx] = 1.0
+                    sample_weight[b, est_idx] = float(weight)
                     if span_sec is not None:
                         span_sec[b, est_idx] = span_ref[b, ref_idx]
-        return class_idx, is_silence, sample_weight, span_sec
+        return class_idx, is_silence, sample_weight, span_sec, quality_code
 
     def _sc_forward_and_loss(self, uss_out, batch, is_training: bool):
         sep = uss_out["foreground_waveform"]
         if self.detach_waveform_for_sc:
             sep = sep.detach()
-        class_idx, is_silence, sample_weight, span_sec = self._build_slot_targets(sep, batch)
+        class_idx, is_silence, sample_weight, span_sec, quality_code = self._build_slot_targets(sep, batch)
 
         bsz, n_slots, channels, samples = sep.shape
         waveform = sep.reshape(bsz * n_slots, channels, samples).to(self.sc_device)
@@ -258,6 +296,11 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         out["loss_sc_weighted"] = loss_sc_weighted
         out["sc_joint_top1"] = top1
         out["sc_active_weight_mean"] = active_weight.mean()
+        quality_flat = quality_code.reshape(bsz * n_slots).to(self.sc_device)
+        out["sc_clean_match_count"] = (quality_flat == 1).to(dtype=ce_all.dtype).sum()
+        out["sc_uncertain_match_count"] = (quality_flat == 2).to(dtype=ce_all.dtype).sum()
+        out["sc_bad_match_count"] = (quality_flat == 3).to(dtype=ce_all.dtype).sum()
+        out["sc_used_match_count"] = active_weight.gt(0).to(dtype=ce_all.dtype).sum()
 
         if self.lambda_consistency > 0.0 and "class_logits" in uss_out:
             uss_logits = uss_out["class_logits"].reshape(bsz * n_slots, -1).to(self.sc_device)

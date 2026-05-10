@@ -1,0 +1,254 @@
+task_name: modified_deft_tse_lite_6s_online_teacher_unified_uss_sc_2pass
+description: >
+  Opt-in unrolled two-pass online-teacher TSE training. Pass 1 matches the
+  standard USS-enrollment recipe; pass 2 uses the detached pass-1 TSE waveform
+  as enrollment and re-runs frozen SC for the pass-2 query label.
+
+deterministic: true
+manual_seed: 0
+
+datamodule:
+  module: src.datamodules.datamodule
+  main: DataModule
+  args:
+    train_dataloader:
+      batch_size: 2
+      num_workers: 2
+      persistent_workers: false
+      dataset:
+        module: src.datamodules.tse_dataset
+        main: OnlineTeacherTSEDataset
+        args:
+          base_dataset:
+            args:
+              config:
+                mode: generate
+                spatial_sound_scene:
+                  duration: 6.0
+                  sr: 32000
+                  max_event_overlap: 3
+                  max_event_dur: 6.0
+                  ref_db: -55
+                  foreground_dir: data/dev_set/sound_event/train
+                  background_dir: data/dev_set/noise/train
+                  interference_dir: data/dev_set/interference/train
+                  room_config:
+                    module: src.modules.spatial_audio_synthesizer.room
+                    main: SofaRoom
+                    args:
+                      path: data/dev_set/room_ir/train
+                      direct_range_ms: [6, 50]
+                dupse_rate: 0.5
+                dupse_min_angle: 60.0
+                max_n_dupse: 2
+                dupse_exclusion_folder_depth: 1
+                snr_range: [5, 20]
+                nevent_range: [0, 3]
+                ninterference_range: [0, 2]
+                inteference_snr_range: [0, 15]
+                dataset_length: 10112
+                shuffle_label: true
+                fg_return: {dry: true, dry_channel: 0, metadata: true}
+              n_sources: 3
+              label_set: dcase2026t4
+              return_source: true
+              label_vector_mode: stack
+              silence_label_mode: zeros
+              return_meta: false
+    val_dataloader:
+      batch_size: 1
+      num_workers: 2
+      persistent_workers: false
+      dataset:
+        module: src.datamodules.tse_dataset
+        main: OnlineTeacherTSEDataset
+        args:
+          base_dataset:
+            args:
+              config:
+                mode: metadata
+                metadata_list: data/dev_set/metadata/valid.json
+                fg_return:
+                  dry: true
+                  dry_channel: 0
+                  metadata: true
+                sr: 32000
+              n_sources: 3
+              label_set: dcase2026t4
+              return_source: true
+              label_vector_mode: stack
+              silence_label_mode: zeros
+              return_meta: false
+
+lightning_module:
+  module: src.training.lightningmodule.online_teacher_tse
+  main: OnlineTeacherTSELightning
+  args:
+    uss_pretrained_ckpt: checkpoint/modified_deft_uss_lite_6s_unified_all_features.ckpt
+    sc_pretrained_ckpt: checkpoint/m2d_sc_stage3_estimated_pretrainedsed_fusion.ckpt
+    pretrained_model_ckpt: checkpoint/modified_deft_tse_lite_6s_temporal.ckpt
+    pretrained_model_strict: false
+    uss_pretrained_strict: true
+    sc_pretrained_strict: true
+    match_metric: sa_sdr
+    min_match_score: -20.0
+    min_estimate_energy_db: -80.0
+    require_sc_active_for_loss: true
+    require_sc_class_match_for_loss: false
+    label_source: sc
+    query_condition_enabled: true
+    temporal_conditioning_source: auto
+    tse_refinement_passes: 2
+    second_pass_loss_weight: 1.0
+    second_pass_detach_enrollment: true
+    uss_model:
+      module: src.models.deft.unified_uss
+      main: UnifiedModifiedDeFTUSS
+      args:
+        input_channels: 4
+        output_channels: 1
+        hidden_channels: 96
+        n_deft_blocks: 6
+        n_heads: 4
+        n_foreground: 3
+        n_interference: 2
+        n_classes: 18
+        window_size: 1024
+        hop_size: 320
+        time_window_size: 128
+        freq_group_size: 64
+        shift_windows: true
+        sample_rate: 32000
+        inference_chunk_seconds: 10.0
+        inference_chunk_hop_seconds: 8.0
+        enable_foa_spatial_features: true
+        include_logmag: true
+        include_aiv: true
+        include_ipd: true
+        spatial_feature_eps: 0.00000001
+        enable_temporal_activity: true
+        enable_count_head: true
+        count_hidden_dim: 64
+        max_count: 3
+        enable_spatial_head: true
+        spatial_embedding_dim: 16
+        enable_residual_slots: true
+        n_residual: 1
+        enable_semantic_bridge: true
+        embedding_dim: 256
+        prototype_scale: 10.0
+        use_audio_embedding: true
+        use_doa_head: true
+        use_spatial_conditioning: true
+        predicted_spatial_prob: 0.25
+        spatial_mix_fallback_prob: 0.05
+        tse_condition_dim: 256
+    sc_model:
+      module: src.models.m2dat.m2d_sc
+      main: M2DPretrainedSEDFusionClassifier
+      args:
+        weight_file:
+          checkpoint/m2d_as_vit_base-80x1001p16x16p32k-240413_AS-FT_enconly/weights_ep69it3124-0.47998.pth
+        num_classes: 18
+        embedding_dim: 512
+        m2d_embedding_dim: 512
+        pooling_hidden_dim: 512
+        projection_hidden_dim: 1024
+        dropout: 0.2
+        finetuning_layers: 2_blocks
+        energy_thresholds:
+          default: -3.5
+        pretrainedsed_repo_root: external/PretrainedSED
+        pretrainedsed_checkpoint_dir: checkpoint/pretrainedsed
+        pretrainedsed_models: [BEATs, ATST-F, fpasst]
+        pretrainedsed_checkpoint_variant: strong_1
+        pretrainedsed_pooling: mean
+        pretrainedsed_seq_len: 250
+        pretrainedsed_embed_dim: 768
+        pretrainedsed_download_if_missing: true
+        freeze_pretrainedsed: true
+        fusion_strategy: weighted_avg
+        fusion_hidden_dim: 1024
+        input_sample_rate: 32000
+    model:
+      module: src.models.deft.modified_deft
+      main: ModifiedDeFTTSEMemoryEfficientTemporal
+      args:
+        mixture_channels: 4
+        enrollment_channels: 1
+        hidden_channels: 96
+        n_deft_blocks: 6
+        n_heads: 4
+        label_dim: 18
+        window_size: 1024
+        hop_size: 320
+        time_window_size: 128
+        freq_group_size: 64
+        shift_windows: true
+        sample_rate: 32000
+        inference_chunk_seconds: 10.0
+        inference_chunk_hop_seconds: 8.0
+        query_condition_dim: 256
+        query_condition_hidden_dim: 256
+        query_condition_scale: 0.5
+        query_condition_dropout: 0.0
+        require_query_condition: true
+    loss:
+      module: src.training.loss.masked_snr
+      main: get_loss_func
+      args:
+        lambda_inactive: 0.05
+        lambda_activity: 0.1
+        activity_pos_weight: 2.0
+    optimizer:
+      module: torch.optim
+      main: AdamW
+      args:
+        params:
+        lr: 0.00005
+        betas: [0.9, 0.999]
+        eps: 0.00000001
+        weight_decay: 0.0
+        amsgrad: true
+    is_validation: true
+
+train:
+  callbacks:
+  - name: checkpoint
+    module: lightning.pytorch.callbacks
+    main: ModelCheckpoint
+    args:
+      every_n_epochs: 1
+      filename: '{epoch}'
+      save_top_k: 1
+      save_last: true
+      monitor: epoch_val/loss
+      mode: min
+      verbose: false
+      dirpath:
+  - name: tqdm
+    module: lightning.pytorch.callbacks
+    main: TQDMProgressBar
+    args:
+      refresh_rate: 60
+      process_position: 0
+  trainer:
+    module: lightning.pytorch
+    main: Trainer
+    args:
+      accelerator: auto
+      devices: auto
+      strategy: ddp_find_unused_parameters_true
+      num_nodes: 1
+      precision: bf16-mixed
+      logger:
+      fast_dev_run: false
+      max_epochs: 30
+      log_every_n_steps: 100
+      use_distributed_sampler: true
+      sync_batchnorm: false
+      num_sanity_val_steps: 0
+      enable_checkpointing: true
+      enable_progress_bar: true
+      enable_model_summary: true
+      gradient_clip_val: 0.5

@@ -91,24 +91,44 @@ def _resolve_existing_path(path, config_dir):
     return path
 
 
-def _load_checkpoint(model, checkpoint_path):
+def _select_model_state_dict(state_dict, model_state, preferred_prefixes=()):
+    if set(state_dict.keys()) == set(model_state.keys()):
+        return state_dict
+    for prefix in preferred_prefixes:
+        stripped = {
+            k[len(prefix):]: v
+            for k, v in state_dict.items()
+            if isinstance(k, str) and k.startswith(prefix)
+        }
+        if stripped and any(k in model_state for k in stripped):
+            return stripped
+    one_model_key = next(iter(model_state.keys()))
+    suffix_matches = [k for k in state_dict if isinstance(k, str) and k.endswith(one_model_key)]
+    if suffix_matches:
+        prefix = suffix_matches[0][:-len(one_model_key)]
+        return {k[len(prefix):]: v for k, v in state_dict.items() if isinstance(k, str) and k.startswith(prefix)}
+    for prefix in ("model.", "module.", "net."):
+        stripped = {k[len(prefix):]: v for k, v in state_dict.items() if isinstance(k, str) and k.startswith(prefix)}
+        if stripped and any(k in model_state for k in stripped):
+            return stripped
+    return state_dict
+
+
+def _stage_checkpoint_prefixes(stage):
+    return {
+        "uss": ("uss_model.", "model.", "module.", "net."),
+        "sc": ("sc_model.", "model.", "module.", "net."),
+        "tse": ("tse_model.", "model.", "module.", "net."),
+    }.get(stage, ("model.", "module.", "net."))
+
+
+def _load_checkpoint(model, checkpoint_path, preferred_prefixes=()):
     if checkpoint_path is None:
         return
     checkpoint = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
     state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
     model_state = model.state_dict()
-    if set(state_dict.keys()) != set(model_state.keys()):
-        one_model_key = next(iter(model_state.keys()))
-        suffix_matches = [k for k in state_dict if isinstance(k, str) and k.endswith(one_model_key)]
-        if suffix_matches:
-            prefix = suffix_matches[0][:-len(one_model_key)]
-            state_dict = {k[len(prefix):]: v for k, v in state_dict.items() if isinstance(k, str) and k.startswith(prefix)}
-        else:
-            for prefix in ("model.", "module.", "net."):
-                stripped = {k[len(prefix):]: v for k, v in state_dict.items() if isinstance(k, str) and k.startswith(prefix)}
-                if stripped and any(k in model_state for k in stripped):
-                    state_dict = stripped
-                    break
+    state_dict = _select_model_state_dict(state_dict, model_state, preferred_prefixes=preferred_prefixes)
     model.load_state_dict(state_dict)
 
 
@@ -329,7 +349,7 @@ class StageEvaluator:
         checkpoint = checkpoint or config_checkpoint
         checkpoint = _resolve_existing_path(checkpoint, self.config_dir)
         self.model = initialize_config(model_config, reload=True)
-        _load_checkpoint(self.model, checkpoint)
+        _load_checkpoint(self.model, checkpoint, preferred_prefixes=_stage_checkpoint_prefixes(stage))
         self.model.eval()
         self.model.to(self.device)
         self.tse_conditioning_configured = bool(

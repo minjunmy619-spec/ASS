@@ -25,6 +25,7 @@ from src.training.loss.class_aware_pit import class_aware_pit_loss
 from src.training.loss.m2d_sc_arcface import get_loss_func as get_sc_loss_func
 from src.training.loss.masked_snr import get_loss_func as get_tse_loss_func
 from src.training.loss.uss_loss import get_loss_func as get_uss_loss_func
+from src.training.lightningmodule.online_teacher_tse import OnlineTeacherTSELightning
 from src.evaluation.metrics.s5capi_metric import (
     S5ClassAwareMetric,
     S5ClassAwareMetricAssignmentComparison,
@@ -66,6 +67,237 @@ class _DummyBaseDataset:
             "span_sec": torch.tensor([[0.0, 1.0], [3.0, 5.0], [-1.0, -1.0]]),
             "est_span_sec": torch.tensor([[0.0, 1.0], [3.0, 5.0], [-1.0, -1.0]]),
         }
+
+
+class _DummyUSS(torch.nn.Module):
+    def __init__(self, enrollment):
+        super().__init__()
+        self.enrollment = enrollment
+
+    def forward(self, input_dict):
+        batch_size, n_sources = self.enrollment.shape[:2]
+        class_logits = self.enrollment.new_zeros(batch_size, n_sources, 4)
+        class_logits[..., 0] = 2.0
+        silence_logits = self.enrollment.new_ones(batch_size, n_sources)
+        count_logits = self.enrollment.new_zeros(batch_size, 4)
+        count_logits[:, 2] = 3.0
+        return {
+            "foreground_waveform": self.enrollment,
+            "class_logits": class_logits,
+            "silence_logits": silence_logits,
+            "count_logits": count_logits,
+        }
+
+
+class _DummySC(torch.nn.Module):
+    def __init__(self, label_vector):
+        super().__init__()
+        self.label_vector = label_vector
+
+    def predict(self, input_dict):
+        flat = self.label_vector.reshape(-1, self.label_vector.shape[-1])
+        active = flat.abs().sum(dim=-1) > 0
+        return {
+            "label_vector": flat,
+            "raw_label_vector": flat,
+            "class_indices": torch.argmax(flat, dim=-1),
+            "probabilities": active.float(),
+            "energy": flat.new_zeros(flat.shape[0]),
+            "silence": ~active,
+        }
+
+
+class _RecordingTwoPassTSE(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.enrollments = []
+
+    def forward(self, input_dict):
+        self.enrollments.append(input_dict["enrollment"].detach().clone())
+        activity_logits = input_dict["enrollment"].new_zeros(input_dict["enrollment"].shape[:2] + (4,))
+        return {
+            "waveform": input_dict["enrollment"] + 0.5,
+            "activity_logits": activity_logits,
+        }
+
+
+class _SecondPassSilentSC(torch.nn.Module):
+    def __init__(self, first_label_vector, second_label_vector):
+        super().__init__()
+        self.calls = 0
+        self.first_label_vector = first_label_vector
+        self.second_label_vector = second_label_vector
+
+    def predict(self, input_dict):
+        self.calls += 1
+        label_vector = self.first_label_vector if self.calls == 1 else self.second_label_vector
+        flat = label_vector.reshape(-1, label_vector.shape[-1])
+        active = flat.abs().sum(dim=-1) > 0
+        return {
+            "label_vector": flat,
+            "raw_label_vector": flat,
+            "class_indices": torch.argmax(flat, dim=-1),
+            "probabilities": active.float(),
+            "energy": flat.new_zeros(flat.shape[0]),
+            "silence": ~active,
+        }
+
+
+def _simple_tse_loss(output_dict, target_dict):
+    return {"loss": (output_dict["waveform"] - target_dict["waveform"]).abs().mean()}
+
+
+def _online_teacher_shell():
+    module = object.__new__(OnlineTeacherTSELightning)
+    module.uss_output_key = "foreground_waveform"
+    module.match_metric = "sa_sdr"
+    module.min_match_score = -100.0
+    module.min_estimate_energy_db = -100.0
+    module.require_sc_active_for_loss = True
+    module.require_sc_class_match_for_loss = False
+    module.label_source = "sc"
+    module.query_condition_enabled = True
+    module.query_condition_key = None
+    module.temporal_conditioning_source = "auto"
+    module.tse_refinement_passes = 1
+    module.second_pass_loss_weight = 1.0
+    module.second_pass_detach_enrollment = True
+    return module
+
+
+def test_online_teacher_aligns_oracle_targets_to_uss_slots():
+    module = _online_teacher_shell()
+    target_waveform = torch.zeros(1, 3, 1, 8)
+    target_waveform[0, 0, 0, 0:2] = 1.0
+    target_waveform[0, 1, 0, 3:5] = 1.0
+    enrollment = target_waveform[:, [1, 0, 2]].clone()
+    label_vector = torch.zeros(1, 3, 4)
+    label_vector[0, 0, 0] = 1.0
+    label_vector[0, 1, 1] = 1.0
+
+    aligned = module._align_oracle_to_estimate_slots(
+        enrollment,
+        {
+            "waveform": target_waveform,
+            "label_vector": label_vector,
+            "active_mask": torch.tensor([[True, True, False]]),
+            "span_sec": torch.tensor([[[0.0, 0.25], [0.375, 0.625], [-1.0, -1.0]]]),
+        },
+    )
+
+    assert aligned["active_mask"].tolist() == [[True, True, False]]
+    assert torch.allclose(aligned["waveform"][0, 0], target_waveform[0, 1])
+    assert torch.allclose(aligned["waveform"][0, 1], target_waveform[0, 0])
+    assert aligned["label_vector"][0, 0, 1] == 1.0
+    assert aligned["label_vector"][0, 1, 0] == 1.0
+
+
+def test_online_teacher_builds_tse_inputs_from_frozen_uss_and_sc():
+    module = _online_teacher_shell()
+    target_waveform = torch.zeros(1, 3, 1, 8)
+    target_waveform[0, 0, 0, 0:2] = 1.0
+    target_waveform[0, 1, 0, 3:5] = 1.0
+    enrollment = target_waveform[:, [1, 0, 2]].clone()
+    sc_labels = torch.zeros(1, 3, 4)
+    sc_labels[0, 0, 1] = 1.0
+    sc_labels[0, 1, 0] = 1.0
+    label_vector = torch.zeros(1, 3, 4)
+    label_vector[0, 0, 0] = 1.0
+    label_vector[0, 1, 1] = 1.0
+    object.__setattr__(module, "uss_model", _DummyUSS(enrollment))
+    object.__setattr__(module, "sc_model", _DummySC(sc_labels))
+
+    input_dict, target_dict, diagnostics = module._build_teacher_batch({
+        "mixture": torch.zeros(1, 4, 8),
+        "waveform": target_waveform,
+        "label_vector": label_vector,
+        "active_mask": torch.tensor([[True, True, False]]),
+        "span_sec": torch.tensor([[[0.0, 0.25], [0.375, 0.625], [-1.0, -1.0]]]),
+    })
+
+    assert torch.allclose(input_dict["enrollment"], enrollment)
+    assert torch.allclose(input_dict["label_vector"], sc_labels)
+    assert input_dict["query_condition"].shape[:2] == (1, 3)
+    assert target_dict["active_mask"].tolist() == [[True, True, False]]
+    assert torch.allclose(target_dict["waveform"][0, 0], target_waveform[0, 1])
+    assert target_dict["label_vector"][0, 0, 1] == 1.0
+    assert diagnostics["teacher_matched_slots"].item() == 2.0
+
+
+def test_online_teacher_two_pass_uses_first_tse_output_as_second_enrollment():
+    module = _online_teacher_shell()
+    module.tse_refinement_passes = 2
+    module.second_pass_loss_weight = 0.25
+    module.metric_func = None
+    target_waveform = torch.zeros(1, 3, 1, 8)
+    target_waveform[0, 0, 0, 0:2] = 1.0
+    target_waveform[0, 1, 0, 3:5] = 1.0
+    enrollment = target_waveform[:, [1, 0, 2]].clone()
+    sc_labels = torch.zeros(1, 3, 4)
+    sc_labels[0, 0, 1] = 1.0
+    sc_labels[0, 1, 0] = 1.0
+    label_vector = torch.zeros(1, 3, 4)
+    label_vector[0, 0, 0] = 1.0
+    label_vector[0, 1, 1] = 1.0
+    tse = _RecordingTwoPassTSE()
+    object.__setattr__(module, "model", tse)
+    object.__setattr__(module, "loss_func", _simple_tse_loss)
+    object.__setattr__(module, "uss_model", _DummyUSS(enrollment))
+    object.__setattr__(module, "sc_model", _DummySC(sc_labels))
+
+    loss_dict = module._step(
+        {
+            "mixture": torch.zeros(1, 4, 8),
+            "waveform": target_waveform,
+            "label_vector": label_vector,
+            "active_mask": torch.tensor([[True, True, False]]),
+            "span_sec": torch.tensor([[[0.0, 0.25], [0.375, 0.625], [-1.0, -1.0]]]),
+        },
+        "train",
+    )
+
+    assert len(tse.enrollments) == 2
+    assert torch.allclose(tse.enrollments[0], enrollment)
+    assert torch.allclose(tse.enrollments[1], enrollment + 0.5)
+    assert "first_pass_loss" in loss_dict
+    assert "second_pass_loss" in loss_dict
+    assert loss_dict["teacher_second_pass_enabled"].item() == 1.0
+
+
+def test_online_teacher_two_pass_masks_second_loss_with_second_sc_output():
+    module = _online_teacher_shell()
+    module.tse_refinement_passes = 2
+    module.metric_func = None
+    target_waveform = torch.zeros(1, 3, 1, 8)
+    target_waveform[0, 0, 0, 0:2] = 1.0
+    target_waveform[0, 1, 0, 3:5] = 1.0
+    enrollment = target_waveform[:, [1, 0, 2]].clone()
+    first_sc_labels = torch.zeros(1, 3, 4)
+    first_sc_labels[0, 0, 1] = 1.0
+    first_sc_labels[0, 1, 0] = 1.0
+    second_sc_labels = first_sc_labels.clone()
+    second_sc_labels[0, 1] = 0.0
+    label_vector = torch.zeros(1, 3, 4)
+    label_vector[0, 0, 0] = 1.0
+    label_vector[0, 1, 1] = 1.0
+    object.__setattr__(module, "uss_model", _DummyUSS(enrollment))
+    object.__setattr__(module, "sc_model", _SecondPassSilentSC(first_sc_labels, second_sc_labels))
+    first_input, target_dict, _ = module._build_teacher_batch(
+        {
+            "mixture": torch.zeros(1, 4, 8),
+            "waveform": target_waveform,
+            "label_vector": label_vector,
+            "active_mask": torch.tensor([[True, True, False]]),
+            "span_sec": torch.tensor([[[0.0, 0.25], [0.375, 0.625], [-1.0, -1.0]]]),
+        }
+    )
+    first_output = {"waveform": enrollment + 0.5}
+
+    _, second_target_dict, diagnostics = module._build_second_pass_input(first_input, first_output, target_dict)
+
+    assert second_target_dict["active_mask"].tolist() == [[True, False, False]]
+    assert torch.allclose(second_target_dict["waveform"][0, 1], torch.zeros_like(second_target_dict["waveform"][0, 1]))
+    assert diagnostics["teacher_second_pass_matched_slots"].item() == 1.0
 
 
 def test_estimated_enrollment_crop_deactivates_out_of_window_sources():
@@ -431,6 +663,35 @@ def test_temporal_s5_gates_inactive_slots_and_conditions_tse():
     assert model.tse.conditioning[0].shape == (1, 3, 4)
     assert model.tse.conditioning[0][0, 0].amin().item() > 0.5
     assert model.tse.conditioning[0][0, 1:].amax().item() < 0.5
+
+
+def test_temporal_s5_can_stop_after_one_tse_refinement_pass():
+    class TemporalUSS(torch.nn.Module):
+        def forward(self, input_dict):
+            mixture = input_dict["mixture"]
+            activity = torch.tensor([[[4.0, 4.0, 4.0, 4.0], [-4.0, -4.0, -4.0, -4.0], [-4.0, -4.0, -4.0, -4.0]]])
+            return {
+                "foreground_waveform": torch.ones(mixture.shape[0], 3, 1, mixture.shape[-1], device=mixture.device),
+                "foreground_activity_logits": activity.to(mixture.device),
+            }
+
+    model = Kwon2025TemporalS5.__new__(Kwon2025TemporalS5)
+    torch.nn.Module.__init__(model)
+    model.uss = TemporalUSS()
+    model.sc = TemporalSupportSC()
+    model.tse = RecordingTemporalTSE()
+    model.labels = [f"class_{idx}" for idx in range(18)]
+    model.onehots = torch.eye(18)
+    model.duplicate_recall_enabled = False
+    model.activity_threshold = 0.5
+    model.temporal_conditioning_enabled = True
+    model.activity_gating_enabled = True
+    model.tse_refinement_passes = 1
+
+    output = model.predict_label_separate(torch.zeros(1, 4, 64))
+
+    assert output["label"] == [["class_1", "silence", "silence"]]
+    assert len(model.tse.conditioning) == 1
 
 
 def test_energy_threshold_calibration_prefers_low_energy_true_positives():

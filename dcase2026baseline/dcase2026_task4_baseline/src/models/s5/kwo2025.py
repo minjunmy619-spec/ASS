@@ -21,6 +21,7 @@ class Kwon2025S5(torch.nn.Module):
         uss_gate_slot_active_threshold=0.45,
         uss_gate_slot_energy_threshold=1e-4,
         tse_uss_conditioning_enabled=False,
+        tse_refinement_passes=2,
     ):
         super().__init__()
         self.uss = initialize_config(uss_config)
@@ -37,25 +38,53 @@ class Kwon2025S5(torch.nn.Module):
         self.uss_gate_slot_active_threshold = float(uss_gate_slot_active_threshold)
         self.uss_gate_slot_energy_threshold = float(uss_gate_slot_energy_threshold)
         self.tse_uss_conditioning_enabled = bool(tse_uss_conditioning_enabled)
+        self.tse_refinement_passes = self._validate_tse_refinement_passes(tse_refinement_passes)
 
         if uss_ckpt is not None:
-            self._load_ckpt(uss_ckpt, self.uss)
+            self._load_ckpt(uss_ckpt, self.uss, preferred_prefixes=("uss_model.", "model.", "module.", "net."))
         if sc_ckpt is not None:
-            self._load_ckpt(sc_ckpt, self.sc)
+            self._load_ckpt(sc_ckpt, self.sc, preferred_prefixes=("sc_model.", "model.", "module.", "net."))
         if tse_ckpt is not None:
-            self._load_ckpt(tse_ckpt, self.tse)
+            self._load_ckpt(tse_ckpt, self.tse, preferred_prefixes=("tse_model.", "model.", "module.", "net."))
 
         self.uss.eval()
         self.sc.eval()
         self.tse.eval()
 
-    def _load_ckpt(self, path, model):
-        model_ckpt = torch.load(path, weights_only=False, map_location="cpu")["state_dict"]
-        if set(model.state_dict().keys()) != set(model_ckpt.keys()):
-            one_model_key = next(iter(model.state_dict().keys()))
-            ckpt_corresponding_key = [k for k in model_ckpt.keys() if k.endswith(one_model_key)]
+    def _validate_tse_refinement_passes(self, passes):
+        passes = int(passes)
+        if passes not in (1, 2):
+            raise ValueError("tse_refinement_passes must be 1 or 2")
+        return passes
+
+    def _get_tse_refinement_passes(self):
+        return self._validate_tse_refinement_passes(getattr(self, "tse_refinement_passes", 2))
+
+    def _select_model_ckpt_state(self, model_ckpt, model, preferred_prefixes=()):
+        model_state = model.state_dict()
+        if set(model_state.keys()) == set(model_ckpt.keys()):
+            return model_ckpt
+        for prefix in preferred_prefixes:
+            stripped = {
+                k[len(prefix):]: v
+                for k, v in model_ckpt.items()
+                if isinstance(k, str) and k.startswith(prefix)
+            }
+            if stripped and any(k in model_state for k in stripped):
+                return stripped
+        one_model_key = next(iter(model_state.keys()))
+        ckpt_corresponding_key = [
+            k for k in model_ckpt.keys()
+            if isinstance(k, str) and k.endswith(one_model_key)
+        ]
+        if ckpt_corresponding_key:
             prefix = ckpt_corresponding_key[0][:-len(one_model_key)]
-            model_ckpt = {k[len(prefix):]: v for k, v in model_ckpt.items() if k.startswith(prefix)}
+            return {k[len(prefix):]: v for k, v in model_ckpt.items() if isinstance(k, str) and k.startswith(prefix)}
+        return model_ckpt
+
+    def _load_ckpt(self, path, model, preferred_prefixes=()):
+        model_ckpt = torch.load(path, weights_only=False, map_location="cpu")["state_dict"]
+        model_ckpt = self._select_model_ckpt_state(model_ckpt, model, preferred_prefixes=preferred_prefixes)
         model.load_state_dict(model_ckpt)
 
     def _vector_to_label(self, label_vector):
@@ -246,6 +275,15 @@ class Kwon2025S5(torch.nn.Module):
             stage2_waveform, stage2_labels, stage2_probs, stage2_vector = self._force_silent_slots(
                 stage2_waveform, stage2_labels, stage2_probs, stage2_vector, silent_slots
             )
+            if self._get_tse_refinement_passes() == 1:
+                output = {
+                    "label": stage2_labels,
+                    "probabilities": stage2_probs,
+                    "waveform": stage2_waveform,
+                }
+                if stage1_condition is not None:
+                    output["query_condition"] = stage1_condition
+                return output
 
             stage3_waveform = self._run_tse(mixture, stage2_waveform, stage2_vector, stage1_condition)
             stage3_labels, stage3_probs, stage3_vector = self._classify_sources(stage3_waveform)

@@ -15,6 +15,8 @@ class USSBridgeLightning(BaseLightningModule):
         for key in ("spatial_vector", "spatial_clue", "doa_vector"):
             if key in batch_data_dict:
                 input_dict[key] = batch_data_dict[key]
+        if "spatial_vector" not in input_dict and "foreground_doa" in batch_data_dict:
+            input_dict["spatial_vector"] = batch_data_dict["foreground_doa"]
         return input_dict
 
     def _get_target_dict(self, batch_data_dict):
@@ -33,9 +35,13 @@ class USSBridgeLightning(BaseLightningModule):
             "spatial_vector",
             "spatial_clue",
             "doa_vector",
+            "foreground_doa",
+            "foreground_doa_mask",
         ):
             if key in batch_data_dict:
                 target_dict[key] = batch_data_dict[key]
+        if "spatial_vector" not in target_dict and "foreground_doa" in batch_data_dict:
+            target_dict["spatial_vector"] = batch_data_dict["foreground_doa"]
         return target_dict
 
     def training_step_processing(self, batch_data_dict, batch_idx):

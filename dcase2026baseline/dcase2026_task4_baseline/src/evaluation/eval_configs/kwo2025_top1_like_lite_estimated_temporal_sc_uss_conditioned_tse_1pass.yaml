@@ -25,7 +25,7 @@ model:
         temporal_conditioning_enabled: true
         activity_gating_enabled: true
         tse_uss_conditioning_enabled: true
-        tse_refinement_passes: 2
+        tse_refinement_passes: 1
         uss_config:
             module: src.models.deft.unified_uss
             main: UnifiedModifiedDeFTUSS

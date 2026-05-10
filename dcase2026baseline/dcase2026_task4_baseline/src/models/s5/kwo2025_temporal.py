@@ -230,6 +230,15 @@ class Kwon2025TemporalS5(Kwon2025S5):
                 stage2_activity,
                 silent_slots,
             )
+            if self._get_tse_refinement_passes() == 1:
+                output = {
+                    "label": stage2_labels,
+                    "probabilities": stage2_probs,
+                    "waveform": stage2_waveform,
+                }
+                if stage1_condition is not None:
+                    output["query_condition"] = stage1_condition
+                return output
 
             stage3_waveform, tse3_activity = self._run_tse_temporal(
                 mixture,

@@ -402,6 +402,95 @@ Example when you want to allow one extra op during bring-up:
   --allow-op ScatterND
 ```
 
+### NPU model statistics
+
+Use `tools/online/measure_npu_model_stats.py` when you need one repeatable
+report with:
+
+- parameter count and parameter payload size
+- explicit streaming state/cache size
+- profiler-based MACs and realtime `GMAC/s`
+- ONNX node and op counts
+- emitted MLIR operation count from `onnx-mlir --EmitMLIR`
+
+Run the current ready-candidate suite:
+
+```bash
+cd /app/ASS
+./.venv/bin/python tools/online/measure_npu_model_stats.py \
+  --target ready-suite \
+  --out-dir /tmp/npu_model_stats_ready
+```
+
+Measure a new online SFC recipe or trained model directory:
+
+```bash
+cd /app/ASS
+./.venv/bin/python tools/online/measure_npu_model_stats.py \
+  --target online \
+  --model-path recipes/musdb18hq/models/online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml \
+  --label my_new_candidate \
+  --n-chan 2 \
+  --out-dir /tmp/npu_model_stats_my_new_candidate
+```
+
+Measure a named non-SFC preset:
+
+```bash
+./.venv/bin/python tools/online/measure_npu_model_stats.py --target tiger-edge
+./.venv/bin/python tools/online/measure_npu_model_stats.py --target dolphin --dolphin-preset edge_small --n-chan 1
+./.venv/bin/python tools/online/measure_npu_model_stats.py --target tf-mlpnet
+```
+
+Outputs are written as `npu_model_stats.json` and `npu_model_stats.csv` in the
+selected output directory, together with the generated ONNX and emitted MLIR
+files. Add `--skip-mlir` for a faster parameter/MAC/ONNX-only pass.
+
+### ONNX to MLIR verification pipeline
+
+Use `tools/online/export_verify_mlir.py` for a pass/fail deployment conversion
+check. It exports ONNX, runs `onnx.checker`, audits ONNX ops, runs
+`onnx-mlir --EmitMLIR`, scans the emitted MLIR for dynamic-control-flow red
+flags, and writes an `export_verify_mlir_manifest.json`.
+
+Export and verify an online recipe:
+
+```bash
+cd /app/ASS
+./.venv/bin/python tools/online/export_verify_mlir.py \
+  --target online \
+  --model-path recipes/musdb18hq/models/online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml \
+  --label soft_query_rt192k_fp512keep475 \
+  --n-chan 2 \
+  --out-dir /tmp/export_verify_soft_query
+```
+
+Verify an existing ONNX and also compile the runtime shared library:
+
+```bash
+cd /app/ASS
+./.venv/bin/python tools/online/export_verify_mlir.py \
+  --onnx-in /tmp/export_verify_soft_query/soft_query_rt192k_fp512keep475.onnx \
+  --label soft_query_existing \
+  --out-dir /tmp/export_verify_soft_query_existing \
+  --compile-shared-lib
+```
+
+Other built-in exporters:
+
+```bash
+./.venv/bin/python tools/online/export_verify_mlir.py --target tiger-edge
+./.venv/bin/python tools/online/export_verify_mlir.py --target dolphin --dolphin-preset edge_small
+./.venv/bin/python tools/online/export_verify_mlir.py --target tf-mlpnet
+```
+
+Useful strictness flags:
+
+- `--fail-on-disallowed-ops`: fail when ONNX ops are outside the selected preset
+- `--forbid-op Tile,Expand,ConstantOfShape`: fail on specific ONNX ops
+- `--fail-on-math-ops`: fail when emitted MLIR contains `math.*` ops
+- `--allow-mlir-red-flags`: report, but do not fail on, control-flow red flags
+
 ### Family overview
 
 The current online / NPU-oriented families differ mainly in the separator and
