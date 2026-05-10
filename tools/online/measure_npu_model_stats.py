@@ -72,6 +72,13 @@ READY_SUITE = [
         "model_path": "recipes/dnr/models/online-hierarchical-soft-band-parallel-ffi-sfc2d.rt192k.speech-lowfreq-narrow.causal20dim.0-1-1l.128-96-48b/config.yaml",
         "n_chan": 1,
     },
+    {
+        "target": "band-scnet-npu",
+        "label": "BandSCNetNPU rt192k",
+        "band_scnet_npu_preset": "rt192k",
+        "n_chan": 1,
+        "freqs": 2049,
+    },
 ]
 
 
@@ -480,11 +487,50 @@ def build_tf_mlpnet_export(args: Any, spec: dict[str, Any], out_dir: Path) -> Ex
     )
 
 
+def build_band_scnet_npu_export(args: Any, spec: dict[str, Any], out_dir: Path) -> ExportedModel:
+    from BandSCNetNPU import BandSCNetNPUStreamingExportWrapper, build_band_scnet_npu_preset
+
+    preset = spec.get("band_scnet_npu_preset") or getattr(args, "band_scnet_npu_preset", "rt192k")
+    label = spec.get("label") or args.label or f"BandSCNetNPU {preset}"
+    n_freq = int(spec.get("freqs") or args.freqs)
+    n_chan = int(spec.get("n_chan") or args.n_chan or 1)
+    frames = int(spec.get("frames") or args.frames)
+    model = build_band_scnet_npu_preset(
+        preset,
+        n_freq=n_freq,
+        n_chan=n_chan,
+    ).to(args.device).eval()
+    state = model.init_stream_state(batch_size=1, device=args.device, dtype=torch.float32)
+    flat_state, _ = flatten_tensor_tree(tuple(state))
+    wrapper = BandSCNetNPUStreamingExportWrapper(model, batch_size=1, dtype=torch.float32).to(args.device).eval()
+    dummy = torch.randn(1, 2 * n_chan, frames, model.n_freq, device=args.device, dtype=torch.float32)
+    inputs = (dummy, *flat_state)
+    return ExportedModel(
+        label=label,
+        target="band-scnet-npu",
+        source=f"BandSCNetNPU preset={preset}",
+        module=model,
+        export_module=wrapper,
+        export_inputs=inputs,
+        onnx_path=out_dir / f"{sanitize_filename(label)}.onnx",
+        input_names=["x", *[f"state_{idx}" for idx in range(len(flat_state))]],
+        output_names=["y", *[f"next_state_{idx}" for idx in range(len(flat_state))]],
+        frames_per_call=frames,
+        state_fp16_bytes=tensor_tree_bytes(tuple(state), torch.float16),
+        state_fp32_bytes=tensor_tree_bytes(tuple(state), torch.float32),
+        param_count=parameter_count(model),
+        param_fp16_bytes=parameter_bytes(model, torch.float16),
+        param_fp32_bytes=parameter_bytes(model, torch.float32),
+        opset=args.online_opset,
+    )
+
+
 BUILDERS = {
     "online": build_online_export,
     "dolphin": build_dolphin_export,
     "tiger-edge": build_tiger_edge_export,
     "tf-mlpnet": build_tf_mlpnet_export,
+    "band-scnet-npu": build_band_scnet_npu_export,
 }
 
 
@@ -624,6 +670,7 @@ def build_specs(args: Any) -> list[dict[str, Any]]:
             "frames": args.frames,
             "freqs": args.freqs,
             "dolphin_preset": args.dolphin_preset,
+            "band_scnet_npu_preset": args.band_scnet_npu_preset,
         }
     ]
 
@@ -634,7 +681,7 @@ def parse_args() -> Any:
     )
     parser.add_argument(
         "--target",
-        choices=["ready-suite", "online", "dolphin", "tiger-edge", "tf-mlpnet"],
+        choices=["ready-suite", "online", "dolphin", "tiger-edge", "tf-mlpnet", "band-scnet-npu"],
         default="ready-suite",
         help="Model family to measure. Use ready-suite for the current NPU candidate set.",
     )
@@ -669,6 +716,7 @@ def parse_args() -> Any:
     )
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--dolphin-preset", default="edge_small")
+    parser.add_argument("--band-scnet-npu-preset", default="rt192k")
     parser.add_argument("--tf-out-channels", type=int, default=24)
     parser.add_argument("--tf-in-channels", type=int, default=96)
     parser.add_argument("--tf-num-blocks", type=int, default=4)
