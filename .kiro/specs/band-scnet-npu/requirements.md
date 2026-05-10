@@ -32,10 +32,13 @@ The model shall use ONLY the following operators in its forward pass:
 - Conv2d, ConvTranspose2d (stride=2 only for transposed)
 - bmm (via reshape to 3D)
 - softmax, sigmoid
-- ReLU (no PReLU, no SiLU in deployed graph — SiLU can be used in training-only paths or approximated as sigmoid*x)
+- ReLU, PReLU (both are NPU-supported per `TF-MLPNet/context.md`). SiLU is NOT used in the deployed graph; if a SiLU-style nonlinearity is desired, it is expressed explicitly as `sigmoid + elementwise-mul`.
 - reshape, transpose (minimize usage)
 - elementwise: add, mul, sub, div
 - padding (zero-pad for causal convolutions)
+
+### FR-5a: STFT / iSTFT are NOT part of the exported model
+STFT and iSTFT shall be implemented in the streaming runtime (outside the exported ONNX graph), matching the existing convention in this repository (see `tools/online/export_onnx_online_model.py`, `TF-MLPNet/tf_mlpnet/export_onnx.py`, and `spectral_feature_compression/core/model/online_model_wrapper.py::CausalISTFTOLA`). The model's input is a pre-computed packed-complex STFT tensor `[B, 2M, T, F]` (real/imag interleaved on the channel axis via `pack_complex_stft_as_2d`); the model's output is a mask/spectrogram tensor of the same layout. STFT and iSTFT are performed by the host/DSP as preprocessing and post-processing, respectively.
 
 ### FR-6: Tensor Dimension Constraints
 All tensors in the forward pass shall have at most 4 dimensions. For 4D tensors, dimension 0 shall always be the batch dimension (set to 1 for NPU export). No folding of other dimensions into the batch dimension.
@@ -111,7 +114,9 @@ All hyperparameters shall be documented. The model shall be deterministic given 
 | Multi-output masking | Online SFC, DolphinSFCNPU | Source-gain masks via channel slicing |
 | Gated mixing (sigmoid * linear) | Band-SCNet GLU, TIGER | sigmoid + mul (both NPU-supported) |
 | Frequency-mixing via bmm | Online SFC soft-band | 3D bmm after reshape (NPU-supported) |
-| ReLU activation (no PReLU/SiLU) | NPU constraint | Direct replacement; SiLU approximated as sigmoid*x where needed |
+| Nonlinearity (ReLU / PReLU) | NPU constraint | Both ReLU and PReLU are NPU-supported (per `TF-MLPNet/context.md`). PReLU is the default activation; fall back to ReLU only if int8 quantization of PReLU turns out to be unstable. |
+| SiLU replaced by explicit `sigmoid * x` | NPU constraint | If a SiLU-style unit is desired, materialise it as `sigmoid + mul` so the exported graph contains no SiLU op. |
+| STFT / iSTFT outside the model | Project convention | Model consumes packed-complex STFT `[B, 2M, T, F]` and emits a packed-complex mask; STFT and iSTFT live in the host/DSP runtime, not in the ONNX graph. |
 
 ---
 

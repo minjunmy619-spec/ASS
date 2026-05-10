@@ -158,6 +158,7 @@ def build_exported_model(args: Any, out_dir: Path):
         "frames": args.frames,
         "freqs": args.freqs,
         "dolphin_preset": args.dolphin_preset,
+        "band_scnet_npu_preset": args.band_scnet_npu_preset,
     }
     if args.target == "online" and args.model_path is None:
         raise ValueError("--model-path is required for --target online.")
@@ -240,7 +241,7 @@ def parse_args() -> Any:
     parser = ArgumentParser(description="Export ONNX and verify onnx-mlir conversion for NPU deployment bring-up.")
     parser.add_argument(
         "--target",
-        choices=["online", "dolphin", "tiger-edge", "tf-mlpnet"],
+        choices=["online", "dolphin", "tiger-edge", "tf-mlpnet", "band-scnet-npu"],
         default="online",
         help="Model exporter to use. Ignored when --onnx-in is passed.",
     )
@@ -259,6 +260,7 @@ def parse_args() -> Any:
     parser.add_argument("--tiger-opset", type=int, default=14)
     parser.add_argument("--tf-opset", type=int, default=17)
     parser.add_argument("--dolphin-preset", default="edge_small")
+    parser.add_argument("--band-scnet-npu-preset", default="rt192k")
     parser.add_argument("--tf-out-channels", type=int, default=24)
     parser.add_argument("--tf-in-channels", type=int, default=96)
     parser.add_argument("--tf-num-blocks", type=int, default=4)
