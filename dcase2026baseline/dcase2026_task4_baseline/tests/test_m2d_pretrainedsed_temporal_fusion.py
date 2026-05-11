@@ -1,4 +1,5 @@
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 import torch
@@ -56,6 +57,43 @@ def test_temporal_predict_contract_from_mocked_forward():
     assert out["probabilities"].shape == (2,)
     assert out["activity_probabilities"].shape == (2, 3)
     assert torch.equal(out["class_index"], torch.tensor([1, 0]))
+
+
+def test_pretrainedsed_temporal_branch_forces_fp32_before_external_frontend():
+    class RecordingBranch(torch.nn.Module):
+        output_dim = 4
+
+        def __init__(self):
+            super().__init__()
+            self.seen_dtype = None
+
+        def forward(self, waveform):
+            self.seen_dtype = waveform.dtype
+            return waveform.new_ones(waveform.shape[0], self.output_dim)
+
+    class ToyFusion(torch.nn.Module):
+        def project(self, branch_embeddings):
+            return branch_embeddings
+
+        def fuse(self, projected):
+            return projected["BEATs"], None
+
+    class ToyTemporalClassifier(M2DTemporalPretrainedSEDFusionClassifier):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.input_sample_rate = 16000
+            self.pretrainedsed_sample_rate = 16000
+            self.branch = RecordingBranch()
+            self.pretrainedsed_branches = torch.nn.ModuleDict({"BEATs": self.branch})
+            self.pretrainedsed_fusion = ToyFusion()
+
+    model = ToyTemporalClassifier()
+    waveform = torch.randn(2, 16000, dtype=torch.bfloat16)
+    fused, branch_embeddings, _ = model._forward_pretrainedsed(waveform)
+
+    assert model.branch.seen_dtype == torch.float32
+    assert branch_embeddings["BEATs"].dtype == torch.float32
+    assert fused.dtype == torch.float32
 
 
 def test_temporal_activity_loss_supervises_silence_as_zero_activity():
