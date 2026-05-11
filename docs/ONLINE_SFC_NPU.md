@@ -440,11 +440,31 @@ Measure a named non-SFC preset:
 ./.venv/bin/python tools/online/measure_npu_model_stats.py --target tiger-edge
 ./.venv/bin/python tools/online/measure_npu_model_stats.py --target dolphin --dolphin-preset edge_small --n-chan 1
 ./.venv/bin/python tools/online/measure_npu_model_stats.py --target tf-mlpnet
+./.venv/bin/python tools/online/measure_npu_model_stats.py \
+  --target band-scnet-npu \
+  --band-scnet-npu-preset rt192k \
+  --freqs 2049 \
+  --n-chan 1
 ```
 
 Outputs are written as `npu_model_stats.json` and `npu_model_stats.csv` in the
 selected output directory, together with the generated ONNX and emitted MLIR
 files. Add `--skip-mlir` for a faster parameter/MAC/ONNX-only pass.
+
+Recent BandSCNetNPU review measurements at `n_freq=2049`, `hop_length=512`,
+and `sample_rate=44100`:
+
+| Preset        | params | state fp16 | GMAC/s | ONNX nodes | MLIR ops | note |
+|---------------|-------:|-----------:|-------:|-----------:|---------:|------|
+| `edge_small`  | 10,411 | 108.75 KiB | 0.2055 | 460        | 2,798    | safest memory bring-up preset |
+| `rt192k`      | 62,115 | 190.88 KiB | 1.2588 | 716        | 3,798    | state-only fits, full I/O budget needs confirmation |
+| `rt192k_plus` | 72,915 | 178.00 KiB | 1.6178 | 588        | 3,257    | better state headroom than `rt192k`, still full I/O budget risk |
+
+For BandSCNetNPU, do not treat `state_fp16_kib` as the whole hardware memory
+answer. At `n_freq=2049`, the single-frame packed input is 8,196 bytes and the
+masked packed output is 24,588 bytes in fp16. If the hardware budget counts
+both input and output state tensors plus `x`/`y`, the deployment signature is
+larger than 192 KiB even when the persistent state alone fits.
 
 ### ONNX to MLIR verification pipeline
 
@@ -482,7 +502,18 @@ Other built-in exporters:
 ./.venv/bin/python tools/online/export_verify_mlir.py --target tiger-edge
 ./.venv/bin/python tools/online/export_verify_mlir.py --target dolphin --dolphin-preset edge_small
 ./.venv/bin/python tools/online/export_verify_mlir.py --target tf-mlpnet
+./.venv/bin/python tools/online/export_verify_mlir.py \
+  --target band-scnet-npu \
+  --band-scnet-npu-preset rt192k_plus \
+  --freqs 2049 \
+  --n-chan 1 \
+  --allow-op PRelu \
+  --fail-on-disallowed-ops
 ```
+
+BandSCNetNPU intentionally uses `PRelu`; pass `--allow-op PRelu` for strict
+audits unless the shared `edge_npu_recommended` ONNX allowlist has been updated
+to include it.
 
 Useful strictness flags:
 

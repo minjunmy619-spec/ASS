@@ -24,7 +24,7 @@ repository root.
 | Optional on-the-fly USS -> SC joint fine-tune | `config/separation/modified_deft_uss_sc_joint_universal_pretrainedsed_fusion.yaml` | `src/models/deft/unified_uss.py` and `src/models/m2dat/m2d_sc.py` | `src/training/lightningmodule/uss_sc_joint_model_parallel.py` | `src/training/loss/uss_bridge_loss.py` and `src/training/loss/m2d_sc_arcface.py` | `src/datamodules/uss_dataset.py` over dynamic `DatasetS3` scenes | stage-evaluate USS/SC with `evaluate_stage.py` and the joint checkpoint |
 | TSE bootstrap | `config/separation/modified_deft_tse_lite_6s_temporal.yaml` | `src/models/deft/modified_deft.py` (`ModifiedDeFTTSEMemoryEfficientTemporal`) | `src/training/lightningmodule/tse.py` | `src/training/loss/masked_snr.py` | `src/datamodules/tse_dataset.py` (`TSEDataset`) | `src/evaluation/evaluate_stage.py --stage tse` |
 | Online-teacher TSE | `config/separation/modified_deft_tse_lite_6s_online_teacher_uss_sc.yaml`; opt-in two-pass: `config/separation/modified_deft_tse_lite_6s_online_teacher_uss_sc_2pass.yaml` | `src/models/deft/modified_deft.py` (`ModifiedDeFTTSEMemoryEfficientTemporal`) | `src/training/lightningmodule/online_teacher_tse.py` | `src/training/loss/masked_snr.py` | `src/datamodules/tse_dataset.py` (`OnlineTeacherTSEDataset`) | full S5 evaluation |
-| Final S5 | two-pass current: `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse.yaml`; one-pass comparison: `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse_1pass.yaml`; two-pass-trained comparison: `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse_2pass_trained.yaml` | `src/models/s5/kwo2025_temporal.py`, `src/models/s5/kwo2025.py` | none | metric-only | `src/datamodules/dataset.py` (`DatasetS3`, waveform test split) | `src/evaluation/evaluate.py` |
+| Final S5 | validation: `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse.yaml`; hidden-test inference: `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse_submission.yaml`; one-pass comparison: `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse_1pass.yaml`; two-pass-trained comparison: `src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse_2pass_trained.yaml` | `src/models/s5/kwo2025_temporal.py`, `src/models/s5/kwo2025.py` | none | metric-only | `src/datamodules/dataset.py` (`DatasetS3`, waveform test split) | `src/evaluation/evaluate.py` |
 
 Supporting USS feature modules:
 
@@ -822,6 +822,37 @@ The final waveform outputs are written under:
 
 ```text
 workspace/universal/final_waveforms/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse/
+```
+
+For official hidden-test or submission inference, use the sibling submission
+config. It intentionally has no `oracle_target_dir` and sets
+`return_source: false`, so it cannot compute validation metrics. Update its
+`soundscape_dir` to the official hidden-test soundscape folder before running.
+
+```bash
+cd /home/cmj/works/ASS/dcase2026baseline/dcase2026_task4_baseline
+source .venv/bin/activate
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+
+python -m src.evaluation.evaluate \
+  -c src/evaluation/eval_configs/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse_submission.yaml \
+  --inference_only \
+  --batchsize 1 \
+  --result_dir workspace/universal/submission_predictions \
+  --waveform_output_dir workspace/universal/submission_waveforms
+```
+
+This writes prediction metadata under:
+
+```text
+workspace/universal/submission_predictions/*_results.json
+workspace/universal/submission_predictions/*_summary.json
+```
+
+and non-silence predicted source waveforms under:
+
+```text
+workspace/universal/submission_waveforms/kwo2025_top1_like_lite_estimated_temporal_sc_uss_conditioned_tse_submission/
 ```
 
 ## 10. Final S5 Stage Diagnostics

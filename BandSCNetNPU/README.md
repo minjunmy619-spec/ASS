@@ -77,20 +77,33 @@ Not used (forbidden by allowlist): `Expand`, `Tile`, `ConstantOfShape`,
 ## Presets
 
 `build_band_scnet_npu_preset(name, n_freq=...)` returns a `BandSCNetNPU`.
-Measured at `n_freq=2049` (standard STFT with `n_fft=4096`), `dtype=fp16`:
+Measured inside the project Docker container at `n_freq=2049` (standard STFT
+with `n_fft=4096`) using `tools/online/measure_npu_model_stats.py` and
+`tools/online/export_verify_mlir.py`:
 
-| Preset        | channels (sep / pyr) | stages | Kt | attention                | params    | streaming state (fp16)  |
-|---------------|----------------------|--------|----|--------------------------|-----------|-------------------------|
-| `edge_small`  | 16 / 8               | 2      | 5  | off                      | ≈10 k     | ≈109 KiB (< 192 KiB)    |
-| `rt192k`      | 40 / 8               | 3      | 3  | W=16, heads=4, head_dim=8| ≈62 k     | ≈191 KiB (< 192 KiB)    |
+| Preset        | channels (sep / pyr) | stages | Kt | attention                 | params | state fp16 | GMAC/s | ONNX nodes | MLIR ops |
+|---------------|----------------------|--------|----|---------------------------|-------:|-----------:|-------:|-----------:|---------:|
+| `edge_small`  | 16 / 8               | 2      | 5  | off                       | 10,411 | 108.75 KiB | 0.2055 | 460        | 2,798    |
+| `rt192k`      | 40 / 8               | 3      | 3  | W=16, heads=4, head_dim=8 | 62,115 | 190.88 KiB | 1.2588 | 716        | 3,798    |
+| `rt192k_plus` | 56 / 8               | 2      | 3  | W=16, heads=4, head_dim=8 | 72,915 | 178.00 KiB | 1.6178 | 588        | 3,257    |
 
-Parameter counts are deliberately small because the DSP 192 KiB streaming
-state quota is the hard constraint: per NarrowBandBlock state is
-`1 * C_sep * (Kt-1) * F' * 2 bytes`, and with F'≈F/16≈128-348 even a
-modest `C_sep * L` blows the budget. The presets trade model size for
-deployability. If the DSP quota is relaxed, widen `channels` or raise
-`num_stages` / `time_kernel` accordingly (see `presets.py` for the
-budget-accounting formulas).
+The state-only number is not the full deployment I/O budget. At `n_freq=2049`
+and fp16, the streaming-cell signature also carries the current input frame
+(`x`, 8,196 bytes) and masked output frame (`y`, 24,588 bytes). That means:
+
+| Preset        | state only | state + x + y | input state + output state + x + y |
+|---------------|-----------:|--------------:|-----------------------------------:|
+| `edge_small`  | 108.75 KiB | 140.77 KiB    | 249.52 KiB                         |
+| `rt192k`      | 190.88 KiB | 222.89 KiB    | 413.77 KiB                         |
+| `rt192k_plus` | 178.00 KiB | 210.02 KiB    | 388.02 KiB                         |
+
+So `rt192k` and `rt192k_plus` are valid ONNX/MLIR bring-up candidates, but they
+are not final hardware-ready presets until the exact DSP/NPU memory accounting
+is confirmed or the state/signature is reduced. Parameter counts are deliberately
+small because the 192 KiB state/cache quota dominates: per NarrowBandBlock state
+is `1 * C_sep * (Kt-1) * F' * 2 bytes`, and with F'≈F/16≈128-348 even a modest
+`C_sep * L` grows quickly. If the quota is relaxed, widen `channels` or raise
+`num_stages` / `time_kernel` accordingly (see `presets.py` for the formulas).
 
 ## Streaming / NPU contract
 
@@ -140,6 +153,7 @@ torch.onnx.export(
     input_names=["x", *[f"state_{i}" for i in range(len(flat_state))]],
     output_names=["y", *[f"next_state_{i}" for i in range(len(flat_state))]],
     do_constant_folding=True,
+    dynamo=False,
 )
 ```
 
@@ -147,20 +161,42 @@ For end-to-end MLIR verification (inside the project's docker container,
 per `AGENT.md`):
 
 ```bash
-/app/ASS/.venv/bin/python tools/online/export_verify_mlir.py \
-  --target band-scnet-npu --preset edge_small
+cd /app/ASS
+./.venv/bin/python tools/online/export_verify_mlir.py \
+  --target band-scnet-npu \
+  --band-scnet-npu-preset rt192k \
+  --freqs 2049 \
+  --n-chan 1 \
+  --label BandSCNetNPU_rt192k \
+  --out-dir /tmp/export_verify_band_scnet_rt192k \
+  --allow-op PRelu \
+  --fail-on-disallowed-ops
 ```
 
-(Registering `band-scnet-npu` in `tools/online/*.py` is Phase 7.2 of
-`.kiro/specs/band-scnet-npu/tasks.md` and is not yet wired up.)
+`PRelu` is used intentionally by the model and is supported by the target-side
+model design. The generic `edge_npu_recommended` audit preset does not include
+it yet, so use `--allow-op PRelu` for strict audit runs unless the shared
+allowlist has been updated.
+
+For repeatable parameter/MAC/node summaries:
+
+```bash
+cd /app/ASS
+./.venv/bin/python tools/online/measure_npu_model_stats.py \
+  --target band-scnet-npu \
+  --band-scnet-npu-preset rt192k_plus \
+  --freqs 2049 \
+  --n-chan 1 \
+  --out-dir /tmp/npu_model_stats_band_scnet_rt192k_plus
+```
 
 ## Run the local test suite
 
-All tests are pure-PyTorch (no NPU, no onnx-mlir required), so they run
-anywhere. From the project root:
+Most tests are pure-PyTorch; the final ONNX smoke also needs the ONNX exporter
+dependencies available in the active environment. From the project root:
 
 ```bash
-python3 -m BandSCNetNPU.test_band_scnet_npu
+./.venv/bin/python -m BandSCNetNPU.test_band_scnet_npu
 ```
 
 Coverage:
@@ -172,6 +208,11 @@ Coverage:
 - NPU kernel-size + transposed-stride constraint walk
 - streaming state byte budget (≤ 192 KiB fp16) for both presets
 - ONNX export smoke (opset 11) + `onnx.checker` + forbidden-op check
+
+If the ONNX smoke fails with `ModuleNotFoundError: No module named 'onnxscript'`
+under a new PyTorch exporter default, use the deployment tooling above for the
+authoritative export/MLIR check or pass `dynamo=False` in direct
+`torch.onnx.export` calls.
 
 Expected:
 
@@ -213,9 +254,9 @@ all 12 tests passed
   present state budget.
 - The frequency axis is zero-padded to the next split-compatible width
   (typically +3 bins out of 2049) and cropped back before masking.
-- `tools/online/export_onnx_online_model.py` and
-  `tools/online/export_verify_mlir.py` do not yet know about
-  `--target band-scnet-npu`; wiring is tracked in Phase 7 of the spec's
-  `tasks.md`.
-- Training recipes (`recipes/band_scnet_npu/`) are Phase 10 of the spec
-  and have not been written yet.
+- `tools/online/measure_npu_model_stats.py` and
+  `tools/online/export_verify_mlir.py` support `--target band-scnet-npu`.
+  `tools/online/export_onnx_online_model.py` is still not the preferred
+  exporter for this model; use the deployment tools shown above.
+- The current training recipe is
+  `recipes/dnr/models/band-scnet-npu.rt192k/config.yaml`.

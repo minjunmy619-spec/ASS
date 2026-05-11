@@ -35,14 +35,16 @@ class Evaluator:
                  batch_size=2,
                  use_cpu=False,
                  compare_assignment=False,
-                 validation_breakdown=False):
+                 validation_breakdown=False,
+                 inference_only=False):
         self.config_path = config_path
         self.filename = os.path.basename(config_path)[:-5]
         self.batch_size = batch_size
         self.waveform_output_dir = os.path.join(waveform_output_dir, self.filename) if waveform_output_dir else waveform_output_dir
         self.result_dir = result_dir
         self.use_cpu = use_cpu
-        self.metric_funcs = build_metric_funcs(
+        self.inference_only = bool(inference_only)
+        self.metric_funcs = [] if self.inference_only else build_metric_funcs(
             compare_assignment=compare_assignment,
             validation_breakdown=validation_breakdown,
         )
@@ -54,6 +56,8 @@ class Evaluator:
         dsconfig = config['dataset']
         self.use_generated_waveform = 'estimate_target_dir' in dsconfig['args']['config'] # if estimate_target_dir is provided, generated waveforms are used to evaluate
         assert not self.use_generated_waveform or not self.waveform_output_dir, 'if estimate_target_dir is provided in the dataset, waveform will not be generated again (waveform_output_dir should not be specified)'
+        if self.inference_only and self.use_generated_waveform:
+            raise ValueError("--inference_only expects model inference; remove estimate_target_dir from the dataset config.")
 
         # load model and dataset
         dataset = initialize_config(config['dataset'], reload=True)
@@ -89,8 +93,52 @@ class Evaluator:
                 # batch_est_waveforms = output['waveform'].cpu()# [bs, nsources, wlen]
         return output
 
+    def _jsonable(self, value):
+        if torch.is_tensor(value):
+            return value.detach().cpu().tolist()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (list, tuple)):
+            return [self._jsonable(v) for v in value]
+        return value
+
+    def _write_prediction_waveforms(self, batch_est_labels, batch_est_waveforms, soundscapes):
+        waveform_paths = [[] for _ in soundscapes]
+        if not self.waveform_output_dir:
+            return waveform_paths
+        for sample_idx, (labels, waveforms, soundscape_name) in enumerate(zip(batch_est_labels, batch_est_waveforms, soundscapes)):
+            for source_idx, (label, waveform) in enumerate(zip(labels, waveforms)):
+                if label != 'silence':
+                    wavpath = os.path.join(self.waveform_output_dir, soundscape_name + '_' + str(source_idx) + '_' + label + '.wav')
+                    sf.write(wavpath, waveform.numpy(), self.sr)
+                    waveform_paths[sample_idx].append(wavpath)
+        return waveform_paths
+
+    def _append_prediction_results(self, results, batch, batch_est_labels, batch_est_probabilities, waveform_paths):
+        if results is None:
+            return
+        for i, soundscape_name in enumerate(batch['soundscape']):
+            reobj = {
+                'soundscape': soundscape_name,
+                'est_labels': self._jsonable(batch_est_labels[i]),
+                'probabilities': self._jsonable(batch_est_probabilities[i]),
+            }
+            if self.waveform_output_dir:
+                reobj['waveform_files'] = waveform_paths[i]
+            results.append(reobj)
+
+    def _count_non_silence(self, batch_est_labels):
+        return sum(
+            1
+            for sample_labels in batch_est_labels
+            for label in sample_labels
+            if label != 'silence'
+        )
+
     def evaluate(self):
-        if self.result_dir: results = []
+        results = [] if self.result_dir else None
+        num_soundscapes = 0
+        num_non_silence_predictions = 0
         for metric_func in self.metric_funcs: metric_func.reset()
 
         for batch in tqdm(self.dataloader):
@@ -105,16 +153,22 @@ class Evaluator:
             batch_est_waveforms = output['waveform'][:, :, 0, :].cpu() # [bs, nsources, wlen]
             batch_est_labels = output['label']
             batch_est_probabilities = output['probabilities']
+            if self.inference_only:
+                waveform_paths = self._write_prediction_waveforms(batch_est_labels, batch_est_waveforms, batch['soundscape'])
+                num_soundscapes += len(batch['soundscape'])
+                num_non_silence_predictions += self._count_non_silence(batch_est_labels)
+                self._append_prediction_results(results, batch, batch_est_labels, batch_est_probabilities, waveform_paths)
+                continue
+
+            if 'dry_sources' not in batch or 'label' not in batch:
+                raise KeyError(
+                    "Evaluation mode requires oracle 'dry_sources' and 'label'. "
+                    "For hidden-test prediction, use --inference_only with a config that omits oracle_target_dir."
+                )
+            self._write_prediction_waveforms(batch_est_labels, batch_est_waveforms, batch['soundscape'])
             batch_mixture = batch['mixture'][:, 0, :] # [bs, wlen]
             batch_ref_waveforms = batch['dry_sources'][:, :, 0, :] # [bs, nsources, wlen]
             batch_ref_labels = batch['label']
-
-            if self.waveform_output_dir:
-                for labels, waveforms, soundscape_name in zip(batch_est_labels, batch_est_waveforms, batch['soundscape']):
-                    for i, (label, waveform) in enumerate(zip(labels, waveforms)):
-                        if label != 'silence':
-                            wavpath = os.path.join(self.waveform_output_dir, soundscape_name + '_' + str(i) + '_' +  label + '.wav')
-                            sf.write(wavpath, waveform.numpy(), self.sr)
 
             metric_values = []
             for metric_func in self.metric_funcs:
@@ -126,7 +180,7 @@ class Evaluator:
                 metric_values.append(metric_value)
                     # 'metric': name = getattr(metric_func, "metric_name", None),
 
-            if self.result_dir:
+            if results is not None:
                 for i in range(len(batch_mixture)):
                     reobj = {
                         'soundscape': batch['soundscape'][i],
@@ -143,11 +197,19 @@ class Evaluator:
                     results.append(reobj)
                     # import pdb; pdb.set_trace()
 
-        summary = {}
-        for metric_func in self.metric_funcs:
-            metric_summary = metric_func.compute(is_print=True)
-            if isinstance(metric_summary, dict):
-                summary[getattr(metric_func, "metric_name", metric_func.__class__.__name__)] = metric_summary
+        if self.inference_only:
+            summary = {
+                'mode': 'inference_only',
+                'num_soundscapes': num_soundscapes,
+                'num_non_silence_predictions': num_non_silence_predictions,
+                'waveform_output_dir': self.waveform_output_dir,
+            }
+        else:
+            summary = {}
+            for metric_func in self.metric_funcs:
+                metric_summary = metric_func.compute(is_print=True)
+                if isinstance(metric_summary, dict):
+                    summary[getattr(metric_func, "metric_name", metric_func.__class__.__name__)] = metric_summary
         if self.result_dir:
             os.makedirs(self.result_dir, exist_ok=True)
             with open(os.path.join(self.result_dir, f"{self.filename}_results.json"), "w") as outfile:
@@ -163,7 +225,8 @@ def main(args):
                  args.batchsize,
                  args.cpu,
                  compare_assignment=args.compare_assignment,
-                 validation_breakdown=args.validation_breakdown)
+                 validation_breakdown=args.validation_breakdown,
+                 inference_only=args.inference_only)
     evalobj.evaluate()
 
 if __name__ == '__main__':
@@ -175,6 +238,7 @@ if __name__ == '__main__':
     parser.add_argument("--batchsize","-b", type=int, required=False, default=2)
     parser.add_argument("--compare_assignment", action="store_true", help="Also log official raw-SDR assignment vs paper SDRi-assignment CAPI-SDRi diagnostics.")
     parser.add_argument("--validation_breakdown", action="store_true", help="Also log CAPI-SDRi, zero-target FP, silence, leakage, and scene-bucket diagnostics.")
+    parser.add_argument("--inference_only", "--inference-only", action="store_true", help="Write predictions without loading oracle targets or computing validation metrics.")
 
     args = parser.parse_args()
     print('START')

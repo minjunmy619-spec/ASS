@@ -146,6 +146,7 @@ rule11: Try to control the number of nodes in the graph, the NPU is good at calc
 rule12: The model should be temporal causul, it need be deployed for realtime/streaming/online inference
 rule13: To support the oneline deployment, the size of the passed state or cache should be small. the DSP quotas(192k) for all the inputs/outputs should be considered carefully
 rule14: To support onnx exporting, dynamic control flows should be avoid, and the number of inputs/outputs parameter should be small
+rule15: The model parameters should less than 7M, and the GMacs should less than 3GMacs/s
 ```
 
 ## Validation
