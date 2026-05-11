@@ -30,6 +30,7 @@ from BandSCNetNPU import (  # noqa: E402
     BandSCNetNPUStreamingExportWrapper,
     CrossBandBlock,
     NarrowBandBlock,
+    PooledChannelMixer,
     SparseDownsampleEncoder,
     SparseUpsampleDecoder,
     build_band_scnet_npu_preset,
@@ -40,6 +41,7 @@ from spectral_feature_compression.utils.onnx_streaming import flatten_tensor_tre
 
 EDGE_PRESET = "edge_small"
 RT_PRESET = "rt192k"
+PARAM_PRESET = "rt192k_param6m"
 N_FREQ_SMALL = 257  # for fast smoke tests
 
 
@@ -100,6 +102,15 @@ def test_cross_band_block_shape() -> None:
     with torch.no_grad():
         y = blk(x)
     assert y.shape == x.shape
+
+
+def test_pooled_channel_mixer_shape_and_grad() -> None:
+    blk = PooledChannelMixer(channels=8, hidden_channels=32).train()
+    x = torch.randn(2, 8, 5, 17, requires_grad=True)
+    y = blk(x)
+    assert y.shape == x.shape
+    y.square().mean().backward()
+    assert x.grad is not None
 
 
 def test_narrow_band_block_streaming_consistency_no_attn() -> None:
@@ -211,8 +222,16 @@ def test_rt192k_streaming_matches_full() -> None:
     _streaming_equivalence(model, x, atol=2e-5, rtol=2e-5)
 
 
+def test_param_preset_streaming_matches_full() -> None:
+    torch.manual_seed(0)
+    model = build_band_scnet_npu_preset(PARAM_PRESET, n_freq=N_FREQ_SMALL).eval()
+    T = min(model.attn_window, 4)
+    x = torch.randn(1, 2, T, N_FREQ_SMALL)
+    _streaming_equivalence(model, x, atol=2e-5, rtol=2e-5)
+
+
 def test_npu_conv_constraints_both_presets() -> None:
-    for name in (EDGE_PRESET, RT_PRESET):
+    for name in (EDGE_PRESET, RT_PRESET, PARAM_PRESET):
         model = build_band_scnet_npu_preset(name, n_freq=N_FREQ_SMALL).eval()
         _assert_conv_constraints(model)
 
@@ -228,6 +247,14 @@ def test_state_budget_rt192k() -> None:
     model = build_band_scnet_npu_preset(RT_PRESET, n_freq=2049).eval()
     bytes_fp16 = model.state_size_bytes(dtype=torch.float16)
     assert bytes_fp16 <= 196_608, f"rt192k state {bytes_fp16} B exceeds 192 KiB"
+
+
+def test_param_preset_state_budget_and_capacity() -> None:
+    model = build_band_scnet_npu_preset(PARAM_PRESET, n_freq=2049).eval()
+    bytes_fp16 = model.state_size_bytes(dtype=torch.float16)
+    params = sum(p.numel() for p in model.parameters())
+    assert bytes_fp16 <= 196_608, f"{PARAM_PRESET} state {bytes_fp16} B exceeds 192 KiB"
+    assert 5_000_000 <= params <= 7_000_000, params
 
 
 # --- ONNX export smoke ------------------------------------------------------
@@ -267,6 +294,7 @@ def test_streaming_onnx_export_edge_small() -> None:
                 input_names=["x", *[f"state_{i}" for i in range(len(flat_state))]],
                 output_names=["y", *[f"next_state_{i}" for i in range(len(flat_state))]],
                 do_constant_folding=True,
+                dynamo=False,
             )
         model_proto = onnx.load(str(out))
         onnx.checker.check_model(model_proto)

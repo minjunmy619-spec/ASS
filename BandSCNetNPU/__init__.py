@@ -4,9 +4,22 @@ See `.kiro/specs/band-scnet-npu/design.md` for full design rationale.
 """
 from __future__ import annotations
 
-from .blocks import BoundedCausalAttn, CrossBandBlock, GatedAct, NarrowBandBlock
+from .blocks import (
+    BoundedCausalAttn,
+    CrossBandBlock,
+    GatedAct,
+    NarrowBandBlock,
+    PooledChannelMixer,
+)
 from .band_scnet_npu import BandSCNetNPU, BandSCNetNPUStreamingExportWrapper
-from .presets import build_band_scnet_npu_preset, edge_small, rt192k, rt192k_plus
+from .presets import (
+    build_band_scnet_npu_preset,
+    edge_small,
+    rt192k,
+    rt192k_param2m,
+    rt192k_param6m,
+    rt192k_plus,
+)
 from .sparse_io import (
     SparseDownsampleEncoder,
     SparseUpsampleDecoder,
@@ -21,12 +34,15 @@ __all__ = [
     "CrossBandBlock",
     "GatedAct",
     "NarrowBandBlock",
+    "PooledChannelMixer",
     "SparseDownsampleEncoder",
     "SparseUpsampleDecoder",
     "build_band_scnet_npu_preset",
     "edge_small",
     "pad_n_freq_for_split",
     "rt192k",
+    "rt192k_param2m",
+    "rt192k_param6m",
     "rt192k_plus",
     "split_bands",
 ]

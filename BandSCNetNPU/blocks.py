@@ -76,6 +76,39 @@ class CrossBandBlock(nn.Module):
         return x + y
 
 
+class PooledChannelMixer(nn.Module):
+    """Parameter-efficient capacity branch with frequency-pooled compute.
+
+    This is a stateless current-frame channel mixer:
+
+        x -> RMSNorm -> mean over F -> Conv2d(C, 2H, 1) -> gate -> Conv2d(H, C, 1)
+
+    The hidden dimension can be large, adding millions of trainable parameters
+    without increasing streaming state. Compute stays modest because the
+    expensive channel projections run at frequency width 1, then broadcast back
+    across the compressed separator frequency axis via Add.
+    """
+
+    def __init__(self, channels: int, hidden_channels: int):
+        super().__init__()
+        if hidden_channels <= 0:
+            raise ValueError(f"hidden_channels must be positive, got {hidden_channels}")
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.norm = RMSNorm2d(channels)
+        self.expand = nn.Conv2d(channels, 2 * hidden_channels, kernel_size=1, bias=True)
+        self.act = GatedAct()
+        self.project = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _runtime_assert(x.ndim == 4, f"Expected 4D input, got {tuple(x.shape)}")
+        y = self.norm(x).mean(dim=3, keepdim=True)
+        y = self.expand(y)
+        y = self.act(y)
+        y = self.project(y)
+        return x + y
+
+
 class BoundedCausalAttn(nn.Module):
     """Temporal causal attention on frequency-pooled features.
 

@@ -1,0 +1,5 @@
+_base_: ../band-scnet-npu.rt192k/config.yaml
+
+task:
+  model:
+    preset: rt192k_param6m

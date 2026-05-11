@@ -83,6 +83,13 @@ READY_SUITE = [
         "n_chan": 1,
         "freqs": 2049,
     },
+    {
+        "target": "band-scnet-npu",
+        "label": "BandSCNetNPU rt192k_param6m",
+        "band_scnet_npu_preset": "rt192k_param6m",
+        "n_chan": 1,
+        "freqs": 2049,
+    },
 ]
 
 

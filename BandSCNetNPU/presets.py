@@ -21,6 +21,11 @@ rt192k      (C_s=32, L=4, Kt=5, attn W=16 h=4 d=8)
   total                   ~ 200 KiB
 With Kt=3 for the separator this drops to ~100 KiB sep + 25 KiB pyramid
 = ~130 KiB, leaving headroom for the attn KV cache and iSTFT scratch.
+
+The ``rt192k_param*`` presets add a frequency-pooled channel mixer inside each
+separator stage. This raises the trainable parameter count into the 2M-6M range
+without increasing persistent streaming state, because the wide branch operates
+on ``[B, C, T, 1]`` rather than every compressed frequency bin.
 """
 from __future__ import annotations
 
@@ -130,9 +135,82 @@ def rt192k_plus(
     )
 
 
+def rt192k_param2m(
+    n_freq: int,
+    *,
+    n_src: int = 3,
+    n_chan: int = 1,
+    masking: bool = True,
+) -> BandSCNetNPU:
+    """Budget-state preset with a moderate pooled channel-capacity branch.
+
+    Uses the same streaming-state shape as ``rt192k`` but adds a stateless
+    pooled mixer with hidden width 6144 in each separator stage. This is meant
+    as a first serious training candidate when the tiny presets underfit.
+    """
+    return BandSCNetNPU(
+        n_freq=n_freq,
+        n_src=n_src,
+        n_chan=n_chan,
+        channels=40,
+        pyramid_channels=8,
+        num_stages=3,
+        time_kernel=3,
+        freq_kernel=3,
+        pyramid_time_kernel=3,
+        pyramid_freq_kernel=3,
+        pyramid_conv_blocks=(1, 1, 1),
+        pyramid_strides=(2, 2, 4),
+        use_attn=True,
+        attn_window=16,
+        num_heads=4,
+        head_dim=8,
+        pooled_mixer_hidden=6144,
+        masking=masking,
+    )
+
+
+def rt192k_param6m(
+    n_freq: int,
+    *,
+    n_src: int = 3,
+    n_chan: int = 1,
+    masking: bool = True,
+) -> BandSCNetNPU:
+    """Quality-biased preset near the rule15 parameter ceiling.
+
+    Keeps the state profile of ``rt192k_plus`` (C=56, two separator stages)
+    while adding a wide frequency-pooled mixer with hidden width 18432. This
+    should be much more trainable than the sub-100K parameter presets while
+    remaining below the 7M parameter target.
+    """
+    return BandSCNetNPU(
+        n_freq=n_freq,
+        n_src=n_src,
+        n_chan=n_chan,
+        channels=56,
+        pyramid_channels=8,
+        num_stages=2,
+        time_kernel=3,
+        freq_kernel=3,
+        pyramid_time_kernel=3,
+        pyramid_freq_kernel=3,
+        pyramid_conv_blocks=(1, 1, 1),
+        pyramid_strides=(2, 2, 4),
+        use_attn=True,
+        attn_window=16,
+        num_heads=4,
+        head_dim=8,
+        pooled_mixer_hidden=18432,
+        masking=masking,
+    )
+
+
 _PRESETS = {
     "edge_small": edge_small,
     "rt192k": rt192k,
+    "rt192k_param2m": rt192k_param2m,
+    "rt192k_param6m": rt192k_param6m,
     "rt192k_plus": rt192k_plus,
 }
 

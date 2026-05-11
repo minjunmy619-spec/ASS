@@ -443,7 +443,7 @@ Measure a named non-SFC preset:
 ./.venv/bin/python tools/online/measure_npu_model_stats.py --target tf-mlpnet
 ./.venv/bin/python tools/online/measure_npu_model_stats.py \
   --target band-scnet-npu \
-  --band-scnet-npu-preset rt192k \
+  --band-scnet-npu-preset rt192k_param6m \
   --freqs 2049 \
   --n-chan 1
 ```
@@ -460,6 +460,13 @@ and `sample_rate=44100`:
 | `edge_small`  | 10,411 | 108.75 KiB | 0.2055 | 460        | 2,798    | safest memory bring-up preset |
 | `rt192k`      | 62,115 | 190.88 KiB | 1.2588 | 716        | 3,798    | state-only fits, full I/O budget needs confirmation |
 | `rt192k_plus` | 72,915 | 178.00 KiB | 1.6178 | 588        | 3,257    | better state headroom than `rt192k`, still full I/O budget risk |
+| `rt192k_param2m` | 2,311,059 | 190.88 KiB | 1.4493 | 806 | skipped | first trainable capacity preset; state shape matches `rt192k` |
+| `rt192k_param6m` | 6,340,019 | 178.00 KiB | 2.1513 | 648 | 3,595 | near-rule15 quality preset; state shape matches `rt192k_plus` |
+
+The matching DnR training recipes are:
+
+- `recipes/dnr/models/band-scnet-npu.rt192k-param2m/config.yaml`
+- `recipes/dnr/models/band-scnet-npu.rt192k-param6m/config.yaml`
 
 For BandSCNetNPU, do not treat `state_fp16_kib` as the whole hardware memory
 answer. At `n_freq=2049`, the single-frame packed input is 8,196 bytes and the
@@ -505,7 +512,7 @@ Other built-in exporters:
 ./.venv/bin/python tools/online/export_verify_mlir.py --target tf-mlpnet
 ./.venv/bin/python tools/online/export_verify_mlir.py \
   --target band-scnet-npu \
-  --band-scnet-npu-preset rt192k_plus \
+  --band-scnet-npu-preset rt192k_param6m \
   --freqs 2049 \
   --n-chan 1 \
   --allow-op PRelu \

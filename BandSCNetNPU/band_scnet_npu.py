@@ -22,7 +22,7 @@ from spectral_feature_compression.core.model.online_sfc_2d import (
     _runtime_assert,
 )
 
-from .blocks import CrossBandBlock, NarrowBandBlock
+from .blocks import CrossBandBlock, NarrowBandBlock, PooledChannelMixer
 from .sparse_io import (
     SparseDownsampleEncoder,
     SparseUpsampleDecoder,
@@ -44,6 +44,7 @@ class _SeparationStage(nn.Module):
         attn_window: int,
         num_heads: int,
         head_dim: int,
+        pooled_mixer_hidden: int = 0,
     ):
         super().__init__()
         self.cross = CrossBandBlock(channels, freq_kernel=freq_kernel)
@@ -55,10 +56,16 @@ class _SeparationStage(nn.Module):
             num_heads=num_heads,
             head_dim=head_dim,
         )
+        self.pooled_mixer = (
+            PooledChannelMixer(channels, pooled_mixer_hidden)
+            if pooled_mixer_hidden > 0
+            else nn.Identity()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.cross(x)
         x = self.narrow(x)
+        x = self.pooled_mixer(x)
         return x
 
     def init_stream_state(
@@ -78,6 +85,7 @@ class _SeparationStage(nn.Module):
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         x = self.cross(x)
         x, new_state = self.narrow.forward_stream(x, state)
+        x = self.pooled_mixer(x)
         return x, new_state
 
 
@@ -172,6 +180,7 @@ class BandSCNetNPU(nn.Module):
         attn_window: int = 16,
         num_heads: int = 4,
         head_dim: int = 8,
+        pooled_mixer_hidden: int = 0,
         ratios: tuple[float, float, float] = (0.175, 0.392, 0.433),
         pyramid_conv_blocks: tuple[int, int, int] = (3, 2, 1),
         pyramid_strides: tuple[int, int, int] = (0, 2, 4),
@@ -213,6 +222,7 @@ class BandSCNetNPU(nn.Module):
         self.attn_window = attn_window
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.pooled_mixer_hidden = pooled_mixer_hidden
         self.ratios = ratios
         self.masking = masking
 
@@ -253,6 +263,7 @@ class BandSCNetNPU(nn.Module):
                 attn_window=attn_window,
                 num_heads=num_heads,
                 head_dim=head_dim,
+                pooled_mixer_hidden=pooled_mixer_hidden,
             )
             for _ in range(num_stages)
         )
