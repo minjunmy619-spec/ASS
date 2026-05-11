@@ -1,15 +1,16 @@
 """Temporal M2D + PretrainedSED fusion source classifier.
 
 This module complements ``m2d_sc.M2DPretrainedSEDFusionClassifier`` with a
-frame-aware variant.  The clip-level classifier keeps the existing ArcFace /
+frame-aware variant. The clip-level classifier keeps the existing ArcFace /
 plain-logit contract used by ``m2d_sc_arcface`` while additionally exposing
-``activity_logits`` and ``frame_logits`` for temporal supervision and debugging.
+``activity_logits`` and ``frame_logits`` for temporal supervision and inference.
 """
 
 from collections import OrderedDict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .portable_m2d import PortableM2D
 from .m2d_sc import (
@@ -29,10 +30,8 @@ class _TemporalConvRefiner(nn.Module):
         super().__init__()
         if kernel_size < 1 or kernel_size % 2 == 0:
             raise ValueError("temporal_kernel_size must be a positive odd integer")
-
-        layers = []
-        for _ in range(int(num_layers)):
-            layers.append(
+        self.layers = nn.ModuleList(
+            [
                 nn.ModuleDict(
                     {
                         "norm": nn.LayerNorm(dim),
@@ -47,8 +46,9 @@ class _TemporalConvRefiner(nn.Module):
                         "dropout": nn.Dropout(dropout),
                     }
                 )
-            )
-        self.layers = nn.ModuleList(layers)
+                for _ in range(int(num_layers))
+            ]
+        )
 
     def forward(self, x):
         # x: [B, T, D]
@@ -56,7 +56,7 @@ class _TemporalConvRefiner(nn.Module):
             residual = x
             y = layer["norm"](x)
             y = layer["dwconv"](y.transpose(1, 2)).transpose(1, 2)
-            y = torch.nn.functional.gelu(y)
+            y = F.gelu(y)
             y = layer["pwconv"](y)
             y = layer["dropout"](y)
             x = residual + y
@@ -66,16 +66,10 @@ class _TemporalConvRefiner(nn.Module):
 class M2DTemporalPretrainedSEDFusionClassifier(PortableM2D):
     """Frame-aware source classifier with optional BEATs/ATST-F/fPaSST fusion.
 
-    Expected input is either a waveform tensor or a dict containing:
-    ``waveform``: ``[B, T]`` or ``[B, C, T]`` audio at ``input_sample_rate``;
-    ``class_index``: optional labels used by the ArcFace head.
-
-    Returns the same clip-level keys as the existing SC models:
-    ``logits``, ``plain_logits``, ``energy``, ``embedding``.
-    It additionally returns:
-    ``activity_logits``: ``[B, T_frame]`` binary source-activity logits;
-    ``frame_logits``: ``[B, T_frame, num_classes]`` per-frame class logits;
-    ``timestamps_sec`` and ``duration_sec`` for temporal target alignment.
+    Training forward input can be either a waveform tensor or a dict containing
+    ``waveform`` and optional ``class_index``. The output keeps the current SC
+    loss contract: ``logits``, ``plain_logits``, ``energy``, and ``embedding``.
+    It additionally returns frame-level ``activity_logits`` and ``frame_logits``.
     """
 
     def __init__(
@@ -336,7 +330,6 @@ class M2DTemporalPretrainedSEDFusionClassifier(PortableM2D):
             float(mono_waveform.shape[-1]) / float(self.input_sample_rate),
         )
 
-        # M2D temporal features: [B, T_frame, cfg.feature_d].
         m2d_frames = self.encode(mono_waveform)
         m2d_frames = self.m2d_frame_projection(m2d_frames)
         m2d_clip = m2d_frames.mean(dim=1)
@@ -357,7 +350,7 @@ class M2DTemporalPretrainedSEDFusionClassifier(PortableM2D):
         frame_embedding = self.temporal_refiner(frame_embedding)
         pooled = self._pool_frames(frame_embedding)
         clip_embedding = self.clip_projection(pooled) + clip_seed
-        clip_embedding = torch.nn.functional.layer_norm(clip_embedding, (clip_embedding.shape[-1],))
+        clip_embedding = F.layer_norm(clip_embedding, (clip_embedding.shape[-1],))
 
         if labels is not None:
             labels = labels.to(device=clip_embedding.device, dtype=torch.long).clamp(0, self.num_classes - 1)
@@ -388,6 +381,51 @@ class M2DTemporalPretrainedSEDFusionClassifier(PortableM2D):
             "aux_branch_weights": aux_branch_weights,
         }
 
+    def predict(self, inputs):
+        """Inference contract used by temporal S5 wrappers.
 
-# Alias with the wording used by the non-temporal fusion classifier name.
+        Returns one-hot ``label_vector`` from clip-level logits plus
+        ``activity_probabilities`` from the temporal activity head. Thresholds
+        are optional and read from ``energy_thresholds`` for compatibility:
+        ``min_probability``/``probability`` gates labels by softmax confidence,
+        ``min_energy`` gates by logsumexp energy, and ``min_activity`` gates by
+        max temporal activity probability.
+        """
+        out = self.forward(inputs)
+        plain_logits = out["plain_logits"].float()
+        class_probs = torch.softmax(plain_logits, dim=-1)
+        probabilities, class_index = class_probs.max(dim=-1)
+        raw_label_vector = F.one_hot(class_index, num_classes=self.num_classes).to(dtype=plain_logits.dtype)
+
+        min_probability = float(
+            self.energy_thresholds.get(
+                "min_probability",
+                self.energy_thresholds.get("probability", 0.0),
+            )
+        )
+        keep = probabilities >= min_probability
+
+        min_energy = self.energy_thresholds.get("min_energy", None)
+        if min_energy is not None:
+            keep = keep & (out["energy"].float() >= float(min_energy))
+
+        activity_probabilities = torch.sigmoid(out["activity_logits"].float())
+        min_activity = self.energy_thresholds.get("min_activity", None)
+        if min_activity is not None:
+            keep = keep & (activity_probabilities.amax(dim=-1) >= float(min_activity))
+
+        label_vector = raw_label_vector * keep.to(dtype=raw_label_vector.dtype).unsqueeze(-1)
+        out.update(
+            {
+                "class_probabilities": class_probs,
+                "probabilities": probabilities,
+                "class_index": class_index,
+                "raw_label_vector": raw_label_vector,
+                "label_vector": label_vector,
+                "activity_probabilities": activity_probabilities,
+            }
+        )
+        return out
+
+
 M2DPretrainedSEDTemporalFusionClassifier = M2DTemporalPretrainedSEDFusionClassifier
