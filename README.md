@@ -160,6 +160,8 @@ One can change these configurations by giving them as the second and third argum
 This repo also includes an **online/realtime, 2D-only** refactor intended for **edge NPU** deployment (ONNX export with `batch_size=1`, tensors \(\le\) 4D, `Conv2d` / `torch.bmm` plus basic tensor ops).
 
 See `docs/ONLINE_SFC_NPU.md`.
+TIGER-specific DnR training recipes are listed in
+`docs/TIGER_TRAINING_RECIPES.md`.
 
 All current online kernels are kept within the deploy-time NPU convolution span
 constraint:
@@ -191,6 +193,7 @@ Quick family view:
 | `hierarchical-soft-band` | front-end SFC compression followed by multi-scale interleaved temporal modeling | per-stage compressor cache + temporal block caches | medium | multi-scale frequency/time candidate |
 | `hierarchical-soft-band-ffi` | hierarchical soft-band backbone with explicit frequency-path -> frame-path interleaving | per-stage compressor cache + per-block time caches | medium | TIGER-inspired online variant |
 | `hierarchical-soft-band-parallel-ffi` | hierarchical soft-band backbone with explicit frequency-path plus parallel multi-receptive-field time branches | per-stage compressor cache + per-branch time caches | medium | multi-branch temporal candidate under cache limits |
+| `tiger-npu-edge-v2` | direct online TIGER edge variant with fused NPU-friendly subband encoder/decoder | KV cache + time context | medium | direct TIGER NPU training/export target |
 | `soft-band-dilated` | dilated causal conv separator with explicit band-mix conv | per-layer cache scaled by dilation | medium | larger-context conv candidate |
 | `soft-band-gru` | custom ConvGRU-style recurrent separator | per-layer recurrent hidden state | medium | recurrent long-context candidate |
 

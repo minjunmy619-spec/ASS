@@ -139,6 +139,12 @@ def main() -> int:
         print(f"[onnx] ReduceMean: {op_counts.get('ReduceMean', 0)} (V1 was 342)")
         print(f"[onnx] Tile: {op_counts.get('Tile', 0)} (V1 was 32)")
 
+        forbidden_ops = {"Tile", "Expand", "ConstantOfShape"}
+        found_forbidden = sorted(op for op in forbidden_ops if op_counts.get(op, 0))
+        if found_forbidden:
+            details = ", ".join(f"{op}={op_counts[op]}" for op in found_forbidden)
+            raise AssertionError(f"Forbidden ONNX ops remain: {details}")
+
         # Fail if graph is still too big
         if total_nodes > 1000:
             raise AssertionError(f"ONNX graph too large: {total_nodes} nodes")

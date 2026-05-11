@@ -241,7 +241,7 @@ def parse_args() -> Any:
     parser = ArgumentParser(description="Export ONNX and verify onnx-mlir conversion for NPU deployment bring-up.")
     parser.add_argument(
         "--target",
-        choices=["online", "dolphin", "tiger-edge", "tf-mlpnet", "band-scnet-npu"],
+        choices=["online", "dolphin", "tiger-edge", "tiger-edge-v2", "tf-mlpnet", "band-scnet-npu"],
         default="online",
         help="Model exporter to use. Ignored when --onnx-in is passed.",
     )

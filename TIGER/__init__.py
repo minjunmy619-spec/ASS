@@ -14,6 +14,7 @@ from .tiger_online import (
 )
 from .tiger_npu_edge import NPUEdgeCtxExportWrapper, TIGERNPUEdgeV1, export_tiger_npu_edge_onnx
 from .tiger_npu_edge_v2 import TIGERNPUEdgeV2, NPUEdgeV2ExportWrapper, export_tiger_npu_edge_v2_onnx
+from .training_wrapper import TIGERWaveformSeparator, build_tiger_core, build_tiger_system
 
 __all__ = [
     "OfflineTIGER",
@@ -35,4 +36,7 @@ __all__ = [
     "TIGERNPUEdgeV2",
     "NPUEdgeV2ExportWrapper",
     "export_tiger_npu_edge_v2_onnx",
+    "TIGERWaveformSeparator",
+    "build_tiger_core",
+    "build_tiger_system",
 ]

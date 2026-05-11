@@ -38,6 +38,10 @@ READY_SUITE = [
         "label": "TIGERNPUEdgeV1",
     },
     {
+        "target": "tiger-edge-v2",
+        "label": "TIGERNPUEdgeV2",
+    },
+    {
         "target": "dolphin",
         "label": "DolphinSFCNPU edge_small",
         "dolphin_preset": "edge_small",
@@ -428,6 +432,35 @@ def build_tiger_edge_export(args: Any, spec: dict[str, Any], out_dir: Path) -> E
     )
 
 
+def build_tiger_edge_v2_export(args: Any, spec: dict[str, Any], out_dir: Path) -> ExportedModel:
+    from TIGER.tiger_npu_edge_v2 import NPUEdgeV2ExportWrapper, TIGERNPUEdgeV2
+
+    label = spec.get("label") or args.label or "TIGERNPUEdgeV2"
+    model = quiet_call(TIGERNPUEdgeV2).to(args.device).eval()
+    state = model.init_streaming_state(batch_size=1, device=args.device, dtype=torch.float32)
+    dummy = torch.zeros(1, 1, model.enc_dim * 2, 1, device=args.device, dtype=torch.float32)
+    wrapper = NPUEdgeV2ExportWrapper(model).to(args.device).eval()
+    inputs = (dummy, *state)
+    return ExportedModel(
+        label=label,
+        target="tiger-edge-v2",
+        source="TIGER.tiger_npu_edge_v2.TIGERNPUEdgeV2",
+        module=model,
+        export_module=wrapper,
+        export_inputs=inputs,
+        onnx_path=out_dir / f"{sanitize_filename(label)}.onnx",
+        input_names=["subband_spec_RIs", "past_kvs", "past_valid_mask", "time_ctx"],
+        output_names=["band_masked_output", "new_kv", "new_valid_mask", "new_time_ctx"],
+        frames_per_call=1,
+        state_fp16_bytes=tensor_tree_bytes(state, torch.float16),
+        state_fp32_bytes=tensor_tree_bytes(state, torch.float32),
+        param_count=parameter_count(model),
+        param_fp16_bytes=parameter_bytes(model, torch.float16),
+        param_fp32_bytes=parameter_bytes(model, torch.float32),
+        opset=args.tiger_opset,
+    )
+
+
 def build_tf_mlpnet_export(args: Any, spec: dict[str, Any], out_dir: Path) -> ExportedModel:
     tf_root = REPO_ROOT / "TF-MLPNet"
     if str(tf_root) not in sys.path:
@@ -529,6 +562,7 @@ BUILDERS = {
     "online": build_online_export,
     "dolphin": build_dolphin_export,
     "tiger-edge": build_tiger_edge_export,
+    "tiger-edge-v2": build_tiger_edge_v2_export,
     "tf-mlpnet": build_tf_mlpnet_export,
     "band-scnet-npu": build_band_scnet_npu_export,
 }
@@ -681,7 +715,7 @@ def parse_args() -> Any:
     )
     parser.add_argument(
         "--target",
-        choices=["ready-suite", "online", "dolphin", "tiger-edge", "tf-mlpnet", "band-scnet-npu"],
+        choices=["ready-suite", "online", "dolphin", "tiger-edge", "tiger-edge-v2", "tf-mlpnet", "band-scnet-npu"],
         default="ready-suite",
         help="Model family to measure. Use ready-suite for the current NPU candidate set.",
     )

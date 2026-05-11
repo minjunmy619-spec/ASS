@@ -438,6 +438,7 @@ Measure a named non-SFC preset:
 
 ```bash
 ./.venv/bin/python tools/online/measure_npu_model_stats.py --target tiger-edge
+./.venv/bin/python tools/online/measure_npu_model_stats.py --target tiger-edge-v2
 ./.venv/bin/python tools/online/measure_npu_model_stats.py --target dolphin --dolphin-preset edge_small --n-chan 1
 ./.venv/bin/python tools/online/measure_npu_model_stats.py --target tf-mlpnet
 ./.venv/bin/python tools/online/measure_npu_model_stats.py \
@@ -536,6 +537,7 @@ state mechanism:
 | `hierarchical-soft-band` | front-end SFC compression followed by multi-scale interleaved temporal modeling | per-stage compressor cache + temporal block caches | yes | medium | multi-scale frequency/time candidate |
 | `hierarchical-soft-band-ffi` | hierarchical soft-band backbone with explicit frequency-path -> frame-path interleaving | per-stage compressor cache + per-block time caches | yes | medium | TIGER-inspired online variant |
 | `hierarchical-soft-band-parallel-ffi` | hierarchical soft-band backbone with parallel multi-receptive-field time branches | per-stage compressor cache + nested per-branch time caches | yes | medium | multi-branch temporal candidate under cache limits |
+| `tiger-npu-edge-v2` | TIGER subband encoder/decoder with fused NPU-friendly frame/frequency separator | KV cache + time context | yes | medium | direct TIGER NPU target; train with `docs/TIGER_TRAINING_RECIPES.md` |
 | `soft-band-dilated` | causal dilated time-mixing conv + explicit band-mix conv | per-layer cache sized by each layer's dilation | yes | medium | higher-context conv candidate |
 | `soft-band-gru` | custom ConvGRU-style recurrent stack built from `Conv2d`, `sigmoid`, `tanh`, and elementwise ops | per-layer recurrent hidden state | yes | medium | recurrent long-context candidate |
 

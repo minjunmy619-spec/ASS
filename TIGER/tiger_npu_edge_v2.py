@@ -311,10 +311,11 @@ class NPUVectorizedFrameAttention(nn.Module):
         prev_k = past_kv[:, :, :, :self.head_dim]  # [B, H, W, D]
         prev_v = past_kv[:, :, :, self.head_dim:]  # [B, H, W, Dv]
 
-        # Shift: drop oldest, append new
+        # Shift: drop oldest, append new. Build the valid marker from the
+        # existing mask tensor so ONNX export does not need ConstantOfShape.
         new_k = torch.cat([prev_k[:, :, 1:, :], k_flat.unsqueeze(2)], dim=2)
         new_v = torch.cat([prev_v[:, :, 1:, :], v_flat.unsqueeze(2)], dim=2)
-        current_valid = past_kv.new_ones(B, 1, 1, 1)
+        current_valid = past_valid_mask[:, :, -1:, :] * 0.0 + 1.0
         next_valid_mask = torch.cat([past_valid_mask[:, :, 1:, :], current_valid], dim=2)
 
         # Attention: q [B*H, 1, D] @ k^T [B*H, D, W] -> [B*H, 1, W]
@@ -322,10 +323,11 @@ class NPUVectorizedFrameAttention(nn.Module):
         k_mat = new_k.reshape(B * self.n_heads, self.window_size, self.head_dim).transpose(1, 2)
         attn = torch.bmm(q_vec, k_mat) * self.attn_scale  # [B*H, 1, W]
 
-        # Mask invalid positions
-        invalid = (1.0 - next_valid_mask.squeeze(-1)) * (-1e4)  # [B, 1, W]
-        invalid = invalid.repeat(1, self.n_heads, 1).reshape(B * self.n_heads, 1, self.window_size)
-        attn = attn + invalid
+        # Mask invalid positions with broadcast Add. Avoid repeat(), which
+        # exports as Tile/Expand on this graph.
+        invalid = (1.0 - next_valid_mask.reshape(B, 1, 1, self.window_size)) * (-1e4)
+        attn = attn.reshape(B, self.n_heads, 1, self.window_size) + invalid
+        attn = attn.reshape(B * self.n_heads, 1, self.window_size)
         attn = F.softmax(attn, dim=-1)  # [B*H, 1, W]
 
         # Context: [B*H, 1, W] @ [B*H, W, Dv] -> [B*H, 1, Dv]

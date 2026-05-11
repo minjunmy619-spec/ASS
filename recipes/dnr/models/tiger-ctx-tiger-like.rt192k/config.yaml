@@ -1,0 +1,3 @@
+_base_: ../tiger-npu-edge-v2.rt192k/config.yaml
+
+tiger_variant: ctx-tiger-like
