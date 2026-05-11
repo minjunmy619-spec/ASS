@@ -1,0 +1,171 @@
+task_name: m2d_sc_stage1_pretrainedsed_temporal_fusion
+description: Temporal M2D source classifier fused with frozen PretrainedSED BEATs, ATST-F, and fPaSST branches.
+
+deterministic: true
+manual_seed: 0
+
+datamodule:
+  module: src.datamodules.datamodule
+  main: DataModule
+  args:
+    train_dataloader:
+      batch_size: 24
+      num_workers: 8
+      persistent_workers: false
+      dataset:
+        module: src.datamodules.source_classifier_dataset
+        main: SourceClassifierDataset
+        args:
+          base_dataset:
+            args:
+              config:
+                mode: generate
+                spatial_sound_scene:
+                  duration: 10.0
+                  sr: 32000
+                  max_event_overlap: 3
+                  max_event_dur: 10.0
+                  ref_db: -55
+                  foreground_dir: data/dev_set/sound_event/train
+                  background_dir: data/dev_set/noise/train
+                  interference_dir: data/dev_set/interference/train
+                  room_config:
+                    module: src.modules.spatial_audio_synthesizer.room
+                    main: SofaRoom
+                    args:
+                      path: data/dev_set/room_ir/train
+                      direct_range_ms: [6, 50]
+                dupse_rate: 0.5
+                dupse_min_angle: 60.0
+                max_n_dupse: 2
+                dupse_exclusion_folder_depth: 1
+                snr_range: [5, 20]
+                nevent_range: [0, 3]
+                ninterference_range: [0, 2]
+                inteference_snr_range: [0, 15]
+                dataset_length: 25088
+                shuffle_label: true
+                fg_return: {dry: true, dry_channel: 0, metadata: true}
+              n_sources: 3
+              label_set: dcase2026t4
+              return_source: true
+              label_vector_mode: stack
+              silence_label_mode: zeros
+              return_meta: false
+    val_dataloader:
+      batch_size: 24
+      num_workers: 8
+      persistent_workers: false
+      dataset:
+        module: src.datamodules.source_classifier_dataset
+        main: SourceClassifierDataset
+        args:
+          base_dataset:
+            args:
+              config:
+                mode: metadata
+                metadata_list: data/dev_set/metadata/valid.json
+                fg_return:
+                  dry: true
+                  dry_channel: 0
+                  metadata: true
+                sr: 32000
+              n_sources: 3
+              label_set: dcase2026t4
+              return_source: true
+              label_vector_mode: stack
+              silence_label_mode: zeros
+              return_meta: false
+lightning_module:
+  module: src.training.lightningmodule.single_label_classification
+  main: SingleLabelClassificationLightning
+  args:
+    model:
+      module: src.models.m2dat.m2d_sc_temporal
+      main: M2DPretrainedSEDTemporalFusionClassifier
+      args:
+        weight_file:
+          checkpoint/m2d_as_vit_base-80x1001p16x16p32k-240413_AS-FT_enconly/weights_ep69it3124-0.47998.pth
+        num_classes: 18
+        embedding_dim: 512
+        m2d_embedding_dim: 512
+        pooling_hidden_dim: 512
+        projection_hidden_dim: 1024
+        dropout: 0.2
+        finetuning_layers: 2_blocks
+        pretrainedsed_repo_root: external/PretrainedSED
+        pretrainedsed_checkpoint_dir: checkpoint/pretrainedsed
+        pretrainedsed_models: [BEATs, ATST-F, fpasst]
+        pretrainedsed_checkpoint_variant: strong_1
+        pretrainedsed_pooling: mean
+        pretrainedsed_seq_len: 250
+        pretrainedsed_embed_dim: 768
+        pretrainedsed_download_if_missing: true
+        pretrainedsed_sample_rate: 16000
+        freeze_pretrainedsed: true
+        fusion_strategy: weighted_avg
+        fusion_hidden_dim: 1024
+        pretrained_fusion_mode: concat_mlp
+        input_sample_rate: 32000
+        temporal_layers: 2
+        temporal_kernel_size: 5
+        temporal_pooling: attentive_stats
+        activity_hidden_dim: 256
+    loss:
+      module: src.training.loss.m2d_sc_arcface
+      main: get_loss_func
+      args:
+        lambda_energy: 0.0
+        lambda_activity: 0.2
+        activity_pos_weight: 2.0
+    optimizer:
+      module: torch.optim
+      main: AdamW
+      args:
+        params:
+        lr: 0.0003
+        betas: [0.9, 0.999]
+        eps: 0.00000001
+        weight_decay: 0.01
+        amsgrad: true
+    is_validation: true
+train:
+  callbacks:
+  - name: checkpoint
+    module: lightning.pytorch.callbacks
+    main: ModelCheckpoint
+    args:
+      every_n_epochs: 1
+      filename: '{epoch}'
+      save_top_k: 1
+      save_last: true
+      monitor: epoch_val/loss
+      mode: min
+      verbose: false
+      dirpath:
+  - name: tqdm
+    module: lightning.pytorch.callbacks
+    main: TQDMProgressBar
+    args:
+      refresh_rate: 60
+      process_position: 0
+  trainer:
+    module: lightning.pytorch
+    main: Trainer
+    args:
+      accelerator: auto
+      devices: auto
+      strategy: ddp_find_unused_parameters_true
+      num_nodes: 1
+      precision: bf16-mixed
+      logger:
+      fast_dev_run: false
+      max_epochs: 100
+      log_every_n_steps: 100
+      use_distributed_sampler: true
+      sync_batchnorm: true
+      num_sanity_val_steps: 0
+      enable_checkpointing: true
+      enable_progress_bar: true
+      enable_model_summary: true
+      gradient_clip_val: 0.5
