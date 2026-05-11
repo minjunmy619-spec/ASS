@@ -7,6 +7,7 @@ plain-logit contract used by ``m2d_sc_arcface`` while additionally exposing
 """
 
 from collections import OrderedDict
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,20 @@ from .m2d_sc import (
     _PretrainedSEDFeatureBranch,
     _resample_waveform,
 )
+
+
+def _disabled_autocast_context(tensor):
+    """Disable autocast for fp32-only external frontend ops.
+
+    PretrainedSED BEATs/ATST-F/fPaSST frontends can call STFT/FFT code.
+    Under Lightning ``bf16-mixed`` autocast, those frontends may receive bf16
+    tensors, and ``torch.fft.rfft`` does not support bf16. Keep the frozen
+    external branches in fp32 while allowing the trainable fusion layers to run
+    under the outer AMP context.
+    """
+    if hasattr(torch, "autocast") and tensor.device.type in {"cuda", "cpu"}:
+        return torch.autocast(device_type=tensor.device.type, enabled=False)
+    return nullcontext()
 
 
 class _TemporalConvRefiner(nn.Module):
@@ -299,11 +314,12 @@ class M2DTemporalPretrainedSEDFusionClassifier(PortableM2D):
         if not self.pretrainedsed_branches:
             return None, OrderedDict(), None
 
-        aux_waveform = self._aux_waveform(mono_waveform)
-        branch_embeddings = OrderedDict(
-            (name, branch(aux_waveform))
-            for name, branch in self.pretrainedsed_branches.items()
-        )
+        aux_waveform = self._aux_waveform(mono_waveform).float()
+        branch_embeddings = OrderedDict()
+        with _disabled_autocast_context(aux_waveform):
+            aux_waveform_fp32 = aux_waveform.float()
+            for name, branch in self.pretrainedsed_branches.items():
+                branch_embeddings[name] = branch(aux_waveform_fp32).float()
         projected = self.pretrainedsed_fusion.project(branch_embeddings)
         fused, branch_weights = self.pretrainedsed_fusion.fuse(projected)
         return fused, branch_embeddings, branch_weights
