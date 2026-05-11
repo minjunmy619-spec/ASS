@@ -21,7 +21,7 @@ def _strip_lightning_prefix(state_dict):
     out = {}
     for key, value in state_dict.items():
         if isinstance(key, str) and key.startswith("model."):
-            key = key[len("model.") :]
+            key = key[len("model."):]
         out[key] = value
     return out
 
@@ -60,12 +60,17 @@ def _best_assignment(scores, active_refs, n_est):
 
 
 class USSCSJointModelParallelLightning(pl.LightningModule):
-    """Opt-in model-parallel joint fine-tuning for USS + SC.
+    """Model-parallel joint fine-tuning for USS + SC.
 
     USS is placed on ``uss_device`` and SC is placed on ``sc_device``. The SC
-    loss is computed on USS separated foreground waveforms. If SC is frozen,
-    gradients still flow through the SC network input back to USS; only SC
-    parameters are not updated.
+    loss is computed on USS separated foreground waveforms.
+
+    Supports two primary training modes:
+      1. **Train USS primarily** (original behaviour): ``freeze_uss=False``,
+         ``freeze_sc=True``. Gradients from SC loss flow back through USS.
+      2. **Train SC primarily** (new): ``freeze_uss=True``, ``freeze_sc=False``.
+         USS runs in inference mode (eval, no_grad). Only SC parameters are
+         updated.
 
     This is model parallelism, not DDP. Use a single Lightning process and set
     trainer ``devices: 1`` / ``strategy: auto`` in the config.
@@ -77,7 +82,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         sc_model: Dict,
         uss_loss: Dict,
         sc_loss: Dict,
-        optimizer_uss: Dict,
+        optimizer_uss: Optional[Dict] = None,
         optimizer_sc: Optional[Dict] = None,
         uss_lr_scheduler: Optional[Dict] = None,
         sc_lr_scheduler: Optional[Dict] = None,
@@ -87,8 +92,11 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         sc_pretrained_strict: bool = True,
         uss_device: str = "cuda:0",
         sc_device: str = "cuda:1",
+        freeze_uss: bool = False,
+        uss_eval_mode_when_frozen: bool = True,
         freeze_sc: bool = True,
         sc_eval_mode_when_frozen: bool = True,
+        lambda_uss: float = 1.0,
         lambda_sc: float = 0.05,
         lambda_consistency: float = 0.0,
         consistency_temperature: float = 1.0,
@@ -120,8 +128,11 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
 
         self.uss_device_name = uss_device
         self.sc_device_name = sc_device
+        self.freeze_uss = bool(freeze_uss)
+        self.uss_eval_mode_when_frozen = bool(uss_eval_mode_when_frozen)
         self.freeze_sc = bool(freeze_sc)
         self.sc_eval_mode_when_frozen = bool(sc_eval_mode_when_frozen)
+        self.lambda_uss = float(lambda_uss)
         self.lambda_sc = float(lambda_sc)
         self.lambda_consistency = float(lambda_consistency)
         self.consistency_temperature = float(consistency_temperature)
@@ -137,6 +148,13 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         self.detach_waveform_for_sc = bool(detach_waveform_for_sc)
         self.is_validation = bool(is_validation)
 
+        # Sanity check: cannot freeze both models
+        if self.freeze_uss and self.freeze_sc:
+            raise ValueError(
+                "Both freeze_uss and freeze_sc are True. At least one model "
+                "must be trainable."
+            )
+
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
         # Device placement is manual because USS and SC live on different GPUs.
         return batch
@@ -147,17 +165,28 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         if self.uss_device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for uss_device")
         if self.sc_device.type == "cuda" and torch.cuda.device_count() <= self.sc_device.index:
-            raise RuntimeError(f"Requested sc_device={self.sc_device}, but only {torch.cuda.device_count()} CUDA devices are visible")
+            raise RuntimeError(
+                f"Requested sc_device={self.sc_device}, but only "
+                f"{torch.cuda.device_count()} CUDA devices are visible"
+            )
         self.uss_model.to(self.uss_device)
         self.sc_model.to(self.sc_device)
+        if self.freeze_uss:
+            for param in self.uss_model.parameters():
+                param.requires_grad = False
+            print("[USS-SC joint] USS model is FROZEN (no gradient updates).")
         if self.freeze_sc:
             for param in self.sc_model.parameters():
                 param.requires_grad = False
+            print("[USS-SC joint] SC model is FROZEN (no gradient updates).")
 
     def train(self, mode: bool = True):
         super().train(mode)
         if hasattr(self, "uss_model"):
-            self.uss_model.train(mode)
+            if self.freeze_uss and self.uss_eval_mode_when_frozen:
+                self.uss_model.eval()
+            else:
+                self.uss_model.train(mode)
         if hasattr(self, "sc_model"):
             if self.freeze_sc and self.sc_eval_mode_when_frozen:
                 self.sc_model.eval()
@@ -256,6 +285,9 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
 
     def _sc_forward_and_loss(self, uss_out, batch, is_training: bool):
         sep = uss_out["foreground_waveform"]
+        # When USS is frozen, waveforms are already detached (produced under
+        # no_grad). When USS is trainable but we don't want SC gradients to
+        # flow back into USS, detach explicitly.
         if self.detach_waveform_for_sc:
             sep = sep.detach()
         class_idx, is_silence, sample_weight, span_sec, quality_code = self._build_slot_targets(sep, batch)
@@ -280,9 +312,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         sc_out = self.sc_model(sc_input)
         sc_loss_dict = self.sc_loss_func(sc_out, sc_target)
 
-        # The configured SC loss is still computed for diagnostics. For the joint
-        # USS gradient, use an explicit weighted CE on active matched slots so
-        # low-quality/unmatched estimates do not dominate.
+        # Weighted CE on active matched slots.
         logits = sc_out.get("plain_logits", sc_out.get("logits"))
         ce_all = F.cross_entropy(logits.float(), class_flat, reduction="none")
         active_weight = (~silence_flat).to(dtype=ce_all.dtype) * weight_flat.to(dtype=ce_all.dtype)
@@ -318,45 +348,117 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         return out
 
     def training_step(self, batch, batch_idx):
-        self.uss_model.train()
+        # --- Set train/eval modes based on freeze flags ---
+        if self.freeze_uss and self.uss_eval_mode_when_frozen:
+            self.uss_model.eval()
+        else:
+            self.uss_model.train()
+
         if self.freeze_sc and self.sc_eval_mode_when_frozen:
             self.sc_model.eval()
         else:
             self.sc_model.train()
 
+        # --- Get optimizers ---
         opts = self.optimizers()
         if isinstance(opts, (list, tuple)):
-            opt_uss = opts[0]
-            opt_sc = opts[1] if len(opts) > 1 else None
+            opt_list = list(opts)
         else:
-            opt_uss = opts
-            opt_sc = None
+            opt_list = [opts] if opts is not None else []
 
-        opt_uss.zero_grad(set_to_none=True)
+        # Identify which optimizer is which based on freeze config.
+        # When USS is frozen: only SC optimizer exists (index 0).
+        # When SC is frozen: only USS optimizer exists (index 0).
+        # When neither frozen: USS is index 0, SC is index 1.
+        opt_uss = None
+        opt_sc = None
+        if self.freeze_uss:
+            # Only SC optimizer
+            opt_sc = opt_list[0] if opt_list else None
+        elif self.freeze_sc:
+            # Only USS optimizer
+            opt_uss = opt_list[0] if opt_list else None
+        else:
+            # Both optimizers
+            opt_uss = opt_list[0] if len(opt_list) > 0 else None
+            opt_sc = opt_list[1] if len(opt_list) > 1 else None
+
+        # Zero gradients
+        if opt_uss is not None:
+            opt_uss.zero_grad(set_to_none=True)
         if opt_sc is not None:
             opt_sc.zero_grad(set_to_none=True)
 
-        uss_out = self.uss_model(self._uss_input(batch))
-        uss_loss_dict = self.uss_loss_func(uss_out, self._uss_target(batch))
+        # --- USS forward ---
+        if self.freeze_uss:
+            # USS is frozen: run in no_grad for memory efficiency
+            with torch.no_grad():
+                uss_out = self.uss_model(self._uss_input(batch))
+            # Detach all tensor outputs so no graph is attached
+            uss_out = {
+                k: v.detach() if torch.is_tensor(v) else v
+                for k, v in uss_out.items()
+            }
+        else:
+            uss_out = self.uss_model(self._uss_input(batch))
+
+        # --- USS loss (for logging; only contributes to backward if USS trainable) ---
+        if self.freeze_uss:
+            with torch.no_grad():
+                uss_loss_dict = self.uss_loss_func(uss_out, self._uss_target(batch))
+        else:
+            uss_loss_dict = self.uss_loss_func(uss_out, self._uss_target(batch))
+
+        # --- SC forward + loss ---
         sc_loss_dict = self._sc_forward_and_loss(uss_out, batch, is_training=True)
 
-        loss = (
-            uss_loss_dict["loss"]
-            + self.lambda_sc * sc_loss_dict["loss_sc_weighted"].to(self.uss_device)
-            + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.uss_device)
-        )
+        # --- Compute total loss ---
+        # When USS is frozen, uss_loss has no grad — use lambda_uss=0 or just
+        # skip it. We still log it for monitoring.
+        if self.freeze_uss:
+            # SC loss is the primary training signal
+            loss = (
+                self.lambda_sc * sc_loss_dict["loss_sc_weighted"].to(self.sc_device)
+                + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.sc_device)
+            )
+            loss_for_log = loss.detach().to(self.uss_device)
+        else:
+            # Original: USS loss is primary, SC is auxiliary
+            loss = (
+                self.lambda_uss * uss_loss_dict["loss"]
+                + self.lambda_sc * sc_loss_dict["loss_sc_weighted"].to(self.uss_device)
+                + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.uss_device)
+            )
+            loss_for_log = loss.detach().to(self.uss_device)
+
+        # --- Backward + optimizer step ---
         self.manual_backward(loss)
-        opt_uss.step()
+
+        if opt_uss is not None:
+            opt_uss.step()
         if opt_sc is not None and (self.global_step % self.sc_update_every == 0):
             opt_sc.step()
 
+        # --- Logging ---
         batchsize = batch["mixture"].shape[0]
-        log_dict = {"step_train/loss": loss.detach().to(self.uss_device)}
-        log_dict.update({f"step_train/uss_{k}": v.detach().to(self.uss_device) for k, v in uss_loss_dict.items() if torch.is_tensor(v)})
-        log_dict.update({f"step_train/{k}": v.detach().to(self.uss_device) for k, v in sc_loss_dict.items() if torch.is_tensor(v)})
-        self.log_dict(log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False, batch_size=batchsize, sync_dist=False)
-        self.log("epoch_train/loss", loss.detach(), prog_bar=True, logger=True, on_step=False, on_epoch=True, batch_size=batchsize, sync_dist=False)
-        return loss.detach()
+        log_dict = {"step_train/loss": loss_for_log}
+        log_dict.update({
+            f"step_train/uss_{k}": v.detach().to(self.uss_device)
+            for k, v in uss_loss_dict.items() if torch.is_tensor(v)
+        })
+        log_dict.update({
+            f"step_train/{k}": v.detach().to(self.uss_device)
+            for k, v in sc_loss_dict.items() if torch.is_tensor(v)
+        })
+        self.log_dict(
+            log_dict, prog_bar=False, logger=True,
+            on_step=True, on_epoch=False, batch_size=batchsize, sync_dist=False,
+        )
+        self.log(
+            "epoch_train/loss", loss_for_log, prog_bar=True, logger=True,
+            on_step=False, on_epoch=True, batch_size=batchsize, sync_dist=False,
+        )
+        return loss_for_log
 
     def validation_step(self, batch, batch_idx):
         self.uss_model.eval()
@@ -364,34 +466,71 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         with torch.no_grad():
             uss_out = self.uss_model(self._uss_input(batch))
             uss_loss_dict = self.uss_loss_func(uss_out, self._uss_target(batch))
-        # Need gradients disabled for validation, but SC forward can still run normally.
         with torch.no_grad():
             sc_loss_dict = self._sc_forward_and_loss(uss_out, batch, is_training=False)
-            loss = (
-                uss_loss_dict["loss"]
-                + self.lambda_sc * sc_loss_dict["loss_sc_weighted"].to(self.uss_device)
-                + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.uss_device)
-            )
+            if self.freeze_uss:
+                loss = (
+                    self.lambda_sc * sc_loss_dict["loss_sc_weighted"].to(self.uss_device)
+                    + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.uss_device)
+                )
+            else:
+                loss = (
+                    self.lambda_uss * uss_loss_dict["loss"]
+                    + self.lambda_sc * sc_loss_dict["loss_sc_weighted"].to(self.uss_device)
+                    + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.uss_device)
+                )
         batchsize = batch["mixture"].shape[0]
         log_dict = {"step_val/loss": loss.detach().to(self.uss_device)}
-        log_dict.update({f"step_val/uss_{k}": v.detach().to(self.uss_device) for k, v in uss_loss_dict.items() if torch.is_tensor(v)})
-        log_dict.update({f"step_val/{k}": v.detach().to(self.uss_device) for k, v in sc_loss_dict.items() if torch.is_tensor(v)})
-        self.log_dict(log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False, batch_size=batchsize, sync_dist=False)
-        self.log("epoch_val/loss", loss.detach(), prog_bar=True, logger=True, on_step=False, on_epoch=True, batch_size=batchsize, sync_dist=False)
+        log_dict.update({
+            f"step_val/uss_{k}": v.detach().to(self.uss_device)
+            for k, v in uss_loss_dict.items() if torch.is_tensor(v)
+        })
+        log_dict.update({
+            f"step_val/{k}": v.detach().to(self.uss_device)
+            for k, v in sc_loss_dict.items() if torch.is_tensor(v)
+        })
+        self.log_dict(
+            log_dict, prog_bar=False, logger=True,
+            on_step=True, on_epoch=False, batch_size=batchsize, sync_dist=False,
+        )
+        self.log(
+            "epoch_val/loss", loss.detach(), prog_bar=True, logger=True,
+            on_step=False, on_epoch=True, batch_size=batchsize, sync_dist=False,
+        )
         return loss.detach()
 
     def configure_optimizers(self):
-        self.optimizer_uss_config["args"]["params"] = self.uss_model.parameters()
-        opt_uss = initialize_config(self.optimizer_uss_config)
-        optimizers = [opt_uss]
+        optimizers = []
         schedulers = []
+
+        # USS optimizer: only create if USS is trainable
+        if not self.freeze_uss and self.optimizer_uss_config is not None:
+            self.optimizer_uss_config["args"]["params"] = self.uss_model.parameters()
+            opt_uss = initialize_config(self.optimizer_uss_config)
+            optimizers.append(opt_uss)
+            if self.uss_lr_scheduler_config is not None:
+                self.uss_lr_scheduler_config["scheduler"]["args"]["optimizer"] = opt_uss
+                schedulers.append(initialize_config(self.uss_lr_scheduler_config["scheduler"]))
+
+        # SC optimizer: only create if SC is trainable
         if not self.freeze_sc and self.optimizer_sc_config is not None:
             self.optimizer_sc_config["args"]["params"] = self.sc_model.parameters()
             opt_sc = initialize_config(self.optimizer_sc_config)
             optimizers.append(opt_sc)
-        if self.uss_lr_scheduler_config is not None:
-            self.uss_lr_scheduler_config["scheduler"]["args"]["optimizer"] = opt_uss
-            schedulers.append(initialize_config(self.uss_lr_scheduler_config["scheduler"]))
+            if self.sc_lr_scheduler_config is not None:
+                self.sc_lr_scheduler_config["scheduler"]["args"]["optimizer"] = opt_sc
+                schedulers.append(initialize_config(self.sc_lr_scheduler_config["scheduler"]))
+
+        if not optimizers:
+            raise RuntimeError(
+                "No optimizer configured. At least one of optimizer_uss or "
+                "optimizer_sc must be provided for the trainable model."
+            )
+
         if len(optimizers) == 1:
+            if schedulers:
+                return optimizers, schedulers
             return optimizers[0]
+        if schedulers:
+            return optimizers, schedulers
         return optimizers
