@@ -10,6 +10,7 @@ from src.models.m2dat.m2d_sc_temporal import (
     M2DTemporalPretrainedSEDFusionClassifier,
     _TemporalConvRefiner,
 )
+from src.training.loss.temporal import temporal_activity_loss
 
 
 def test_temporal_fusion_alias_points_to_temporal_classifier():
@@ -24,7 +25,55 @@ def test_temporal_refiner_preserves_frame_embedding_shape():
     assert y.shape == x.shape
 
 
-def test_temporal_classifier_exposes_temporal_forward_contract():
+def test_temporal_classifier_exposes_training_and_inference_contracts():
     assert "forward" in M2DTemporalPretrainedSEDFusionClassifier.__dict__
+    assert "predict" in M2DTemporalPretrainedSEDFusionClassifier.__dict__
     assert "_forward_pretrainedsed" in M2DTemporalPretrainedSEDFusionClassifier.__dict__
     assert "_pool_frames" in M2DTemporalPretrainedSEDFusionClassifier.__dict__
+
+
+def test_temporal_predict_contract_from_mocked_forward():
+    class ToyTemporalClassifier(M2DTemporalPretrainedSEDFusionClassifier):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.num_classes = 3
+            self.energy_thresholds = {"min_probability": 0.0, "min_activity": 0.0}
+
+        def forward(self, inputs):
+            plain_logits = torch.tensor([[0.1, 2.0, -1.0], [3.0, 0.2, -0.5]])
+            return {
+                "logits": plain_logits,
+                "plain_logits": plain_logits,
+                "energy": torch.logsumexp(plain_logits, dim=-1),
+                "embedding": torch.randn(2, 8),
+                "activity_logits": torch.tensor([[4.0, -4.0, 4.0], [-4.0, -4.0, -4.0]]),
+            }
+
+    out = ToyTemporalClassifier().predict({"waveform": torch.randn(2, 16000)})
+
+    assert out["label_vector"].shape == (2, 3)
+    assert out["raw_label_vector"].shape == (2, 3)
+    assert out["probabilities"].shape == (2,)
+    assert out["activity_probabilities"].shape == (2, 3)
+    assert torch.equal(out["class_index"], torch.tensor([1, 0]))
+
+
+def test_temporal_activity_loss_supervises_silence_as_zero_activity():
+    output = {
+        "activity_logits": torch.tensor(
+            [[4.0, 4.0, 4.0], [-4.0, 4.0, -4.0]],
+            requires_grad=True,
+        ),
+        "duration_sec": torch.tensor([1.0, 1.0]),
+    }
+    target = {
+        "span_sec": torch.tensor([[-1.0, -1.0], [0.25, 0.75]]),
+    }
+
+    loss = temporal_activity_loss(output, target, pos_weight=1.0)
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert output["activity_logits"].grad is not None
+    assert output["activity_logits"].grad[0].abs().sum() > 0.0
