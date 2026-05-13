@@ -1,5 +1,5 @@
 _base_: ../tf-mlpnet-edge.rt192k/config.yaml
 
-# Balance preset (hidden=128, 8 blocks, wider encoder feature_dim=48). Still
-# uses (1,2,4) time dilations to keep (k-1)*d < 14 per prj_context.md.
+# TF-MLPNet v3 "balance" preset (~6M parameters): hidden=208, 9 blocks, kf=7.
+# Same NPU rules as edge (dilations=(1,2,4), state <= 192 KiB fp16).
 tiger_variant: tf-mlpnet-balance
