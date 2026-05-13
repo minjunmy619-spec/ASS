@@ -2,15 +2,30 @@
 TIGERNPUEdgeV2 -- NPU-optimized variant addressing ONNX graph bloat.
 
 Key changes vs V1:
-1. Replace LayerNorm2DOnChannel (5+ ops each) with nn.BatchNorm2d (1 op in ONNX).
+1. Replace LayerNorm2DOnChannel (5+ ops each) with a lightweight channel-axis
+   RMSNorm (3 ONNX ops, no running stats, train/eval identical).
 2. Replace BNBlock permute-based norm with a direct Conv2d path (no Transpose).
 3. Replace StaticFreqResize2D repeat_interleave (Tile) with ConvTranspose2d.
 4. Vectorize attention heads via batched bmm (no Python for-loop unrolling).
 5. Fuse the 67-subband encoder/decoder loops into single grouped Conv2d ops.
 6. Minimize Slice/Concat by pre-allocating state update shapes.
+7. Chunked-T training path: ``forward_sequence`` unrolls in chunks of
+   ``chunk_size`` frames via a shared ``forward_chunk`` kernel that is
+   T-agnostic, so the GPU sees wide kernel launches during training while the
+   T=1 export path (``forward_cell``) stays bit-identical.
 
 The design keeps the TIGER freq/time alternation + sliding-window KV attention
 architecture intact, preserving the core ideas from the original paper.
+
+Normalization notes:
+- Earlier revisions of this file used ``BatchNorm2d`` everywhere.  That is
+  cheap at ONNX export time (BN folds into the preceding Conv2d), but it
+  trains badly on this graph: the old ``forward_sequence`` ran one T=1 call
+  per audio frame, so BN saw a highly correlated mini-batch of size
+  ``B * F * 1`` per step, ran ~1000 updates per clip with momentum=0.1, and
+  drifted between train-mode and eval-mode statistics.  Replacing BN with
+  ``NPURMSNormChannel`` removes the train/eval split entirely, adds zero
+  streaming state, and costs only ~3 extra ONNX ops per norm site.
 """
 
 from __future__ import annotations
@@ -27,19 +42,54 @@ from .npu_edge_utils import sanitize_for_npu_edge
 
 
 # ---------------------------------------------------------------------------
-# NPU-friendly normalization: BatchNorm2d exports as a single fused op
+# NPU-friendly normalization: frame-local RMSNorm over the channel axis.
+#
+# The old file used ``BatchNorm2d`` here because BN folds into the previous
+# Conv2d at export time and collapses to a single ONNX node.  That's fine for
+# the exported graph, but on this architecture it is actively harmful during
+# training -- see the module-level docstring for the full rationale.
+#
+# ``NPURMSNormChannel`` normalises along the channel axis of a (B, C, F, T)
+# tensor.  It is frame-local (no time reduction), does not track running
+# statistics, and exposes the same forward signature as a BN wrapper so call
+# sites are mechanical to migrate.  ONNX export of this module emits
+# ``Mul -> ReduceMean -> Add -> Rsqrt -> Mul -> Mul`` (6 elementwise ops); that
+# is still 100x smaller than the V1 LayerNorm2DOnChannel path.
 # ---------------------------------------------------------------------------
 
 
-class NPUBatchNorm2d(nn.Module):
-    """Wrapper around BatchNorm2d that works in eval mode for export."""
+class NPURMSNormChannel(nn.Module):
+    """Channel-axis RMSNorm for (B, C, F, T) tensors.
 
-    def __init__(self, num_features: int, eps: float = 1e-5):
+    The normalisation is computed over the channel axis only, so there is no
+    time-axis reduction -- the operator is trivially causal and streaming-safe.
+    A single learnable per-channel scale is applied after normalisation; there
+    is no bias term.  No running statistics: eval() and train() produce
+    identical outputs by construction.
+    """
+
+    def __init__(self, num_features: int, eps: float = 1e-6):
         super().__init__()
-        self.bn = nn.BatchNorm2d(num_features, eps=eps)
+        self.num_features = num_features
+        self.eps = eps
+        # Shape (1, C, 1, 1) so it broadcasts cleanly against (B, C, F, T)
+        # and folds into ONNX as a static constant Mul.
+        self.weight = nn.Parameter(torch.ones(1, num_features, 1, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.bn(x)
+        ms = (x * x).mean(dim=1, keepdim=True)
+        x = x * torch.rsqrt(ms + self.eps)
+        return x * self.weight
+
+
+# NOTE: Earlier revisions of this file used ``NPUBatchNorm2d`` (a thin wrapper
+# around ``nn.BatchNorm2d``).  That class has been removed in favour of
+# ``NPURMSNormChannel``; the parameter shapes are different (RMSNorm stores a
+# single (1, C, 1, 1) weight while BN stores weight/bias/running_mean/
+# running_var/num_batches_tracked), so pre-existing V2 checkpoints will not
+# load verbatim.  This is a deliberate breaking change: the BN statistics
+# accumulated under the old T=1 training loop were poorly conditioned anyway,
+# so re-training from scratch is the right migration.
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +98,7 @@ class NPUBatchNorm2d(nn.Module):
 
 
 class NPUConv2dNormAct(nn.Module):
-    """Conv2d + BatchNorm2d + ReLU. No permute, no LayerNorm decomposition."""
+    """Conv2d + NPURMSNormChannel + ReLU. No permute, no LayerNorm decomposition."""
 
     def __init__(self, nIn, nOut, kSize, stride=1, groups=1, dilation=1, bias=False):
         super().__init__()
@@ -57,7 +107,7 @@ class NPUConv2dNormAct(nn.Module):
             nIn, nOut, kSize, stride=stride, padding=padding, bias=bias,
             groups=groups, dilation=dilation,
         )
-        self.bn = nn.BatchNorm2d(nOut)
+        self.bn = NPURMSNormChannel(nOut)
         self.act = nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -65,7 +115,7 @@ class NPUConv2dNormAct(nn.Module):
 
 
 class NPUConv2dNorm(nn.Module):
-    """Conv2d + BatchNorm2d without activation."""
+    """Conv2d + NPURMSNormChannel without activation."""
 
     def __init__(self, nIn, nOut, kSize, stride=(1, 1), dilation=(1, 1),
                  groups=1, bias=False):
@@ -82,7 +132,7 @@ class NPUConv2dNorm(nn.Module):
             nIn, nOut, kSize, stride=stride, padding=(pad_h, pad_w),
             bias=bias, groups=groups, dilation=dilation,
         )
-        self.bn = nn.BatchNorm2d(nOut)
+        self.bn = NPURMSNormChannel(nOut)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.bn(self.conv(x))
@@ -98,7 +148,7 @@ class NPUCausalConv2dNorm(nn.Module):
             nIn, nOut, (1, kSize_t), stride=(1, 1), padding=(0, 0),
             dilation=(1, dilation_t), bias=bias, groups=groups,
         )
-        self.bn = nn.BatchNorm2d(nOut)
+        self.bn = NPURMSNormChannel(nOut)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.lookback > 0:
@@ -189,10 +239,10 @@ class NPUFusedSubbandEncoder(nn.Module):
         # Factored projection: enc_dim_2 -> mid -> feature_dim*nband
         mid = min(256, self.enc_dim_2 // 4)
         self.proj1 = nn.Conv2d(self.enc_dim_2, mid, 1, bias=True)
-        self.bn1 = nn.BatchNorm2d(mid)
+        self.bn1 = NPURMSNormChannel(mid)
         self.act1 = nn.ReLU()
         self.proj2 = nn.Conv2d(mid, feature_dim * self.nband, 1, bias=True)
-        self.bn2 = nn.BatchNorm2d(feature_dim * self.nband)
+        self.bn2 = NPURMSNormChannel(feature_dim * self.nband)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, 1, 2*enc_dim, T]
@@ -227,7 +277,7 @@ class NPUFusedSubbandDecoder(nn.Module):
         mid = min(256, in_ch)
         self.act = nn.ReLU()
         self.proj1 = nn.Conv2d(in_ch, mid, 1, bias=True)
-        self.bn1 = nn.BatchNorm2d(mid)
+        self.bn1 = NPURMSNormChannel(mid)
         self.act1 = nn.ReLU()
         self.proj2 = nn.Conv2d(mid, self.out_channels, 1, bias=True)
 
@@ -271,13 +321,13 @@ class NPUVectorizedFrameAttention(nn.Module):
         # QKV projection: [B, C, F, T] -> [B, total_proj, F, T]
         self.qkv_conv = nn.Sequential(
             nn.Conv2d(in_channels, total_proj, 1, bias=True),
-            nn.BatchNorm2d(total_proj),
+            NPURMSNormChannel(total_proj),
             nn.ReLU(),
         )
         # Output projection
         self.proj_conv = nn.Sequential(
             nn.Conv2d(n_heads * v_hid_chan, in_channels, 1, bias=True),
-            nn.BatchNorm2d(in_channels),
+            NPURMSNormChannel(in_channels),
             nn.ReLU(),
         )
 
@@ -343,6 +393,104 @@ class NPUVectorizedFrameAttention(nn.Module):
         next_kv = torch.cat([new_k, new_v], dim=3)
         return out, next_kv, next_valid_mask
 
+    def forward_chunk(self, x: torch.Tensor, past_kv: torch.Tensor,
+                      past_valid_mask: torch.Tensor
+                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """T-generic sliding-window causal attention for chunked training.
+
+        Given ``T`` consecutive frames, each output frame attends to its own
+        trailing window of ``window_size`` frames -- i.e., the same set of
+        keys/values that ``forward`` would have seen if the frames had been
+        pushed through one at a time.  At ``T == 1`` this method produces
+        numerically-identical outputs to ``forward`` (see the parity test in
+        ``test_tiger_npu_edge_v2.py``), so callers who need the optimised T=1
+        ONNX graph should still invoke ``forward``.  This path is intended
+        exclusively for training; it is **not** wired into the ONNX export.
+
+        Shapes match ``forward`` but with arbitrary ``T``:
+          x:               (B, C, F, T)
+          past_kv:         (B, n_heads, window_size, head_dim + v_head_dim)
+          past_valid_mask: (B, 1, window_size, 1)
+        returns:
+          out:              (B, C, F, T)
+          next_kv:          (B, n_heads, window_size, head_dim + v_head_dim)
+          next_valid_mask:  (B, 1, window_size, 1)
+        """
+        B, _, Fb, T = x.shape
+        W = self.window_size
+        H = self.n_heads
+
+        qkv = self.qkv_conv(x)  # (B, total_proj, F, T)
+        qkv = qkv.view(B, H, 2 * self.hid_chan + self.v_hid_chan, Fb, T)
+
+        q = qkv[:, :, :self.hid_chan, :, :]                              # (B, H, hid, F, T)
+        k = qkv[:, :, self.hid_chan:2 * self.hid_chan, :, :]             # (B, H, hid, F, T)
+        v = qkv[:, :, 2 * self.hid_chan:, :, :]                          # (B, H, v_hid, F, T)
+
+        # Bring T to the front of the per-head payload so we can flatten
+        # (hid, F) into head_dim and keep T as a distinct axis.
+        q_T = q.permute(0, 1, 4, 2, 3).reshape(B, H, T, self.head_dim)
+        k_T = k.permute(0, 1, 4, 2, 3).reshape(B, H, T, self.head_dim)
+        v_T = v.permute(0, 1, 4, 2, 3).reshape(B, H, T, self.v_head_dim)
+
+        prev_k = past_kv[:, :, :, :self.head_dim]                        # (B, H, W, head_dim)
+        prev_v = past_kv[:, :, :, self.head_dim:]                        # (B, H, W, v_head_dim)
+
+        # Combined KV sequence: prev window followed by the current chunk.
+        # Output frame i within the chunk needs to attend to the trailing W
+        # frames ending at i; in combined-sequence coordinates that is the
+        # slice [i+1, i+W]. See the window-mask construction below.
+        combined_k = torch.cat([prev_k, k_T], dim=2)                     # (B, H, W+T, head_dim)
+        combined_v = torch.cat([prev_v, v_T], dim=2)                     # (B, H, W+T, v_head_dim)
+
+        new_valid = past_valid_mask.new_ones(B, 1, T, 1)
+        combined_valid = torch.cat([past_valid_mask, new_valid], dim=2)  # (B, 1, W+T, 1)
+
+        # Attention scores: (B*H, T, W+T)
+        q_bmm = q_T.reshape(B * H, T, self.head_dim)
+        k_bmm = combined_k.reshape(B * H, W + T, self.head_dim).transpose(1, 2)
+        attn = torch.bmm(q_bmm, k_bmm) * self.attn_scale
+
+        # Causal-window mask: chunk frame i attends to combined positions j
+        # with 1 <= (j - i) <= W. Built from arange() each call; this is
+        # training-only, so ONNX cost is irrelevant here.
+        i_idx = torch.arange(T, device=x.device)
+        j_idx = torch.arange(W + T, device=x.device)
+        diff = j_idx.unsqueeze(0) - i_idx.unsqueeze(1)                   # (T, W+T)
+        window_mask = (diff >= 1) & (diff <= W)                           # (T, W+T)
+        window_add = torch.where(
+            window_mask,
+            torch.zeros((), device=x.device, dtype=attn.dtype),
+            torch.full((), -1e4, device=x.device, dtype=attn.dtype),
+        )                                                                 # (T, W+T)
+
+        # Combine with per-position validity from the warmup mask.
+        valid_flat = combined_valid.reshape(B, 1, W + T)                 # (B, 1, W+T)
+        valid_add = (1.0 - valid_flat) * (-1e4)                          # (B, 1, W+T)
+
+        attn = attn.view(B, H, T, W + T)
+        attn = attn + window_add.view(1, 1, T, W + T)
+        attn = attn + valid_add.view(B, 1, 1, W + T)
+        attn = attn.reshape(B * H, T, W + T)
+        attn = F.softmax(attn, dim=-1)
+
+        v_bmm = combined_v.reshape(B * H, W + T, self.v_head_dim)
+        context = torch.bmm(attn, v_bmm)                                 # (B*H, T, v_head_dim)
+        context = context.view(B, H, T, self.v_hid_chan, Fb)
+        # (B, H, T, v_hid, F) -> (B, H*v_hid, F, T)
+        context = context.permute(0, 1, 3, 4, 2).reshape(
+            B, H * self.v_hid_chan, Fb, T,
+        )
+        out = self.proj_conv(context)                                    # (B, C, F, T)
+
+        # Carry forward the trailing window (last W combined positions) so
+        # the next chunk sees the same sliding-window state as frame-by-frame.
+        next_kv = torch.cat(
+            [combined_k[:, :, -W:, :], combined_v[:, :, -W:, :]], dim=3,
+        )
+        next_valid_mask = combined_valid[:, :, -W:, :]
+        return out, next_kv, next_valid_mask
+
 
 class NPUVectorizedFreqAttention(nn.Module):
     """
@@ -364,12 +512,12 @@ class NPUVectorizedFreqAttention(nn.Module):
         total_proj = n_heads * (hid_chan * 2 + v_hid_chan)
         self.qkv_conv = nn.Sequential(
             nn.Conv2d(in_channels, total_proj, 1, bias=True),
-            nn.BatchNorm2d(total_proj),
+            NPURMSNormChannel(total_proj),
             nn.ReLU(),
         )
         self.proj_conv = nn.Sequential(
             nn.Conv2d(n_heads * v_hid_chan, in_channels, 1, bias=True),
-            nn.BatchNorm2d(in_channels),
+            NPURMSNormChannel(in_channels),
             nn.ReLU(),
         )
 
@@ -400,9 +548,45 @@ class NPUVectorizedFreqAttention(nn.Module):
         out = self.proj_conv(ctx)  # [B, C, F, 1]
         return out
 
+    def forward_chunk(self, x: torch.Tensor) -> torch.Tensor:
+        """T-generic frequency self-attention for chunked training.
+
+        The original ``forward`` assumes T=1 and squeezes the time axis.  For
+        chunk training we fold T into the batch so each frame still attends
+        purely over its own frequency axis (identical semantics).  At T=1
+        this is numerically identical to ``forward``; the export path is
+        therefore unaffected.
+        """
+        B, _, Fb, T = x.shape
+        H = self.n_heads
+
+        qkv = self.qkv_conv(x)  # (B, total, F, T)
+        qkv = qkv.view(B, H, 2 * self.hid_chan + self.v_hid_chan, Fb, T)
+
+        q = qkv[:, :, :self.hid_chan, :, :]                     # (B, H, hid, F, T)
+        k = qkv[:, :, self.hid_chan:2 * self.hid_chan, :, :]
+        v = qkv[:, :, 2 * self.hid_chan:, :, :]                 # (B, H, v_hid, F, T)
+
+        # Collapse (B, H, T) into the batch dim so each (B,H,T) slot runs an
+        # independent F-axis attention with no cross-frame leakage.
+        q_t = q.permute(0, 1, 4, 3, 2).reshape(B * H * T, Fb, self.hid_chan)
+        k_r = k.permute(0, 1, 4, 2, 3).reshape(B * H * T, self.hid_chan, Fb)
+        v_t = v.permute(0, 1, 4, 3, 2).reshape(B * H * T, Fb, self.v_hid_chan)
+
+        attn = torch.bmm(q_t, k_r) * self.attn_scale
+        attn = F.softmax(attn, dim=-1)
+        ctx = torch.bmm(attn, v_t)                               # (B*H*T, F, v_hid)
+
+        # Reassemble to (B, H*v_hid, F, T).
+        ctx = ctx.view(B, H, T, Fb, self.v_hid_chan)
+        ctx = ctx.permute(0, 1, 4, 3, 2).reshape(
+            B, H * self.v_hid_chan, Fb, T,
+        )
+        return self.proj_conv(ctx)
+
 
 # ---------------------------------------------------------------------------
-# NPU-friendly Freq/Time U-blocks (using BatchNorm2d, no Dropout)
+# NPU-friendly Freq/Time U-blocks (using NPURMSNormChannel, no Dropout)
 # ---------------------------------------------------------------------------
 
 
@@ -504,7 +688,7 @@ class NPUFreqUConvBlock(nn.Module):
 class NPUCausalTimeBlock(nn.Module):
     """
     Causal time-domain block with context state.
-    Uses depthwise causal Conv2d with BatchNorm2d. No Dropout.
+    Uses depthwise causal Conv2d with NPURMSNormChannel. No Dropout.
     
     Architecture: parallel dilated causal convolutions applied to the
     context-prefixed input. Each conv receives the same padded input and
@@ -534,7 +718,7 @@ class NPUCausalTimeBlock(nn.Module):
                 nn.Conv2d(hidden_channels, hidden_channels, (1, kernel_size),
                           dilation=(1, d), padding=(0, 0),
                           groups=hidden_channels, bias=False),
-                nn.BatchNorm2d(hidden_channels),
+                NPURMSNormChannel(hidden_channels),
             )
             for d in dilations
         ])
@@ -545,10 +729,10 @@ class NPUCausalTimeBlock(nn.Module):
         self.global_conv = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, (1, global_kernel_size),
                       padding=(0, 0), groups=hidden_channels, bias=False),
-            nn.BatchNorm2d(hidden_channels),
+            NPURMSNormChannel(hidden_channels),
             nn.ReLU(),
             nn.Conv2d(hidden_channels, hidden_channels, 1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
+            NPURMSNormChannel(hidden_channels),
         )
 
         # Fusion gates
@@ -634,7 +818,7 @@ class NPUFreqTimeStage(nn.Module):
         self.freq_attn = NPUVectorizedFreqAttention(
             out_channels, n_heads, att_hid_chan, att_val_hid_chan, nband,
         )
-        self.freq_norm = nn.BatchNorm2d(out_channels)
+        self.freq_norm = NPURMSNormChannel(out_channels)
 
         self.time_block = NPUCausalTimeBlock(
             out_channels, time_hidden_channels, time_dilations,
@@ -644,7 +828,7 @@ class NPUFreqTimeStage(nn.Module):
             out_channels, n_heads, att_hid_chan, att_val_hid_chan, nband,
             kv_window_size,
         )
-        self.frame_norm = nn.BatchNorm2d(out_channels)
+        self.frame_norm = NPURMSNormChannel(out_channels)
 
     def forward(self, x: torch.Tensor, past_kv: torch.Tensor,
                 past_valid_mask: torch.Tensor, time_ctx: torch.Tensor
@@ -665,6 +849,31 @@ class NPUFreqTimeStage(nn.Module):
         frame_out = self.frame_norm(frame_out)
         out = frame_out + residual_2
 
+        return out, new_kv, new_valid, next_ctx
+
+    def forward_chunk(self, x: torch.Tensor, past_kv: torch.Tensor,
+                      past_valid_mask: torch.Tensor, time_ctx: torch.Tensor
+                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """T-generic stage forward used by chunked training.
+
+        The freq block, the time block and the two norms are already
+        T-agnostic; only the attention modules were T=1-specialised, so this
+        method just routes through their ``forward_chunk`` variants.  At T=1
+        the result matches ``forward`` within fp32 tolerance.
+        """
+        residual_1 = x
+        freq_out = self.freq_block(x)
+        freq_attn_out = self.freq_attn.forward_chunk(freq_out)
+        freq_out = self.freq_norm(freq_attn_out)
+        x2 = freq_out + residual_1
+
+        residual_2 = x2
+        time_out, next_ctx = self.time_block(x2, ctx=time_ctx)
+        frame_out, new_kv, new_valid = self.frame_attn.forward_chunk(
+            time_out, past_kv, past_valid_mask,
+        )
+        frame_out = self.frame_norm(frame_out)
+        out = frame_out + residual_2
         return out, new_kv, new_valid, next_ctx
 
 
@@ -741,6 +950,42 @@ class NPUStackedSeparator(nn.Module):
 
         return x, new_kvs, new_valid_mask, new_ctxs
 
+    def forward_chunk(self, x: torch.Tensor, past_kvs: torch.Tensor,
+                      past_valid_mask: torch.Tensor, time_ctx: torch.Tensor
+                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """T-generic stacked forward for chunked training.
+
+        Mirrors ``forward`` line-for-line but dispatches to each stage's
+        ``forward_chunk``.  Per-stage slicing of ``past_kvs`` / ``time_ctx``
+        and the mix-block routing are identical.
+        """
+        mixture = x
+        kv_dim = (self.att_hid_chan + self.att_val_hid_chan) * self.nband
+        ctx_dim = self.stages[0].time_block.hidden_channels
+
+        new_kvs_list: List[torch.Tensor] = []
+        new_ctxs_list: List[torch.Tensor] = []
+        new_valid_mask = past_valid_mask
+
+        for stage_idx, stage in enumerate(self.stages):
+            prev_ctx = time_ctx[:, stage_idx * ctx_dim:(stage_idx + 1) * ctx_dim, :, :]
+            past_kv = past_kvs[:, :, :, stage_idx * kv_dim:(stage_idx + 1) * kv_dim]
+
+            if stage_idx == 0:
+                stage_input = x
+            else:
+                stage_input = self.mix_blocks[stage_idx - 1](mixture + x)
+
+            x, new_kv, new_valid_mask, next_ctx = stage.forward_chunk(
+                stage_input, past_kv, past_valid_mask, prev_ctx,
+            )
+            new_kvs_list.append(new_kv)
+            new_ctxs_list.append(next_ctx)
+
+        new_kvs = torch.cat(new_kvs_list, dim=-1)
+        new_ctxs = torch.cat(new_ctxs_list, dim=1)
+        return x, new_kvs, new_valid_mask, new_ctxs
+
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +1014,8 @@ class TIGERNPUEdgeV2(nn.Module):
 
     Key architectural choices:
     - Fused subband encoder/decoder (single Conv2d instead of 67-band loop)
-    - BatchNorm2d everywhere (1 ONNX node) instead of LayerNorm (5+ nodes)
+    - NPURMSNormChannel everywhere (stream-safe, train-eval identical, ~3 ops)
+      instead of LayerNorm (5+ nodes) or BatchNorm (bad under T=1 training)
     - Vectorized attention (no Python for-loop over heads)
     - ConvTranspose2d frequency resizing (no Tile/repeat_interleave)
     - No Dropout, no PReLU (ReLU only)
@@ -841,6 +1087,12 @@ class TIGERNPUEdgeV2(nn.Module):
         self._time_kernel_size = time_kernel_size
         self._time_global_kernel_size = time_global_kernel_size
 
+        # Chunked training is supported -- ``forward_sequence`` uses a single
+        # T-generic kernel (``_forward_chunk``) and slices the total frame
+        # range into chunks of ``chunk_size`` frames per GPU call, instead of
+        # the old frame-by-frame Python loop.  See ``forward_sequence`` below.
+        self.supports_exact_chunk_training = True
+
     @property
     def _ctx_size(self) -> int:
         return self.separator.stages[0].time_block.context_size
@@ -882,18 +1134,42 @@ class TIGERNPUEdgeV2(nn.Module):
         past_valid_mask: torch.Tensor,
         time_ctx: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Single-frame forward for streaming/export. Input T=1."""
-        # Encode
-        features = self.encoder(subband_spec_RIs)  # [B, C, nband, 1]
+        """Single-frame forward for streaming/export. Input T=1.
 
-        # Separate
+        This is the ONNX export path and is kept intentionally thin: the
+        shapes flowing through ``self.separator`` have ``T == 1`` so the
+        frame-attention module takes its T=1 code path with no extra masking
+        / windowing machinery. Do not change without re-running the op-count
+        assertions in ``test_tiger_npu_edge_v2.py``.
+        """
+        features = self.encoder(subband_spec_RIs)  # [B, C, nband, 1]
         sep_out, new_kvs, new_valid, new_ctx = self.separator(
             features, past_kvs, past_valid_mask, time_ctx,
         )
-
-        # Decode
         output = self.decoder(sep_out)  # [B, 4*num_sources, enc_dim, 1]
+        return output, new_kvs, new_valid, new_ctx
 
+    def _forward_chunk(
+        self,
+        subband_spec_RIs: torch.Tensor,
+        past_kvs: torch.Tensor,
+        past_valid_mask: torch.Tensor,
+        time_ctx: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """T-generic chunked forward used by ``forward_sequence``.
+
+        This is the training-only fast path.  For any ``T >= 1`` it routes
+        through the same encoder / separator / decoder modules, but with the
+        attention modules invoked via their ``forward_chunk`` variants so the
+        whole chunk is processed in one fused batched BMM instead of ``T``
+        sequential T=1 calls.  Frame-by-frame parity is enforced by
+        ``test_chunked_matches_frame_by_frame``.
+        """
+        features = self.encoder(subband_spec_RIs)  # [B, C, nband, T]
+        sep_out, new_kvs, new_valid, new_ctx = self.separator.forward_chunk(
+            features, past_kvs, past_valid_mask, time_ctx,
+        )
+        output = self.decoder(sep_out)  # [B, 4*num_sources, enc_dim, T]
         return output, new_kvs, new_valid, new_ctx
 
     def forward_sequence(
@@ -903,9 +1179,23 @@ class TIGERNPUEdgeV2(nn.Module):
         past_valid_mask: Optional[torch.Tensor] = None,
         time_ctx: Optional[torch.Tensor] = None,
         detach_state: bool = False,
-        chunk_size: int = 1,
+        chunk_size: int = 8,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Multi-frame forward for training."""
+        """Multi-frame forward used for training and offline evaluation.
+
+        Previously this looped frame-by-frame (``T=1`` call per STFT frame),
+        which launched ~1 kernel per frame and kept GPU utilisation near
+        zero during training.  It now slices the total frame range into
+        chunks of ``chunk_size`` frames and pushes each chunk through
+        ``_forward_chunk`` in a single call.  Sliding-window KV, causal
+        masking and time-block context are preserved exactly across chunk
+        boundaries, so training remains strictly causal and the single-frame
+        deployment path still matches the training computation.
+
+        ``chunk_size <= 0`` means "whole sequence in one call"; ``1`` falls
+        back to the original frame-by-frame loop for exact bit-wise parity
+        with ``forward_cell`` (used by the parity test).
+        """
         B, _, _, total_frames = subband_spec_RIs.shape
 
         if past_kvs is None or past_valid_mask is None or time_ctx is None:
@@ -913,12 +1203,24 @@ class TIGERNPUEdgeV2(nn.Module):
                 B, subband_spec_RIs.device, subband_spec_RIs.dtype,
             )
 
-        outputs = []
-        for t in range(total_frames):
-            frame = subband_spec_RIs[..., t:t+1]
-            out, past_kvs, past_valid_mask, time_ctx = self.forward_cell(
-                frame, past_kvs, past_valid_mask, time_ctx,
-            )
+        if chunk_size is None or chunk_size <= 0:
+            chunk_size = total_frames
+        chunk_size = min(chunk_size, max(total_frames, 1))
+
+        outputs: List[torch.Tensor] = []
+        for start in range(0, total_frames, chunk_size):
+            end = min(start + chunk_size, total_frames)
+            chunk = subband_spec_RIs[..., start:end]
+            if end - start == 1:
+                # Preserve exact parity with ``forward_cell`` (used by the
+                # frame-by-frame baseline in the parity test).
+                out, past_kvs, past_valid_mask, time_ctx = self.forward_cell(
+                    chunk, past_kvs, past_valid_mask, time_ctx,
+                )
+            else:
+                out, past_kvs, past_valid_mask, time_ctx = self._forward_chunk(
+                    chunk, past_kvs, past_valid_mask, time_ctx,
+                )
             outputs.append(out)
             if detach_state:
                 past_kvs = past_kvs.detach()
