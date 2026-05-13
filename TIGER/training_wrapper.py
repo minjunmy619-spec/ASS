@@ -49,11 +49,91 @@ def _normalize_variant_name(variant: str) -> str:
         "npu_edge_v2": "npu-edge-v2",
         "tiger-edge-v2": "npu-edge-v2",
         "tiger_edge_v2": "npu-edge-v2",
+        # TF-MLPNet-style TIGEREdgeMLP (separator replaced by EdgeTFMLPSeparator,
+        # encoder/decoder inherited from stock TIGER so this stays inside the
+        # build_tiger_system / TIGERWaveformSeparator training path).
+        "tf-mlpnet": "tf-mlpnet-edge",
+        "tf_mlpnet": "tf-mlpnet-edge",
+        "tfmlpnet": "tf-mlpnet-edge",
+        "tf-mlpnet-edge": "tf-mlpnet-edge",
+        "tf_mlpnet_edge": "tf-mlpnet-edge",
+        "tf-mlpnet-balance": "tf-mlpnet-balance",
+        "tf_mlpnet_balance": "tf-mlpnet-balance",
+        "tf-mlpnet-large": "tf-mlpnet-large",
+        "tf_mlpnet_large": "tf-mlpnet-large",
     }
     key = variant.strip().lower()
     if key not in aliases:
         raise ValueError(f"Unknown TIGER variant: {variant}")
     return aliases[key]
+
+
+# Preset tables for TF-MLPNet (TIGEREdgeMLP). Sizes follow context.md:
+# - edge:    hidden=96,  num_blocks=6  -> ~TIGER npu-edge-v2 footprint
+# - balance: hidden=128, num_blocks=8
+# - large:   hidden=160, num_blocks=8
+#
+# NPU constraint: (time_kernel-1)*dilation < 14. With kt=3 and dilations
+# (1,2,4) the worst case is 8, which is safe. (1,2,4,8) would hit 16 and
+# must not be used here.
+#
+# ``out_channels`` must be divisible by ``num_sources`` (MaskBlock depthwise
+# groups). For DnR 3-stem we use 24 / 48 / 72.
+_TF_MLPNET_PRESETS: dict[str, dict[str, Any]] = {
+    "tf-mlpnet-edge": {
+        "out_channels": 24,
+        "in_channels": 96,
+        "num_blocks": 6,
+        "upsampling_depth": 2,
+        "edge_hidden_channels": 96,
+        "edge_num_blocks": 6,
+        "edge_expansion": 2,
+        "edge_freq_kernel_size": 3,
+        "edge_time_kernel_size": 3,
+        "edge_time_dilations": (1, 2, 4),
+    },
+    "tf-mlpnet-balance": {
+        "out_channels": 48,
+        "in_channels": 192,
+        "num_blocks": 8,
+        "upsampling_depth": 2,
+        "edge_hidden_channels": 128,
+        "edge_num_blocks": 8,
+        "edge_expansion": 2,
+        "edge_freq_kernel_size": 3,
+        "edge_time_kernel_size": 3,
+        "edge_time_dilations": (1, 2, 4),
+    },
+    "tf-mlpnet-large": {
+        "out_channels": 72,
+        "in_channels": 240,
+        "num_blocks": 8,
+        "upsampling_depth": 2,
+        "edge_hidden_channels": 160,
+        "edge_num_blocks": 8,
+        "edge_expansion": 2,
+        "edge_freq_kernel_size": 3,
+        "edge_time_kernel_size": 3,
+        "edge_time_dilations": (1, 2, 4),
+    },
+}
+
+
+def _import_tiger_edge_mlp():
+    """Import ``TIGEREdgeMLP`` from the hyphenated ``TF-MLPNet`` sibling.
+
+    ``TF-MLPNet/`` cannot be imported as a top-level Python module because of
+    the hyphen, so we add the directory to ``sys.path`` on first use.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _tf_root = _Path(__file__).resolve().parent.parent / "TF-MLPNet"
+    if _tf_root.is_dir() and str(_tf_root) not in _sys.path:
+        _sys.path.insert(0, str(_tf_root))
+    from tf_mlpnet import TIGEREdgeMLP  # noqa: E402 - deferred import by design
+
+    return TIGEREdgeMLP
 
 
 def _build_analysis_window(name: str, win: int) -> torch.Tensor | None:
@@ -87,6 +167,21 @@ def build_tiger_core(
             win=n_fft,
             stride=hop_length,
             **kwargs,
+        )
+
+    if variant in _TF_MLPNET_PRESETS:
+        tiger_edge_mlp_cls = _import_tiger_edge_mlp()
+        defaults = dict(_TF_MLPNET_PRESETS[variant])
+        # Keep explicit control flags off the preset dict so users can't
+        # accidentally override them via `model_kwargs` and break streaming.
+        defaults.update(kwargs)
+        return tiger_edge_mlp_cls(
+            sample_rate=fs,
+            num_sources=n_src,
+            win=n_fft,
+            stride=hop_length,
+            need_streaming=True,
+            **defaults,
         )
 
     common = {

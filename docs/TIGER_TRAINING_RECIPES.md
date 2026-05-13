@@ -16,6 +16,9 @@ which keeps the training path on the same causal RI sequence and
 | `recipes/dnr/models/tiger-ctx-tiger-like.rt192k` | `ctx-tiger-like` | ctx-state, more paper-faithful ablation |
 | `recipes/dnr/models/tiger-deployable.rt192k` | `deployable` | compact non-ctx deployable baseline |
 | `recipes/dnr/models/tiger-tiger-like.rt192k` | `tiger-like` | non-ctx, more paper-faithful ablation |
+| `recipes/dnr/models/tf-mlpnet-edge.rt192k` | `tf-mlpnet-edge` | TF-MLPNet-style Conv2d separator (no attention / no bmm), edge preset (hidden=96, 6 blocks) |
+| `recipes/dnr/models/tf-mlpnet-balance.rt192k` | `tf-mlpnet-balance` | TF-MLPNet balance preset (hidden=128, 8 blocks) |
+| `recipes/dnr/models/tf-mlpnet-large.rt192k` | `tf-mlpnet-large` | TF-MLPNet large preset (hidden=160, 8 blocks) |
 
 All recipes inherit the DnR three-stem setup:
 
@@ -76,3 +79,29 @@ The training wrapper applies the TIGER complex masks outside the exported NPU
 cell, then reconstructs waveforms through the same causal RI helper. The
 checkpointed parameters still belong to the TIGER core under
 `model.core`.
+
+## TF-MLPNet note
+
+The `tf-mlpnet-*` variants swap TIGER's `RecurrentKV` separator for
+`EdgeTFMLPSeparator` (see `TF-MLPNet/tf_mlpnet/tiger_edge_mlp.py`). They reuse
+the stock `TIGER._encode_subbands` / `_decode_masks` path and therefore plug
+into the same `build_tiger_system` + `TIGERWaveformSeparator` training wrapper.
+The NPU rule `(time_kernel - 1) * dilation < 14` is enforced at construction
+time, so the recipes pin `edge_time_dilations=(1, 2, 4)` with
+`edge_time_kernel_size=3` (worst-case effective span = 8).
+
+## DolphinSFCNPU DnR recipes
+
+DolphinSFCNPU does not share TIGER's encoder/decoder, so it has its own
+training wrapper and recipe family:
+
+| recipe | `preset` | purpose |
+|---|---|---|
+| `recipes/dnr/models/dolphin-sfc-npu.edge-small` | `edge_small` | structural / export smoke |
+| `recipes/dnr/models/dolphin-sfc-npu.large-6m` | `large_6m` | first performance target |
+| `recipes/dnr/models/dolphin-sfc-npu.large-8m` | `large_8m` | larger quality-oriented variant |
+
+These recipes use `DolphinSFCNPU.training_wrapper.build_dolphin_sfc_npu_system`
+with `n_fft=4096`, `hop_length=1024` (matching the BandSCNetNPU DnR setup),
+and feed the packed-real STFT contract through the existing
+`OnlineModelWrapper` / `SupTask` pipeline.
