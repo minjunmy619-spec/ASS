@@ -9,11 +9,16 @@ hop_length: 512
 n_src: 3
 n_chan: 1
 
-# TF-MLPNet / TIGEREdgeMLP backbone: TIGER encoder/decoder with a TF-MLP style
-# Conv2d separator (no attention, no bmm, no iteration unroll). The variant is
-# routed through TIGER.training_wrapper.build_tiger_system so the training and
-# deployment paths stay on the same forward_sequence / forward_cell code path
-# that is exported to ONNX.
+# TF-MLPNet v3 "edge" preset (~3M parameters): GLU-gated frequency and time
+# mixers with EMA global state. Conv2d-only separator (no attention, no bmm,
+# no iteration unroll). Routed through TIGER.training_wrapper.build_tiger_system
+# so training and deployment stay on the same forward_sequence / forward_cell
+# path that is exported to ONNX by TIGEREdgeMLPCellExportWrapper.
+#
+# NPU rules:
+#   (time_kernel-1)*dilation < 14  (kt=3, dilations=(1,2,4) -> max 8)
+#   (freq_kernel-1)             < 14  (kf=5 here, 6 for balance/large)
+#   State fits 192 KiB fp16 DSP quota (audited by TF-MLPNet smoke test).
 tiger_variant: tf-mlpnet-edge
 tiger_startup_packet: 256
 tiger_analysis_window: sqrt_hann

@@ -24,6 +24,12 @@ from .tiger_edge_mlp import (
     EdgeTimeMixer,
     TIGEREdgeMLP,
 )
+from .tiger_edge_mlp_v3 import (
+    EdgeTFMLPSeparatorV3,
+    TIGEREdgeMLPV3,
+    V3_PRESETS,
+    build_tiger_edge_mlp_v3,
+)
 
 __all__ = [
     "EdgeFreqMixer",
@@ -32,6 +38,10 @@ __all__ = [
     "EdgeTFMLPSeparator",
     "EdgeTimeMixer",
     "TIGEREdgeMLP",
+    "EdgeTFMLPSeparatorV3",
+    "TIGEREdgeMLPV3",
+    "V3_PRESETS",
+    "build_tiger_edge_mlp_v3",
     "V1EdgeChannelNorm",
     "V1EdgeFreqMixer",
     "V1EdgePWConvBlock",
