@@ -195,6 +195,152 @@ train:
       start_spatial_mix_fallback_prob: 0.05
       end_spatial_mix_fallback_prob: 0.0
       strict: true
+  # Opt-in lambda scheduler. Uncomment to enable scheduled lambda_* updates.
+  # The schedule below is one suggested curriculum for this 250-epoch recipe:
+  #   * Phase 1 (warmup, 0..20):
+  #       focus on clean per-source separation. The bridge contrastive losses,
+  #       activity heads and waveform/embedding regularizers stay small until
+  #       the SI-SDR PIT objective stabilizes.
+  #   * Phase 2 (semantic ramp, 20..120):
+  #       linearly grow class CE, prototype, supcon and infonce so the
+  #       semantic-acoustic bridge learns alignment once separation is decent.
+  #   * Phase 3 (refinement, 120..220):
+  #       bring in spatial diversity, anti-collapse and DoA more strongly,
+  #       holding the contrastive losses near their target weights.
+  #   * Phase 4 (cooldown, 220..250):
+  #       cosine anneal the regularizer weights back down so SI-SDR fitting
+  #       dominates the final epochs.
+  # - name: lambda_scheduler
+  #   module: src.training.callbacks.lambda_scheduler
+  #   main: LambdaScheduler
+  #   args:
+  #     strict: true
+  #     log_prefix: lambda_schedule
+  #     # Resume-safe: state is saved into the Lightning checkpoint via
+  #     # ``state_dict`` / ``load_state_dict``. On resume, the callback
+  #     # restores the original YAML-default snapshot and lets Lightning's
+  #     # ``current_epoch`` / ``global_step`` drive the next schedule
+  #     # evaluation. Set restore_on_fit_end: false to keep the final
+  #     # scheduled values in ``loss_func.lambdas`` after training ends.
+  #     restore_on_fit_end: true
+  #     schedules:
+  #       lambda_class_ce:
+  #         kind: linear
+  #         unit: epoch
+  #         warmup: 20
+  #         duration: 100
+  #         start: 0.2
+  #         end: 0.8
+  #       lambda_class_pit:
+  #         kind: linear
+  #         unit: epoch
+  #         warmup: 20
+  #         duration: 100
+  #         start: 0.02
+  #         end: 0.1
+  #       lambda_count:
+  #         kind: linear
+  #         unit: epoch
+  #         warmup: 10
+  #         duration: 60
+  #         start: 0.0
+  #         end: 0.2
+  #       lambda_inactive_foreground:
+  #         kind: piecewise_linear
+  #         unit: epoch
+  #         points:
+  #           - [0, 0.05]
+  #           - [50, 0.2]
+  #           - [200, 0.2]
+  #           - [250, 0.05]
+  #       lambda_doa:
+  #         kind: cosine
+  #         unit: epoch
+  #         warmup: 50
+  #         duration: 120
+  #         start: 0.0
+  #         end: 0.05
+  #       lambda_spatial_diversity:
+  #         kind: linear
+  #         unit: epoch
+  #         warmup: 80
+  #         duration: 100
+  #         start: 0.0
+  #         end: 0.02
+  #       lambda_waveform_anticollapse:
+  #         kind: linear
+  #         unit: epoch
+  #         warmup: 80
+  #         duration: 100
+  #         start: 0.0
+  #         end: 0.01
+  #       lambda_activity_foreground:
+  #         kind: linear
+  #         unit: epoch
+  #         warmup: 30
+  #         duration: 80
+  #         start: 0.0
+  #         end: 0.05
+  #       lambda_bridge_proto:
+  #         kind: linear
+  #         unit: epoch
+  #         warmup: 25
+  #         duration: 80
+  #         start: 0.0
+  #         end: 0.05
+  #       lambda_bridge_supcon:
+  #         kind: linear
+  #         unit: epoch
+  #         warmup: 30
+  #         duration: 80
+  #         start: 0.0
+  #         end: 0.02
+  #       lambda_bridge_infonce:
+  #         kind: linear
+  #         unit: epoch
+  #         warmup: 30
+  #         duration: 80
+  #         start: 0.0
+  #         end: 0.02
+  #       lambda_bridge_doa:
+  #         kind: cosine
+  #         unit: epoch
+  #         warmup: 50
+  #         duration: 120
+  #         start: 0.0
+  #         end: 0.05
+  #       lambda_bridge_norm:
+  #         kind: constant
+  #         value: 0.001
+  #       lambda_residual_slot:
+  #         kind: linear
+  #         unit: epoch
+  #         warmup: 40
+  #         duration: 100
+  #         start: 0.0
+  #         end: 0.05
+  #       lambda_mix:
+  #         kind: piecewise_linear
+  #         unit: epoch
+  #         points:
+  #           - [0, 0.0]
+  #           - [40, 0.0]
+  #           - [140, 0.05]
+  #           - [220, 0.05]
+  #           - [250, 0.02]
+  #     # Optional: a fallback schedule for any lambda not listed above.
+  #     # defaults:
+  #     #   kind: constant
+  #     # Optional: multiply every scheduled lambda by this curve, useful for
+  #     # globally ramping the auxiliary loss weight up while keeping ratios
+  #     # fixed. Comment out to disable.
+  #     # global_scale:
+  #     #   kind: cosine
+  #     #   unit: epoch
+  #     #   warmup: 0
+  #     #   duration: 50
+  #     #   start: 0.5
+  #     #   end: 1.0
   trainer:
     module: lightning.pytorch
     main: Trainer
