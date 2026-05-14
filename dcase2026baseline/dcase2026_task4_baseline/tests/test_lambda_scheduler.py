@@ -255,3 +255,189 @@ def test_uss_bridge_loss_shares_lambdas_with_base():
     loss.lambdas["lambda_class_ce"] = 0.1
     assert loss.lambdas["lambda_bridge_proto"] == 0.5
     assert loss.lambdas["lambda_class_ce"] == 0.1
+
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint / resume round-trip
+# ---------------------------------------------------------------------------
+
+
+def _make_scheduler(**overrides):
+    kwargs = dict(
+        schedules={
+            "lambda_class_ce": {
+                "kind": "linear",
+                "warmup": 10,
+                "duration": 10,
+                "start": 0.2,
+                "end": 0.8,
+            },
+            "lambda_doa": {
+                "kind": "cosine",
+                "warmup": 0,
+                "duration": 10,
+                "start": 0.0,
+                "end": 0.05,
+            },
+        },
+        defaults={"kind": "constant", "value": 0.123},
+        global_scale={
+            "kind": "linear",
+            "warmup": 0,
+            "duration": 20,
+            "start": 0.0,
+            "end": 1.0,
+        },
+        strict=True,
+    )
+    kwargs.update(overrides)
+    return LambdaScheduler(**kwargs)
+
+
+def _initial_lambdas():
+    return {
+        "lambda_class_ce": 0.8,
+        "lambda_doa": 0.0,
+        "lambda_extra_unknown": 0.5,
+    }
+
+
+def test_state_dict_includes_originals_last_applied_and_fingerprint():
+    sched = _make_scheduler()
+    pl_mod = _FakePLModule(_initial_lambdas())
+
+    sched.on_fit_start(_FakeTrainer(epoch=0, step=0), pl_mod)
+    sched.on_train_epoch_start(_FakeTrainer(epoch=15, step=0), pl_mod)
+
+    state = sched.state_dict()
+    assert set(state.keys()) == {"original_values", "last_applied", "config_fingerprint"}
+    # Originals are the YAML defaults, NOT the schedule-modified values.
+    assert state["original_values"] == {
+        "lambda_class_ce": 0.8,
+        "lambda_doa": 0.0,
+        "lambda_extra_unknown": 0.5,
+    }
+    # Last applied reflects what the scheduler actually wrote at epoch 15.
+    assert "lambda_class_ce" in state["last_applied"]
+    assert "lambda_doa" in state["last_applied"]
+    assert isinstance(state["config_fingerprint"], str)
+    assert state["config_fingerprint"]  # non-empty
+
+
+def test_resume_uses_loaded_originals_and_recomputes_at_resumed_epoch():
+    # First run: train to epoch 15, capture state.
+    fresh_lambdas = _initial_lambdas()
+    sched1 = _make_scheduler()
+    pl1 = _FakePLModule(fresh_lambdas)
+    sched1.on_fit_start(_FakeTrainer(epoch=0, step=0), pl1)
+    sched1.on_train_epoch_start(_FakeTrainer(epoch=15, step=0), pl1)
+    saved = sched1.state_dict()
+
+    # Second run: same config, but the loss factory was rebuilt and
+    # ``loss_func.lambdas`` is back at YAML defaults. Lightning loads the
+    # callback state BEFORE on_fit_start runs.
+    rebuilt_lambdas = _initial_lambdas()
+    sched2 = _make_scheduler()
+    pl2 = _FakePLModule(rebuilt_lambdas)
+    sched2.load_state_dict(saved)
+    sched2.on_fit_start(_FakeTrainer(epoch=15, step=0), pl2)
+
+    # Originals from the checkpoint are preserved (not overwritten by the
+    # YAML-default snapshot taken on resume).
+    assert sched2._original_values == saved["original_values"]
+    # And the schedule has been re-evaluated for the resumed epoch, so the
+    # values match what the original run would have applied at epoch 15.
+    _aclose(rebuilt_lambdas["lambda_class_ce"], pl1.loss_func.lambdas["lambda_class_ce"])
+    _aclose(rebuilt_lambdas["lambda_doa"], pl1.loss_func.lambdas["lambda_doa"])
+    _aclose(rebuilt_lambdas["lambda_extra_unknown"], pl1.loss_func.lambdas["lambda_extra_unknown"])
+
+
+def test_on_fit_end_restores_originals_only_when_enabled():
+    lambdas = _initial_lambdas()
+    sched = _make_scheduler()
+    pl_mod = _FakePLModule(lambdas)
+    sched.on_fit_start(_FakeTrainer(epoch=0, step=0), pl_mod)
+    # Use a mid-ramp epoch so the schedule definitely produces values
+    # different from the YAML defaults.
+    sched.on_train_epoch_start(_FakeTrainer(epoch=14, step=0), pl_mod)
+    # Mid-training: scheduler has mutated values.
+    assert lambdas["lambda_class_ce"] != pytest.approx(0.8)
+    assert lambdas["lambda_doa"] != pytest.approx(0.0)
+
+    sched.on_fit_end(_FakeTrainer(epoch=14, step=0), pl_mod)
+    # All YAML defaults restored.
+    _aclose(lambdas["lambda_class_ce"], 0.8)
+    _aclose(lambdas["lambda_doa"], 0.0)
+    _aclose(lambdas["lambda_extra_unknown"], 0.5)
+
+    # Now opt out of restoration.
+    lambdas2 = _initial_lambdas()
+    sched_no_restore = _make_scheduler(restore_on_fit_end=False)
+    pl2 = _FakePLModule(lambdas2)
+    sched_no_restore.on_fit_start(_FakeTrainer(epoch=0, step=0), pl2)
+    sched_no_restore.on_train_epoch_start(_FakeTrainer(epoch=14, step=0), pl2)
+    mid = dict(lambdas2)
+    sched_no_restore.on_fit_end(_FakeTrainer(epoch=14, step=0), pl2)
+    assert lambdas2 == mid  # untouched
+
+
+def test_config_fingerprint_changes_with_schedule_changes():
+    sched_a = _make_scheduler()
+    sched_b = _make_scheduler(
+        schedules={
+            "lambda_class_ce": {
+                "kind": "linear",
+                "warmup": 10,
+                "duration": 10,
+                "start": 0.2,
+                "end": 0.9,  # changed end value
+            },
+            "lambda_doa": {
+                "kind": "cosine",
+                "warmup": 0,
+                "duration": 10,
+                "start": 0.0,
+                "end": 0.05,
+            },
+        }
+    )
+    assert sched_a._config_fingerprint() != sched_b._config_fingerprint()
+
+    # Whereas changing only book-keeping flags must NOT affect fingerprint.
+    sched_c = _make_scheduler(strict=False, log_prefix="other_prefix", restore_on_fit_end=False)
+    assert sched_a._config_fingerprint() == sched_c._config_fingerprint()
+
+
+def test_load_state_dict_warns_on_fingerprint_mismatch_but_keeps_originals(caplog):
+    sched1 = _make_scheduler()
+    pl1 = _FakePLModule(_initial_lambdas())
+    sched1.on_fit_start(_FakeTrainer(epoch=0, step=0), pl1)
+    sched1.on_train_epoch_start(_FakeTrainer(epoch=15, step=0), pl1)
+    saved = sched1.state_dict()
+
+    sched2 = _make_scheduler(
+        schedules={
+            "lambda_class_ce": {
+                "kind": "linear",
+                "warmup": 10,
+                "duration": 10,
+                "start": 0.2,
+                "end": 0.9,  # different config
+            },
+        }
+    )
+    with caplog.at_level("INFO"):
+        sched2.load_state_dict(saved)
+    # Originals from the checkpoint are still preserved on mismatch.
+    assert sched2._original_values == saved["original_values"]
+    # And we logged something about the mismatch.
+    assert any("fingerprint" in rec.getMessage().lower() for rec in caplog.records)
+
+
+def test_load_state_dict_handles_empty_or_missing_keys():
+    sched = _make_scheduler()
+    sched.load_state_dict({})  # must not raise
+    assert sched._original_values == {}
+    assert sched._last_applied == {}
+    assert sched._loaded_from_checkpoint is True

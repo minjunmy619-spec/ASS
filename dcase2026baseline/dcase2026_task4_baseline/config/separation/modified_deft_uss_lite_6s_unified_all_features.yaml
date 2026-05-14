@@ -216,6 +216,13 @@ train:
   #   args:
   #     strict: true
   #     log_prefix: lambda_schedule
+  #     # Resume-safe: state is saved into the Lightning checkpoint via
+  #     # ``state_dict`` / ``load_state_dict``. On resume, the callback
+  #     # restores the original YAML-default snapshot and lets Lightning's
+  #     # ``current_epoch`` / ``global_step`` drive the next schedule
+  #     # evaluation. Set restore_on_fit_end: false to keep the final
+  #     # scheduled values in ``loss_func.lambdas`` after training ends.
+  #     restore_on_fit_end: true
   #     schedules:
   #       lambda_class_ce:
   #         kind: linear

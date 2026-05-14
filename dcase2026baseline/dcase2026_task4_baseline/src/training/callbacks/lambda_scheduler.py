@@ -43,8 +43,12 @@ Two top-level conveniences are also supported:
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
+
+_log = logging.getLogger(__name__)
 
 try:
     import lightning.pytorch as pl
@@ -74,6 +78,26 @@ def _coerce_points(points: Sequence[Any]) -> list:
     if not coerced:
         raise ValueError("piecewise schedule requires at least one point")
     return coerced
+
+
+def _normalize_for_fingerprint(value: Any) -> Any:
+    """Convert a schedule spec into JSON-stable scalars for hashing.
+
+    Mappings are dict-ified with sorted keys, sequences become lists, and
+    every scalar is coerced to a JSON-safe primitive. Floats are rounded
+    to a tight tolerance so that load-from-yaml roundtrips compare equal.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return {str(k): _normalize_for_fingerprint(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_fingerprint(v) for v in value]
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return round(float(value), 12)
+    return str(value)
 
 
 class _Schedule:
@@ -204,6 +228,7 @@ class LambdaScheduler(_CallbackBase):
         global_scale: Optional[Mapping[str, Any]] = None,
         log_prefix: str = "lambda_schedule",
         strict: bool = True,
+        restore_on_fit_end: bool = True,
     ):
         super().__init__()
         self.schedules_spec: Dict[str, Mapping[str, Any]] = dict(schedules or {})
@@ -211,13 +236,24 @@ class LambdaScheduler(_CallbackBase):
         self.global_scale_spec: Optional[Mapping[str, Any]] = global_scale
         self.log_prefix = str(log_prefix)
         self.strict = bool(strict)
+        self.restore_on_fit_end = bool(restore_on_fit_end)
 
         # Compiled at on_fit_start so every entry validates eagerly.
         self._compiled: Dict[str, _Schedule] = {}
         self._defaults: Optional[_Schedule] = None
         self._global_scale: Optional[_Schedule] = None
         self._has_step_unit: bool = False
+
+        # Persisted state (covered by state_dict / load_state_dict):
+        # - ``_original_values`` snapshots the YAML-default lambdas captured the
+        #   first time fit started, so we can restore them at fit end.
+        # - ``_last_applied`` records the most recent value the scheduler wrote
+        #   into ``loss_func.lambdas`` for diagnostics / forensics.
+        # - ``_loaded_from_checkpoint`` distinguishes a fresh fit from a resumed
+        #   one so ``on_fit_start`` knows whether to seed ``_original_values``.
         self._original_values: Dict[str, float] = {}
+        self._last_applied: Dict[str, float] = {}
+        self._loaded_from_checkpoint: bool = False
 
     # ------------------------------------------------------------------
     def _resolve_lambdas(self, pl_module) -> Optional[Dict[str, float]]:
@@ -309,6 +345,7 @@ class LambdaScheduler(_CallbackBase):
                 continue
             new_value = self._value_for(name, epoch, step)
             lambdas[name] = new_value
+            self._last_applied[name] = new_value
             try:
                 pl_module.log(
                     f"{self.log_prefix}/{name}",
@@ -359,8 +396,19 @@ class LambdaScheduler(_CallbackBase):
                     "ensure the loss factory exposes its lambda state."
                 )
             return
-        self._original_values = dict(lambdas)
+
+        # Snapshot YAML defaults only the first time this scheduler runs
+        # (a fresh fit). On a resumed fit, ``load_state_dict`` already
+        # populated ``_original_values`` from the checkpoint, so the fresh
+        # ``loss_func.lambdas`` we'd see here reflects YAML defaults but
+        # we want the originals from before training started.
+        if not self._loaded_from_checkpoint and not self._original_values:
+            self._original_values = dict(lambdas)
+
         self._compile(lambdas)
+        # Sanity check: scheduled keys that exist now are validated by
+        # ``_compile``. The originals snapshot may include extra keys that
+        # are still valid; nothing to do.
         self._apply(trainer, pl_module, on_step=False)
 
     def on_train_epoch_start(self, trainer, pl_module):
@@ -371,10 +419,69 @@ class LambdaScheduler(_CallbackBase):
             self._apply(trainer, pl_module, on_step=True)
 
     def on_fit_end(self, trainer, pl_module):
-        # Restore original values so that re-fitting / resuming with a different
-        # schedule starts from a clean slate.
+        if not self.restore_on_fit_end:
+            return
+        # Restore original values so a subsequent fit (e.g. with a different
+        # schedule) starts from a clean slate.
         lambdas = self._resolve_lambdas(pl_module)
         if lambdas is None or not self._original_values:
             return
         for name, value in self._original_values.items():
             lambdas[name] = value
+
+    # ------------------------------------------------------------------
+    # Checkpoint integration
+    # ------------------------------------------------------------------
+    def _config_fingerprint(self) -> str:
+        """Stable hash of the schedule config to detect mismatches on resume.
+
+        The fingerprint covers all knobs that change the trajectory of the
+        lambdas over time. It deliberately ignores ``log_prefix``,
+        ``strict``, and ``restore_on_fit_end``, which are book-keeping flags
+        that don't affect numerical values.
+        """
+        payload = {
+            "schedules": _normalize_for_fingerprint(self.schedules_spec),
+            "defaults": _normalize_for_fingerprint(self.defaults_spec),
+            "global_scale": _normalize_for_fingerprint(self.global_scale_spec),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Persist enough state to faithfully resume from a checkpoint.
+
+        Lightning calls this for every callback whose class name is unique
+        and saves the result inside the checkpoint under
+        ``callbacks[<callback_state_key>]``. ``load_state_dict`` is then
+        invoked before ``on_fit_start`` on resume.
+        """
+        return {
+            "original_values": dict(self._original_values),
+            "last_applied": dict(self._last_applied),
+            "config_fingerprint": self._config_fingerprint(),
+        }
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        if not isinstance(state_dict, Mapping):
+            return
+        self._original_values = {
+            str(k): float(v) for k, v in (state_dict.get("original_values") or {}).items()
+        }
+        self._last_applied = {
+            str(k): float(v) for k, v in (state_dict.get("last_applied") or {}).items()
+        }
+        loaded_fp = state_dict.get("config_fingerprint")
+        current_fp = self._config_fingerprint()
+        if loaded_fp is not None and loaded_fp != current_fp:
+            msg = (
+                "LambdaScheduler config fingerprint changed since the "
+                "checkpoint was saved. The schedule will follow the *new* "
+                "config from this point onward; ``original_values`` from "
+                "the checkpoint are preserved so ``on_fit_end`` can still "
+                "restore them. Set ``strict=False`` to silence this."
+            )
+            if self.strict:
+                _log.warning(msg)
+            else:
+                _log.info(msg)
+        self._loaded_from_checkpoint = True
