@@ -1,0 +1,95 @@
+_base_: ${base_config_path}/train_base.yaml
+
+seed: 2026
+
+sr: 44100
+n_fft: 4096
+hop_length: 1024
+
+n_src: 3
+n_chan: 1
+
+trainer:
+  max_epochs: 150
+  check_val_every_n_epoch: 1
+  gradient_clip_val: 5.0
+  sync_batchnorm: True
+  deterministic: false
+  limit_train_batches: 1354
+  limit_val_batches: 10
+  benchmark: True
+  use_distributed_sampler: False
+  precision: bf16-mixed
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      filename: "{epoch:04d}"
+      save_top_k: 5
+      monitor: validation/loss
+      mode: min
+      save_last: True
+    - _target_: lightning.pytorch.callbacks.RichProgressBar
+      refresh_rate: 5
+    - _target_: lightning.pytorch.callbacks.RichModelSummary
+      max_depth: 3
+
+datamodule:
+  _target_: spectral_feature_compression.common.datamodules.hdf5_wav_datamodule.DataModule
+  train_dataset_path:
+    - ./recipes/dnr/hdf5/tr_speech_seg8sec_sad.hdf5
+    - ./recipes/dnr/hdf5/tr_music_seg8sec_sad.hdf5
+    - ./recipes/dnr/hdf5/tr_sfx_seg8sec_sad.hdf5
+  val_dataset_path: ./recipes/dnr/hdf5/cv_unsegmented.hdf5
+  batch_size: 4
+  val_batch_size: 1
+  sr: ${sr}
+  duration: 6
+  val_duration: null
+  num_workers: 4
+  return_ref: true
+  use_scatter_dataset: false
+  use_dm_dataset: true
+  p_source_dropout: 0.05
+  val_drop_last: false
+
+task:
+  _target_: spectral_feature_compression.core.tasks.sup_task.SupTask
+  n_fft: ${n_fft}
+  hop_length: ${hop_length}
+  css_validation: true
+  ema_weight: 0.999
+  ema_update_freq: 1
+  model:
+    _target_: DolphinSFCNPU.training_wrapper.build_dolphin_sfc_npu_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    scaling: false
+    css_segment_size: 12
+    css_shift_size: 6
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    preset: large_6m
+    band_config: musical
+  loss:
+    _target_: spectral_feature_compression.core.loss.snr.ThresSNRLossWithInactiveSource
+    solve_perm: false
+    n_src: ${n_src}
+    zeroref_weight: 0.1
+    only_denominator: false
+  optimizer_config:
+    _target_: aiaccel.torch.lightning.OptimizerConfig
+    optimizer_generator:
+      _partial_: True
+      _target_: torch.optim.AdamW
+      lr: 1.e-3
+      weight_decay: 1.e-2
+      betas: [0.9, 0.999]
+    scheduler_generator:
+      _partial_: True
+      _target_: spectral_feature_compression.common.lr_schedulers.warmup.WarmUpStepLR
+      warmup_steps: 5000
+      decay_start_step: 150000
+      decay_stop_step: 220000
+      step_size: 1354
+      decay: 0.98
+    scheduler_interval: step

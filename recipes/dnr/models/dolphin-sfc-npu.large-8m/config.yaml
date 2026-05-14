@@ -1,0 +1,5 @@
+_base_: ../dolphin-sfc-npu.large-6m/config.yaml
+
+task:
+  model:
+    preset: large_8m

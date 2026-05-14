@@ -1,0 +1,6 @@
+_base_: ../tf-mlpnet-edge.rt192k/config.yaml
+
+# Large preset (hidden=160, 8 blocks, feature_dim=72). Only enable when the
+# NPU still has headroom; fp32 streaming-state should still stay inside the
+# 192 KiB DSP quota because no KV attention is used.
+tiger_variant: tf-mlpnet-large

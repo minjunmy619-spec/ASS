@@ -1,0 +1,9 @@
+_base_: ../dolphin-sfc-npu.large-6m/config.yaml
+
+# edge_small is intended for structural/export smoke testing. It is
+# still attached to the full DnR training pipeline so teams can verify
+# dataloading + optimizer wiring end-to-end without spending a large
+# training budget.
+task:
+  model:
+    preset: edge_small
