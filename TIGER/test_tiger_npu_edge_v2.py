@@ -17,6 +17,7 @@ import argparse
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -71,6 +72,26 @@ def run_sequence_vs_cell(model: TIGERNPUEdgeV2, subband_spec_ri_seq: torch.Tenso
     return (seq_out - cell_out).abs().max().item()
 
 
+def run_chunk_sizes_parity(
+    model: TIGERNPUEdgeV2, subband_spec_ri_seq: torch.Tensor,
+) -> Tuple[float, float]:
+    """Compare chunk_size=1 (true frame-by-frame) against chunk_size in {4, 8}.
+
+    chunk_size=1 uses ``forward_cell`` so it is the reference.  The larger
+    chunk sizes go through ``_forward_chunk`` and must match within fp32
+    accumulation noise.
+    """
+    model.eval()
+    with torch.no_grad():
+        ref_out, *_ = model.forward_sequence(subband_spec_ri_seq, chunk_size=1)
+        chunk4_out, *_ = model.forward_sequence(subband_spec_ri_seq, chunk_size=4)
+        chunk8_out, *_ = model.forward_sequence(subband_spec_ri_seq, chunk_size=8)
+    return (
+        (ref_out - chunk4_out).abs().max().item(),
+        (ref_out - chunk8_out).abs().max().item(),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate TIGERNPUEdgeV2")
     parser.add_argument("--frames", type=int, default=8)
@@ -119,6 +140,18 @@ def main() -> int:
     if max_diff > 1e-4:
         raise AssertionError(f"Mismatch too large: {max_diff}")
 
+    # Chunked training parity: chunk_size=4 and chunk_size=8 must match
+    # frame-by-frame (chunk_size=1) within fp32 tolerance.  This is what
+    # lets training skip the per-frame Python loop without drifting from
+    # the deployment (T=1) path.
+    chunk4_diff, chunk8_diff = run_chunk_sizes_parity(model, subband)
+    print(f"[chunk-parity] max |c=1 - c=4| = {chunk4_diff:.6e}")
+    print(f"[chunk-parity] max |c=1 - c=8| = {chunk8_diff:.6e}")
+    if chunk4_diff > 1e-4 or chunk8_diff > 1e-4:
+        raise AssertionError(
+            f"Chunked training parity broken: c4={chunk4_diff}, c8={chunk8_diff}"
+        )
+
     # ONNX export
     if not args.skip_onnx:
         args.onnx_out.parent.mkdir(parents=True, exist_ok=True)
@@ -134,7 +167,11 @@ def main() -> int:
         total_nodes = sum(op_counts.values())
         mem_ops = sum(op_counts.get(k, 0)
                       for k in ['Slice', 'Transpose', 'Concat', 'Gather', 'Reshape', 'Unsqueeze'])
-        print(f"[onnx] total nodes: {total_nodes} (V1 was 5524)")
+        # Reference counts: V1 was ~5500 nodes with LayerNorm; the earlier
+        # BatchNorm-V2 hit ~600 nodes but trained badly under T=1.
+        # RMSNorm-V2 emits ~3 extra ops per norm site (~120 sites in the
+        # default config), so the ceiling has been raised accordingly.
+        print(f"[onnx] total nodes: {total_nodes} (V1 was 5524; BN-V2 was ~600)")
         print(f"[onnx] memory ops: {mem_ops} (V1 was 998)")
         print(f"[onnx] ReduceMean: {op_counts.get('ReduceMean', 0)} (V1 was 342)")
         print(f"[onnx] Tile: {op_counts.get('Tile', 0)} (V1 was 32)")
@@ -145,8 +182,10 @@ def main() -> int:
             details = ", ".join(f"{op}={op_counts[op]}" for op in found_forbidden)
             raise AssertionError(f"Forbidden ONNX ops remain: {details}")
 
-        # Fail if graph is still too big
-        if total_nodes > 1000:
+        # Rationale for the 1200 ceiling: BN-V2 exported at ~600 nodes.  Each
+        # of the ~120 norm sites now emits ~3 extra ops, adding ~360 nodes in
+        # the worst case, plus margin for compiler-version drift.
+        if total_nodes > 1200:
             raise AssertionError(f"ONNX graph too large: {total_nodes} nodes")
 
     total_params = sum(p.numel() for p in model.parameters())
