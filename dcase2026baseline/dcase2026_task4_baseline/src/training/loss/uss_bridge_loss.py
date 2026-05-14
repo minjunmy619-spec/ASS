@@ -139,18 +139,51 @@ def get_loss_func(
     residual_ref_channel=0,
     bridge_temperature=0.1,
     lambda_class_match=1.0,
+    lambda_state=None,
     **base_uss_loss_kwargs,
 ):
     """USS loss + opt-in semantic-acoustic bridge objectives.
 
     This wrapper is backward compatible: if the model does not emit bridge keys,
     all bridge losses are zero and the returned main loss equals the base USS loss.
+
+    All scalar ``lambda_*`` weights (both the bridge ones below and the base
+    USS ones forwarded through ``**base_uss_loss_kwargs``) are stored in a
+    single shared mutable dict, exposed as ``loss_func.lambdas``. An external
+    scheduler can mutate any of those values at runtime; each forward call
+    re-reads them from the dict.
     """
-    base_loss_func = get_base_uss_loss_func(**base_uss_loss_kwargs)
+    _initial_lambdas = {
+        "lambda_bridge_proto": float(lambda_bridge_proto),
+        "lambda_bridge_supcon": float(lambda_bridge_supcon),
+        "lambda_bridge_infonce": float(lambda_bridge_infonce),
+        "lambda_bridge_doa": float(lambda_bridge_doa),
+        "lambda_bridge_norm": float(lambda_bridge_norm),
+        "lambda_residual_slot": float(lambda_residual_slot),
+        "lambda_mix": float(lambda_mix),
+        "lambda_class_match": float(lambda_class_match),
+    }
+    if lambda_state is None:
+        lambda_state = dict(_initial_lambdas)
+    else:
+        for _k, _v in _initial_lambdas.items():
+            lambda_state.setdefault(_k, _v)
+
+    base_loss_func = get_base_uss_loss_func(lambda_state=lambda_state, **base_uss_loss_kwargs)
     residual_stft_fft_sizes = tuple(int(x) for x in residual_stft_fft_sizes)
     residual_ref_channel = int(residual_ref_channel)
 
     def loss_func(output, target):
+        # Live lambdas, read every call so the scheduler can mutate them.
+        lambda_bridge_proto = lambda_state["lambda_bridge_proto"]
+        lambda_bridge_supcon = lambda_state["lambda_bridge_supcon"]
+        lambda_bridge_infonce = lambda_state["lambda_bridge_infonce"]
+        lambda_bridge_doa = lambda_state["lambda_bridge_doa"]
+        lambda_bridge_norm = lambda_state["lambda_bridge_norm"]
+        lambda_residual_slot = lambda_state["lambda_residual_slot"]
+        lambda_mix = lambda_state["lambda_mix"]
+        lambda_class_match = lambda_state["lambda_class_match"]
+
         loss_dict = base_loss_func(output, target)
         best_perm, active = _foreground_perm(output, target, lambda_class_match=lambda_class_match)
 
@@ -210,4 +243,5 @@ def get_loss_func(
         )
         return loss_dict
 
+    loss_func.lambdas = lambda_state
     return loss_func

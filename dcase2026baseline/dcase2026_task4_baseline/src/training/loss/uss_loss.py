@@ -288,8 +288,62 @@ def get_loss_func(
     lambda_waveform_anticollapse=0.0,
     spatial_diversity_margin=0.2,
     waveform_anticollapse_margin=0.3,
+    lambda_state=None,
 ):
+    """USS loss factory.
+
+    All scalar ``lambda_*`` weights are stored in a mutable ``lambda_state``
+    dict that is also exposed as ``loss_func.lambdas``. Each forward call
+    reads the current value, so an external scheduler (see
+    ``src.training.callbacks.lambda_scheduler.LambdaScheduler``) can update
+    the dict in-place between training steps without rebuilding the loss.
+
+    If ``lambda_state`` is supplied (e.g. by ``uss_bridge_loss.get_loss_func``)
+    the same dict is shared and only missing keys are seeded from kwargs.
+    """
+    _initial_lambdas = {
+        "lambda_non_foreground": float(lambda_non_foreground),
+        "lambda_class_pit": float(lambda_class_pit),
+        "lambda_class_ce": float(lambda_class_ce),
+        "lambda_kl": float(lambda_kl),
+        "lambda_silence": float(lambda_silence),
+        "lambda_count": float(lambda_count),
+        "lambda_inactive_foreground": float(lambda_inactive_foreground),
+        "lambda_inactive_interference": float(lambda_inactive_interference),
+        "lambda_inactive_noise": float(lambda_inactive_noise),
+        "lambda_residual": float(lambda_residual),
+        "lambda_activity_foreground": float(lambda_activity_foreground),
+        "lambda_activity_interference": float(lambda_activity_interference),
+        "lambda_activity_noise": float(lambda_activity_noise),
+        "lambda_doa": float(lambda_doa),
+        "lambda_spatial_diversity": float(lambda_spatial_diversity),
+        "lambda_waveform_anticollapse": float(lambda_waveform_anticollapse),
+    }
+    if lambda_state is None:
+        lambda_state = dict(_initial_lambdas)
+    else:
+        for _k, _v in _initial_lambdas.items():
+            lambda_state.setdefault(_k, _v)
+
     def loss_func(output, target):
+        # Read live lambda values from the shared dict so a scheduler can
+        # mutate ``loss_func.lambdas`` and have it take effect immediately.
+        lambda_non_foreground = lambda_state["lambda_non_foreground"]
+        lambda_class_pit = lambda_state["lambda_class_pit"]
+        lambda_class_ce = lambda_state["lambda_class_ce"]
+        lambda_kl = lambda_state["lambda_kl"]
+        lambda_silence = lambda_state["lambda_silence"]
+        lambda_count = lambda_state["lambda_count"]
+        lambda_inactive_foreground = lambda_state["lambda_inactive_foreground"]
+        lambda_inactive_interference = lambda_state["lambda_inactive_interference"]
+        lambda_inactive_noise = lambda_state["lambda_inactive_noise"]
+        lambda_residual = lambda_state["lambda_residual"]
+        lambda_activity_foreground = lambda_state["lambda_activity_foreground"]
+        lambda_activity_interference = lambda_state["lambda_activity_interference"]
+        lambda_activity_noise = lambda_state["lambda_activity_noise"]
+        lambda_doa = lambda_state["lambda_doa"]
+        lambda_spatial_diversity = lambda_state["lambda_spatial_diversity"]
+        lambda_waveform_anticollapse = lambda_state["lambda_waveform_anticollapse"]
         device_type = output["foreground_waveform"].device.type
         with torch.autocast(device_type=device_type, enabled=False):
             fg_est = output["foreground_waveform"].float()
@@ -481,4 +535,5 @@ def get_loss_func(
             "loss_noise_activity": loss_noise_activity,
         }
 
+    loss_func.lambdas = lambda_state
     return loss_func
