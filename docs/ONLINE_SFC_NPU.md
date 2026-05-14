@@ -474,6 +474,34 @@ masked packed output is 24,588 bytes in fp16. If the hardware budget counts
 both input and output state tensors plus `x`/`y`, the deployment signature is
 larger than 192 KiB even when the persistent state alone fits.
 
+### Quick GMACs/s check (no ONNX / no Docker)
+
+For a fast parameter-count and realtime GMACs/s readout across every variant
+— TIGER-NPU-Edge v1 & v2, TF-MLPNet, DolphinSFCNPU, BandSCNetNPU — use
+`tools/online/measure_gmacs.py`. It reuses the `BUILDERS` registry and the
+`profile_macs` helper from `measure_npu_model_stats.py` but skips ONNX export
+and MLIR emission, so it runs on a plain Python environment with only PyTorch
+installed and completes in seconds.
+
+```bash
+# Sweep every built-in preset.
+./.venv/bin/python tools/online/measure_gmacs.py
+
+# Measure a single family / preset (same CLI options as the full tool).
+./.venv/bin/python tools/online/measure_gmacs.py --target dolphin --dolphin-preset edge_small
+
+# Substring filter the suite.
+./.venv/bin/python tools/online/measure_gmacs.py --filter band-scnet --filter tiger
+
+# CI / pre-commit guard for AGENT.md rule 15 (params <= 7M, GMACs/s <= 3).
+./.venv/bin/python tools/online/measure_gmacs.py --assert-rule15
+```
+
+`--assert-rule15` prints a plain table and exits non-zero if any model exceeds
+the 7 M parameter or 3 GMACs/s ceilings in AGENT.md rule 15. For a full
+deployment audit (ONNX node counts, MLIR ops, state bytes) continue to use
+`tools/online/measure_npu_model_stats.py` under the Docker toolchain.
+
 ### ONNX to MLIR verification pipeline
 
 Use `tools/online/export_verify_mlir.py` for a pass/fail deployment conversion
