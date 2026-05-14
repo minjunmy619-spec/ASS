@@ -443,23 +443,125 @@ def apply_source_gain_mask_4d(x: torch.Tensor, mask_logits: torch.Tensor, n_src:
 
 
 class DolphinSFCNPUStreamingExportWrapper(nn.Module):
+    """
+    ONNX export wrapper that collapses the nested streaming-state tree of
+    `DolphinSFCNPUSeparator` into a single packed tensor.
+
+    Rationale (see AGENT.md):
+      - rule 14 asks the exported graph to have a small number of input/output
+        parameters. Exposing every leaf cache tensor as its own ONNX input
+        would produce 23 inputs and 23 outputs for the three-scale preset.
+      - The core separator keeps its ergonomic tree-state API for Python
+        callers and training. Only the export boundary is flattened.
+
+    Packed shape convention:
+      * state tensor is 2-D ``(B, total_numel)``. Using 2-D (rather than
+        ``(B, 1, 1, total_numel)``) keeps the graph free from rule-4 batch-dim
+        bookkeeping for this leaf tensor and adds no extra Unsqueeze nodes.
+      * per-leaf ``(C_i, T_i, F_i)`` shapes and offsets are baked in at
+        construction time, so unpack is a static list of ``Slice`` + ``Reshape``
+        ops (both on the NPU-allowed list) and repack is per-leaf ``Reshape``
+        plus one ``Concat``.
+
+    The core ``forward_stream`` API is intentionally untouched; this wrapper is
+    the only place that should be used for ONNX/MLIR export.
+    """
+
     def __init__(self, core: DolphinSFCNPUSeparator, batch_size: int = 1, dtype: torch.dtype = torch.float32):
         super().__init__()
         from spectral_feature_compression.utils.onnx_streaming import flatten_tensor_tree
 
         self.core = core
+        self.batch_size = batch_size
         example_state = core.init_stream_state(batch_size=batch_size, dtype=dtype)
         flat_state, state_spec = flatten_tensor_tree(example_state)
         self.state_spec = state_spec
         self.state_tensor_count = len(flat_state)
 
-    def forward(self, x: torch.Tensor, *flat_state: torch.Tensor):
-        from spectral_feature_compression.utils.onnx_streaming import flatten_tensor_tree, unflatten_tensor_tree
+        per_shapes: list[tuple[int, ...]] = []
+        per_numels: list[int] = []
+        for tensor in flat_state:
+            if tensor.shape[0] != batch_size:
+                raise ValueError(
+                    f"All leaf state tensors must start with batch dim {batch_size}; "
+                    f"got {tuple(tensor.shape)}."
+                )
+            shape_wo_batch = tuple(int(d) for d in tensor.shape[1:])
+            numel = int(tensor.numel() // max(batch_size, 1))
+            if numel == 0:
+                raise ValueError(
+                    "DolphinSFCNPUStreamingExportWrapper does not support zero-sized leaf "
+                    f"state tensors (shape {tuple(tensor.shape)}); such tensors carry no "
+                    "information and break the static `Reshape(-1, ...)` used during unpack. "
+                    "Drop them from the streaming state tree instead."
+                )
+            per_shapes.append(shape_wo_batch)
+            per_numels.append(numel)
+        self.per_shapes: tuple[tuple[int, ...], ...] = tuple(per_shapes)
+        self.per_numels: tuple[int, ...] = tuple(per_numels)
+        self.total_numel: int = sum(per_numels)
 
-        state = unflatten_tensor_tree(flat_state, self.state_spec)
-        y, new_state = self.core.forward_stream(x, state)
-        flat_new_state, _ = flatten_tensor_tree(new_state)
-        return (y, *flat_new_state)
+    # -- internal helpers ----------------------------------------------------
+
+    def _unpack_state(self, packed: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Unpack ``(B, total_numel)`` into the tree of per-leaf state tensors."""
+        from spectral_feature_compression.utils.onnx_streaming import unflatten_tensor_tree
+
+        _runtime_assert(
+            packed.ndim == 2 and int(packed.shape[1]) == self.total_numel,
+            f"Expected packed state shape (B, {self.total_numel}), got {tuple(packed.shape)}",
+        )
+        leaves: list[torch.Tensor] = []
+        offset = 0
+        for numel, shape in zip(self.per_numels, self.per_shapes):
+            # Static slice bounds -> ONNX ``Slice``; fixed reshape with ``-1`` for
+            # the batch dim -> a single ``Reshape`` with a constant shape tensor.
+            chunk = packed[:, offset : offset + numel]
+            leaves.append(chunk.reshape((-1,) + shape))
+            offset += numel
+        return unflatten_tensor_tree(tuple(leaves), self.state_spec)
+
+    def _pack_state(self, state_tree) -> torch.Tensor:
+        """Pack the tree of per-leaf state tensors back into ``(B, total_numel)``."""
+        from spectral_feature_compression.utils.onnx_streaming import flatten_tensor_tree
+
+        flat, _ = flatten_tensor_tree(state_tree)
+        _runtime_assert(
+            len(flat) == self.state_tensor_count,
+            f"State tree has {len(flat)} leaves but {self.state_tensor_count} were expected.",
+        )
+        # ``flatten(start_dim=1)`` lowers to a single ``Reshape`` per leaf,
+        # then one ``Concat`` over dim=1 produces the packed state.
+        flat_2d = [torch.flatten(t, start_dim=1) for t in flat]
+        return torch.cat(flat_2d, dim=1)
+
+    # -- public API ----------------------------------------------------------
+
+    def forward(self, x: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        state_tree = self._unpack_state(state)
+        y, new_state_tree = self.core.forward_stream(x, state_tree)
+        packed_new_state = self._pack_state(new_state_tree)
+        return y, packed_new_state
+
+    def init_packed_state(
+        self,
+        batch_size: int | None = None,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """Return a zero packed state compatible with :meth:`forward`."""
+        b = batch_size if batch_size is not None else self.batch_size
+        state_tree = self.core.init_stream_state(batch_size=b, device=device, dtype=dtype)
+        return self._pack_state(state_tree)
+
+    def pack_state(self, state_tree) -> torch.Tensor:
+        """Public helper to convert a tree-state into the packed ONNX layout."""
+        return self._pack_state(state_tree)
+
+    def unpack_state(self, packed: torch.Tensor):
+        """Public helper to convert a packed state back into the tree layout."""
+        return self._unpack_state(packed)
 
 
 def build_dolphin_sfc_npu_preset(
