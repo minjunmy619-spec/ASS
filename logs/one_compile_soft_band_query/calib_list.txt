@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/one_compile_soft_band_query/calib_000.npy

@@ -361,7 +361,12 @@ def main():
     parser.add_argument("--n-chan", type=int, required=True, help="Number of audio channels M")
     parser.add_argument("--frames", type=int, default=64, help="Fixed number of frames T for export")
     parser.add_argument("--freqs", type=int, default=None, help="Fixed number of frequency bins F for export")
-    parser.add_argument("--opset", type=int, default=11, help="ONNX opset version")
+    parser.add_argument(
+        "--opset",
+        type=int,
+        default=14,
+        help="ONNX opset version for current NPU flow (supported range: 11~14).",
+    )
     parser.add_argument("--check", action="store_true", help="Run onnx.checker.check_model after export")
     parser.add_argument(
         "--streaming",
@@ -418,6 +423,10 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.opset < 11 or args.opset > 14:
+        raise ValueError(
+            f"Unsupported opset {args.opset}. Current NPU compilation supports ONNX opset 11~14 only."
+        )
 
     core, source_mode = load_export_core(args.model_path, args.device)
     frequency_preprocess_meta = load_frequency_preprocess_metadata(args.model_path)
@@ -502,6 +511,7 @@ def main():
         output_names=output_names,
         dynamic_axes=None,
         keep_initializers_as_inputs=args.keep_initializers_as_inputs,
+        dynamo=False
     )
 
     onnx_model = onnx.load(args.out)
@@ -601,6 +611,7 @@ def main():
     print(f"Source mode: {source_mode}")
     print(f"Core: {type(core).__name__}")
     print(f"Opset: {args.opset}")
+    print("Dynamo exporter: False")
     print(f"Streaming export: {args.streaming}")
     print(f"Masking inside graph: {not args.disable_masking}")
     print(f"Keep initializers as inputs: {args.keep_initializers_as_inputs}")

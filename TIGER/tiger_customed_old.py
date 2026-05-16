@@ -787,28 +787,28 @@ class AdaptiveAvgPool2DOnLastDim(nn.Module):
         if x.shape[-1] < output_size[-1]:
             shape_x = x.shape
             pad_size = output_size[-1] - shape_x[-1]
-            paddzero = torch.zeros((shape_x[0], shape_x[1], shape_x[2], pad_size), device=x.device)
-            x = F.interpolate(x, output_size, mode="bilinear")
+            # paddzero = torch.zeros((shape_x[0], shape_x[1], shape_x[2], pad_size), device=x.device)
+            # x = F.interpolate(x, output_size, mode="bilinear")
             # x = x.repeat(1, 1, 1, output_size[-1])
             # xx = torch.cat((x, paddzero), axis=-1)
             # x = torch.cat((x, x.clone()), axis=-1)
             # print(f"AdaptiveAvgPool2DOnLastDim H padding :{pad_size}=> x {x.shape} => xx: {xx.shape} => xy: {xy.shape}  => yy: {yy.shape}")
 
-            # x = F.pad(x, (0, pad_size, 0, 0), mode='constant', value=x.mean().item())
+            x = F.pad(x, (0, pad_size, 0, 0), mode='constant', value=x.mean().item())
             # x = F.pad(x, (0, pad_size, 0, 0), mode='constant', value=0.0)
 
         ####padd on height
         if x.shape[-2] < output_size[-2]:
             shape_x = x.shape
             pad_size = output_size[-2] - shape_x[-2]
-            paddzero = torch.zeros((shape_x[0], shape_x[1], pad_size, shape_x[3]), device=x.device)
-            x = F.interpolate(x, output_size, mode="bilinear")
+            # paddzero = torch.zeros((shape_x[0], shape_x[1], pad_size, shape_x[3]), device=x.device)
+            # x = F.interpolate(x, output_size, mode="bilinear")
             # x = x.repeat(1, 1, output_size[-2], 1)
             # xx = torch.cat((x, paddzero), axis=-2)
             # xy = torch.cat((x, x.clone()), axis=-2)
             # print(f"AdaptiveAvgPool2DOnLastDim H padding :{pad_size}=> x {x.shape} => xx: {xx.shape} => xy: {xy.shape}  => yy: {yy.shape}")
 
-            # x = F.pad(x, (0, 0, 0, pad_size), mode='constant', value=x.mean().item())
+            x = F.pad(x, (0, 0, 0, pad_size), mode='constant', value=x.mean().item())
             # x = F.pad(x, (0, 0, 0, pad_size), mode='constant', value=0.0)
         if x.shape[-2]==output_size[-2] and x.shape[-1]==output_size[-1]:
             return x

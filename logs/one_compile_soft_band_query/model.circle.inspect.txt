@@ -1,0 +1,1095 @@
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+MUL
+ADD
+SOFTMAX
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+TRANSPOSE
+TRANSPOSE
+RESHAPE
+RESHAPE
+TRANSPOSE
+FULLY_CONNECTED
+RESHAPE
+TRANSPOSE
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+TRANSPOSE
+RESHAPE
+RESHAPE
+TRANSPOSE
+FULLY_CONNECTED
+RESHAPE
+TRANSPOSE
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+STRIDED_SLICE
+STRIDED_SLICE
+LOGISTIC
+MUL
+CONCATENATION
+STRIDED_SLICE
+PAD
+TRANSPOSE
+DEPTHWISE_CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+ADD
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+MUL
+MEAN
+ADD
+RSQRT
+MUL
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+CONCATENATION
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+LOGISTIC
+MUL
+ADD
+TRANSPOSE
+ADD
+MUL
+TRANSPOSE
+SUM
+TRANSPOSE
+ADD
+DIV
+MUL
+ADD
+TRANSPOSE
+RESHAPE
+TRANSPOSE
+RESHAPE
+TRANSPOSE
+FULLY_CONNECTED
+RESHAPE
+TRANSPOSE
+TRANSPOSE
+CONV_2D
+TRANSPOSE
+arg0 FLOAT32
+arg1 FLOAT32
+arg2 FLOAT32
+arg3 FLOAT32
+arg4 FLOAT32
+arg5 FLOAT32
+arg6 FLOAT32
+arg7 FLOAT32
+arg8 FLOAT32
+arg9 FLOAT32
+arg10 FLOAT32
+arg11 FLOAT32
+arg12 FLOAT32
+arg13 FLOAT32
+Circle.pseudo_const INT32
+Circle.pseudo_const1 INT32
+Circle.pseudo_const2 INT32
+Circle.pseudo_const3 INT32
+Circle.pseudo_const4 FLOAT32
+Circle.pseudo_const5 FLOAT32
+Circle.pseudo_const6 FLOAT32
+Circle.pseudo_const7 FLOAT32
+Circle.pseudo_const8 FLOAT32
+Circle.pseudo_const9 FLOAT32
+Circle.pseudo_const10 FLOAT32
+Circle.pseudo_const11 FLOAT32
+Circle.pseudo_const12 FLOAT32
+Circle.pseudo_const13 FLOAT32
+Circle.pseudo_const14 FLOAT32
+Circle.pseudo_const15 FLOAT32
+Circle.pseudo_const16 FLOAT32
+Circle.pseudo_const17 FLOAT32
+Circle.pseudo_const18 FLOAT32
+Circle.pseudo_const19 FLOAT32
+Circle.pseudo_const20 FLOAT32
+Circle.pseudo_const21 FLOAT32
+Circle.pseudo_const22 FLOAT32
+Circle.pseudo_const23 FLOAT32
+Circle.pseudo_const24 FLOAT32
+Circle.pseudo_const25 FLOAT32
+Circle.pseudo_const26 FLOAT32
+Circle.pseudo_const27 FLOAT32
+Circle.pseudo_const28 FLOAT32
+Circle.pseudo_const29 FLOAT32
+Circle.pseudo_const30 FLOAT32
+Circle.pseudo_const31 FLOAT32
+Circle.pseudo_const32 FLOAT32
+Circle.pseudo_const33 FLOAT32
+Circle.pseudo_const34 FLOAT32
+Circle.pseudo_const35 FLOAT32
+Circle.pseudo_const36 FLOAT32
+Circle.pseudo_const37 FLOAT32
+Circle.pseudo_const38 FLOAT32
+Circle.pseudo_const39 FLOAT32
+Circle.pseudo_const40 FLOAT32
+Circle.pseudo_const41 FLOAT32
+Circle.pseudo_const42 FLOAT32
+Circle.pseudo_const43 FLOAT32
+Circle.pseudo_const44 INT32
+Circle.pseudo_const45 INT32
+Circle.pseudo_const46 INT32
+Circle.pseudo_const47 INT32
+Circle.pseudo_const48 FLOAT32
+Circle.pseudo_const49 FLOAT32
+Circle.pseudo_const50 FLOAT32
+Circle.pseudo_const51 FLOAT32
+Circle.pseudo_const52 FLOAT32
+Circle.pseudo_const53 FLOAT32
+Circle.pseudo_const54 FLOAT32
+Circle.pseudo_const55 INT32
+Circle.pseudo_const56 INT32
+Circle.pseudo_const57 INT32
+Circle.pseudo_const58 INT32
+Circle.pseudo_const59 INT32
+Circle.pseudo_const60 INT32
+Circle.pseudo_const61 INT32
+Circle.pseudo_const62 INT32
+Circle.pseudo_const63 INT32
+Circle.pseudo_const64 INT32
+Circle.pseudo_const65 INT32
+Circle.pseudo_const66 INT32
+Circle.pseudo_const67 INT32
+Circle.pseudo_const68 FLOAT32
+Circle.pseudo_const69 FLOAT32
+Initializer_core.in_proj.0.bias FLOAT32
+Initializer_core.compressor.pw.bias FLOAT32
+Initializer_core.compressor.dw.conv.bias FLOAT32
+Initializer_core.compressor.score.bias FLOAT32
+Initializer_core.compressor.value.bias FLOAT32
+Initializer_core.compressor.query.bias FLOAT32
+Initializer_core.separator.0.pw1.bias FLOAT32
+Initializer_core.separator.0.dw.conv.bias FLOAT32
+Initializer_core.separator.0.pw2.bias FLOAT32
+Initializer_core.separator.1.pw1.bias FLOAT32
+Initializer_core.separator.1.dw.conv.bias FLOAT32
+Initializer_core.separator.1.pw2.bias FLOAT32
+Initializer_core.separator.2.pw1.bias FLOAT32
+Initializer_core.separator.2.dw.conv.bias FLOAT32
+Initializer_core.separator.2.pw2.bias FLOAT32
+Initializer_core.separator.3.pw1.bias FLOAT32
+Initializer_core.separator.3.dw.conv.bias FLOAT32
+Initializer_core.separator.3.pw2.bias FLOAT32
+Initializer_core.separator.4.pw1.bias FLOAT32
+Initializer_core.separator.4.dw.conv.bias FLOAT32
+Initializer_core.separator.4.pw2.bias FLOAT32
+Initializer_core.separator.5.pw1.bias FLOAT32
+Initializer_core.separator.5.dw.conv.bias FLOAT32
+Initializer_core.separator.5.pw2.bias FLOAT32
+Initializer_core.separator.6.pw1.bias FLOAT32
+Initializer_core.separator.6.dw.conv.bias FLOAT32
+Initializer_core.separator.6.pw2.bias FLOAT32
+Initializer_core.separator.7.pw1.bias FLOAT32
+Initializer_core.separator.7.dw.conv.bias FLOAT32
+Initializer_core.separator.7.pw2.bias FLOAT32
+Initializer_core.separator.8.pw1.bias FLOAT32
+Initializer_core.separator.8.dw.conv.bias FLOAT32
+Initializer_core.separator.8.pw2.bias FLOAT32
+Initializer_core.separator.9.pw1.bias FLOAT32
+Initializer_core.separator.9.dw.conv.bias FLOAT32
+Initializer_core.separator.9.pw2.bias FLOAT32
+Initializer_core.separator.10.pw1.bias FLOAT32
+Initializer_core.separator.10.dw.conv.bias FLOAT32
+Initializer_core.separator.10.pw2.bias FLOAT32
+Initializer_core.separator.11.pw1.bias FLOAT32
+Initializer_core.separator.11.dw.conv.bias FLOAT32
+Initializer_core.separator.11.pw2.bias FLOAT32
+Initializer_core.expander.expansion_basis FLOAT32
+Initializer_core.expander.latent_pre.1.bias FLOAT32
+Initializer_core.expander.query_pre.1.bias FLOAT32
+Initializer_core.expander.fuse.0.bias FLOAT32
+Initializer_core.expander.band_gain.bias FLOAT32
+Initializer_core.out_proj.bias FLOAT32
+Initializer_onnx::Mul_998 FLOAT32
+Initializer_onnx::Add_1004 FLOAT32
+Circle.pseudo_const70 INT32
+/in_proj/in_proj.0/Conv/pre_tr FLOAT32
+/in_proj/in_proj.0/Conv FLOAT32
+/in_proj/in_proj.0/Conv/post_tr FLOAT32
+/in_proj/in_proj.1/Mul FLOAT32
+/in_proj/in_proj.1/ReduceMean FLOAT32
+/in_proj/in_proj.1/Add FLOAT32
+/in_proj/in_proj.1/Div FLOAT32
+/in_proj/in_proj.1/Mul_1 FLOAT32
+/in_proj/in_proj.1/Mul_2 FLOAT32
+/norm/Mul FLOAT32
+/norm/ReduceMean FLOAT32
+/norm/Add FLOAT32
+/norm/Div FLOAT32
+/norm/Mul_1 FLOAT32
+/norm/Mul_2 FLOAT32
+/pw/Conv/pre_tr FLOAT32
+/pw/Conv FLOAT32
+/pw/Conv/post_tr FLOAT32
+/Concat FLOAT32
+/Slice FLOAT32
+/conv/Conv/pads FLOAT32
+/conv/Conv/pre_tr FLOAT32
+/conv/Conv FLOAT32
+/conv/Conv/post_tr FLOAT32
+/Sigmoid FLOAT32
+/Mul FLOAT32
+/score/Conv/pre_tr FLOAT32
+/score/Conv FLOAT32
+/score/Conv/post_tr FLOAT32
+/Mul_1 FLOAT32
+/Add FLOAT32
+/Softmax FLOAT32
+/value/Conv/pre_tr FLOAT32
+/value/Conv FLOAT32
+/value/Conv/post_tr FLOAT32
+/Transpose FLOAT32
+/Transpose_1 FLOAT32
+/Reshape_1 FLOAT32
+/MatMul/reshape FLOAT32
+/MatMul/tr FLOAT32
+/MatMul FLOAT32
+/Reshape_2 FLOAT32
+/Transpose_2 FLOAT32
+/query/Conv/pre_tr FLOAT32
+/query/Conv FLOAT32
+/query/Conv/post_tr FLOAT32
+/Transpose_3 FLOAT32
+/Reshape_4 FLOAT32
+/MatMul_1/reshape FLOAT32
+/MatMul_1/tr FLOAT32
+/MatMul_1 FLOAT32
+/Reshape_5 FLOAT32
+/Transpose_4 FLOAT32
+/norm1/Mul FLOAT32
+/norm1/ReduceMean FLOAT32
+/norm1/Add FLOAT32
+/norm1/Div FLOAT32
+/norm1/Mul_1 FLOAT32
+/norm1/Mul_2 FLOAT32
+/pw1/Conv/pre_tr FLOAT32
+/pw1/Conv FLOAT32
+/pw1/Conv/post_tr FLOAT32
+/Slice_1 FLOAT32
+/Slice_2 FLOAT32
+/Sigmoid_1 FLOAT32
+/Mul_4 FLOAT32
+/Concat_1 FLOAT32
+/Slice_3 FLOAT32
+/conv_1/Conv/pads FLOAT32
+/conv_1/Conv/pre_tr FLOAT32
+/conv_1/Conv FLOAT32
+/conv_1/Conv/post_tr FLOAT32
+/Sigmoid_2 FLOAT32
+/Mul_5 FLOAT32
+/pw2/Conv/pre_tr FLOAT32
+/pw2/Conv FLOAT32
+/pw2/Conv/post_tr FLOAT32
+/Add_2 FLOAT32
+/norm2/Mul FLOAT32
+/norm2/ReduceMean FLOAT32
+/norm2/Add FLOAT32
+/norm2/Div FLOAT32
+/norm2/Mul_1 FLOAT32
+/norm2/Mul_2 FLOAT32
+/norm1_1/Mul FLOAT32
+/norm1_1/ReduceMean FLOAT32
+/norm1_1/Add FLOAT32
+/norm1_1/Div FLOAT32
+/norm1_1/Mul_1 FLOAT32
+/norm1_1/Mul_2 FLOAT32
+/pw1_1/Conv/pre_tr FLOAT32
+/pw1_1/Conv FLOAT32
+/pw1_1/Conv/post_tr FLOAT32
+/Slice_4 FLOAT32
+/Slice_5 FLOAT32
+/Sigmoid_3 FLOAT32
+/Mul_8 FLOAT32
+/Concat_2 FLOAT32
+/Slice_6 FLOAT32
+/conv_2/Conv/pads FLOAT32
+/conv_2/Conv/pre_tr FLOAT32
+/conv_2/Conv FLOAT32
+/conv_2/Conv/post_tr FLOAT32
+/Sigmoid_4 FLOAT32
+/Mul_9 FLOAT32
+/pw2_1/Conv/pre_tr FLOAT32
+/pw2_1/Conv FLOAT32
+/pw2_1/Conv/post_tr FLOAT32
+/Add_4 FLOAT32
+/norm2_1/Mul FLOAT32
+/norm2_1/ReduceMean FLOAT32
+/norm2_1/Add FLOAT32
+/norm2_1/Div FLOAT32
+/norm2_1/Mul_1 FLOAT32
+/norm2_1/Mul_2 FLOAT32
+/norm1_2/Mul FLOAT32
+/norm1_2/ReduceMean FLOAT32
+/norm1_2/Add FLOAT32
+/norm1_2/Div FLOAT32
+/norm1_2/Mul_1 FLOAT32
+/norm1_2/Mul_2 FLOAT32
+/pw1_2/Conv/pre_tr FLOAT32
+/pw1_2/Conv FLOAT32
+/pw1_2/Conv/post_tr FLOAT32
+/Slice_7 FLOAT32
+/Slice_8 FLOAT32
+/Sigmoid_5 FLOAT32
+/Mul_12 FLOAT32
+/Concat_3 FLOAT32
+/Slice_9 FLOAT32
+/conv_3/Conv/pads FLOAT32
+/conv_3/Conv/pre_tr FLOAT32
+/conv_3/Conv FLOAT32
+/conv_3/Conv/post_tr FLOAT32
+/Sigmoid_6 FLOAT32
+/Mul_13 FLOAT32
+/pw2_2/Conv/pre_tr FLOAT32
+/pw2_2/Conv FLOAT32
+/pw2_2/Conv/post_tr FLOAT32
+/Add_6 FLOAT32
+/norm2_2/Mul FLOAT32
+/norm2_2/ReduceMean FLOAT32
+/norm2_2/Add FLOAT32
+/norm2_2/Div FLOAT32
+/norm2_2/Mul_1 FLOAT32
+/norm2_2/Mul_2 FLOAT32
+/norm1_3/Mul FLOAT32
+/norm1_3/ReduceMean FLOAT32
+/norm1_3/Add FLOAT32
+/norm1_3/Div FLOAT32
+/norm1_3/Mul_1 FLOAT32
+/norm1_3/Mul_2 FLOAT32
+/pw1_3/Conv/pre_tr FLOAT32
+/pw1_3/Conv FLOAT32
+/pw1_3/Conv/post_tr FLOAT32
+/Slice_10 FLOAT32
+/Slice_11 FLOAT32
+/Sigmoid_7 FLOAT32
+/Mul_16 FLOAT32
+/Concat_4 FLOAT32
+/Slice_12 FLOAT32
+/conv_4/Conv/pads FLOAT32
+/conv_4/Conv/pre_tr FLOAT32
+/conv_4/Conv FLOAT32
+/conv_4/Conv/post_tr FLOAT32
+/Sigmoid_8 FLOAT32
+/Mul_17 FLOAT32
+/pw2_3/Conv/pre_tr FLOAT32
+/pw2_3/Conv FLOAT32
+/pw2_3/Conv/post_tr FLOAT32
+/Add_8 FLOAT32
+/norm2_3/Mul FLOAT32
+/norm2_3/ReduceMean FLOAT32
+/norm2_3/Add FLOAT32
+/norm2_3/Div FLOAT32
+/norm2_3/Mul_1 FLOAT32
+/norm2_3/Mul_2 FLOAT32
+/norm1_4/Mul FLOAT32
+/norm1_4/ReduceMean FLOAT32
+/norm1_4/Add FLOAT32
+/norm1_4/Div FLOAT32
+/norm1_4/Mul_1 FLOAT32
+/norm1_4/Mul_2 FLOAT32
+/pw1_4/Conv/pre_tr FLOAT32
+/pw1_4/Conv FLOAT32
+/pw1_4/Conv/post_tr FLOAT32
+/Slice_13 FLOAT32
+/Slice_14 FLOAT32
+/Sigmoid_9 FLOAT32
+/Mul_20 FLOAT32
+/Concat_5 FLOAT32
+/Slice_15 FLOAT32
+/conv_5/Conv/pads FLOAT32
+/conv_5/Conv/pre_tr FLOAT32
+/conv_5/Conv FLOAT32
+/conv_5/Conv/post_tr FLOAT32
+/Sigmoid_10 FLOAT32
+/Mul_21 FLOAT32
+/pw2_4/Conv/pre_tr FLOAT32
+/pw2_4/Conv FLOAT32
+/pw2_4/Conv/post_tr FLOAT32
+/Add_10 FLOAT32
+/norm2_4/Mul FLOAT32
+/norm2_4/ReduceMean FLOAT32
+/norm2_4/Add FLOAT32
+/norm2_4/Div FLOAT32
+/norm2_4/Mul_1 FLOAT32
+/norm2_4/Mul_2 FLOAT32
+/norm1_5/Mul FLOAT32
+/norm1_5/ReduceMean FLOAT32
+/norm1_5/Add FLOAT32
+/norm1_5/Div FLOAT32
+/norm1_5/Mul_1 FLOAT32
+/norm1_5/Mul_2 FLOAT32
+/pw1_5/Conv/pre_tr FLOAT32
+/pw1_5/Conv FLOAT32
+/pw1_5/Conv/post_tr FLOAT32
+/Slice_16 FLOAT32
+/Slice_17 FLOAT32
+/Sigmoid_11 FLOAT32
+/Mul_24 FLOAT32
+/Concat_6 FLOAT32
+/Slice_18 FLOAT32
+/conv_6/Conv/pads FLOAT32
+/conv_6/Conv/pre_tr FLOAT32
+/conv_6/Conv FLOAT32
+/conv_6/Conv/post_tr FLOAT32
+/Sigmoid_12 FLOAT32
+/Mul_25 FLOAT32
+/pw2_5/Conv/pre_tr FLOAT32
+/pw2_5/Conv FLOAT32
+/pw2_5/Conv/post_tr FLOAT32
+/Add_12 FLOAT32
+/norm2_5/Mul FLOAT32
+/norm2_5/ReduceMean FLOAT32
+/norm2_5/Add FLOAT32
+/norm2_5/Div FLOAT32
+/norm2_5/Mul_1 FLOAT32
+/norm2_5/Mul_2 FLOAT32
+/norm1_6/Mul FLOAT32
+/norm1_6/ReduceMean FLOAT32
+/norm1_6/Add FLOAT32
+/norm1_6/Div FLOAT32
+/norm1_6/Mul_1 FLOAT32
+/norm1_6/Mul_2 FLOAT32
+/pw1_6/Conv/pre_tr FLOAT32
+/pw1_6/Conv FLOAT32
+/pw1_6/Conv/post_tr FLOAT32
+/Slice_19 FLOAT32
+/Slice_20 FLOAT32
+/Sigmoid_13 FLOAT32
+/Mul_28 FLOAT32
+/Concat_7 FLOAT32
+/Slice_21 FLOAT32
+/conv_7/Conv/pads FLOAT32
+/conv_7/Conv/pre_tr FLOAT32
+/conv_7/Conv FLOAT32
+/conv_7/Conv/post_tr FLOAT32
+/Sigmoid_14 FLOAT32
+/Mul_29 FLOAT32
+/pw2_6/Conv/pre_tr FLOAT32
+/pw2_6/Conv FLOAT32
+/pw2_6/Conv/post_tr FLOAT32
+/Add_14 FLOAT32
+/norm2_6/Mul FLOAT32
+/norm2_6/ReduceMean FLOAT32
+/norm2_6/Add FLOAT32
+/norm2_6/Div FLOAT32
+/norm2_6/Mul_1 FLOAT32
+/norm2_6/Mul_2 FLOAT32
+/norm1_7/Mul FLOAT32
+/norm1_7/ReduceMean FLOAT32
+/norm1_7/Add FLOAT32
+/norm1_7/Div FLOAT32
+/norm1_7/Mul_1 FLOAT32
+/norm1_7/Mul_2 FLOAT32
+/pw1_7/Conv/pre_tr FLOAT32
+/pw1_7/Conv FLOAT32
+/pw1_7/Conv/post_tr FLOAT32
+/Slice_22 FLOAT32
+/Slice_23 FLOAT32
+/Sigmoid_15 FLOAT32
+/Mul_32 FLOAT32
+/Concat_8 FLOAT32
+/Slice_24 FLOAT32
+/conv_8/Conv/pads FLOAT32
+/conv_8/Conv/pre_tr FLOAT32
+/conv_8/Conv FLOAT32
+/conv_8/Conv/post_tr FLOAT32
+/Sigmoid_16 FLOAT32
+/Mul_33 FLOAT32
+/pw2_7/Conv/pre_tr FLOAT32
+/pw2_7/Conv FLOAT32
+/pw2_7/Conv/post_tr FLOAT32
+/Add_16 FLOAT32
+/norm2_7/Mul FLOAT32
+/norm2_7/ReduceMean FLOAT32
+/norm2_7/Add FLOAT32
+/norm2_7/Div FLOAT32
+/norm2_7/Mul_1 FLOAT32
+/norm2_7/Mul_2 FLOAT32
+/norm1_8/Mul FLOAT32
+/norm1_8/ReduceMean FLOAT32
+/norm1_8/Add FLOAT32
+/norm1_8/Div FLOAT32
+/norm1_8/Mul_1 FLOAT32
+/norm1_8/Mul_2 FLOAT32
+/pw1_8/Conv/pre_tr FLOAT32
+/pw1_8/Conv FLOAT32
+/pw1_8/Conv/post_tr FLOAT32
+/Slice_25 FLOAT32
+/Slice_26 FLOAT32
+/Sigmoid_17 FLOAT32
+/Mul_36 FLOAT32
+/Concat_9 FLOAT32
+/Slice_27 FLOAT32
+/conv_9/Conv/pads FLOAT32
+/conv_9/Conv/pre_tr FLOAT32
+/conv_9/Conv FLOAT32
+/conv_9/Conv/post_tr FLOAT32
+/Sigmoid_18 FLOAT32
+/Mul_37 FLOAT32
+/pw2_8/Conv/pre_tr FLOAT32
+/pw2_8/Conv FLOAT32
+/pw2_8/Conv/post_tr FLOAT32
+/Add_18 FLOAT32
+/norm2_8/Mul FLOAT32
+/norm2_8/ReduceMean FLOAT32
+/norm2_8/Add FLOAT32
+/norm2_8/Div FLOAT32
+/norm2_8/Mul_1 FLOAT32
+/norm2_8/Mul_2 FLOAT32
+/norm1_9/Mul FLOAT32
+/norm1_9/ReduceMean FLOAT32
+/norm1_9/Add FLOAT32
+/norm1_9/Div FLOAT32
+/norm1_9/Mul_1 FLOAT32
+/norm1_9/Mul_2 FLOAT32
+/pw1_9/Conv/pre_tr FLOAT32
+/pw1_9/Conv FLOAT32
+/pw1_9/Conv/post_tr FLOAT32
+/Slice_28 FLOAT32
+/Slice_29 FLOAT32
+/Sigmoid_19 FLOAT32
+/Mul_40 FLOAT32
+/Concat_10 FLOAT32
+/Slice_30 FLOAT32
+/conv_10/Conv/pads FLOAT32
+/conv_10/Conv/pre_tr FLOAT32
+/conv_10/Conv FLOAT32
+/conv_10/Conv/post_tr FLOAT32
+/Sigmoid_20 FLOAT32
+/Mul_41 FLOAT32
+/pw2_9/Conv/pre_tr FLOAT32
+/pw2_9/Conv FLOAT32
+/pw2_9/Conv/post_tr FLOAT32
+/Add_20 FLOAT32
+/norm2_9/Mul FLOAT32
+/norm2_9/ReduceMean FLOAT32
+/norm2_9/Add FLOAT32
+/norm2_9/Div FLOAT32
+/norm2_9/Mul_1 FLOAT32
+/norm2_9/Mul_2 FLOAT32
+/norm1_10/Mul FLOAT32
+/norm1_10/ReduceMean FLOAT32
+/norm1_10/Add FLOAT32
+/norm1_10/Div FLOAT32
+/norm1_10/Mul_1 FLOAT32
+/norm1_10/Mul_2 FLOAT32
+/pw1_10/Conv/pre_tr FLOAT32
+/pw1_10/Conv FLOAT32
+/pw1_10/Conv/post_tr FLOAT32
+/Slice_31 FLOAT32
+/Slice_32 FLOAT32
+/Sigmoid_21 FLOAT32
+/Mul_44 FLOAT32
+/Concat_11 FLOAT32
+/Slice_33 FLOAT32
+/conv_11/Conv/pads FLOAT32
+/conv_11/Conv/pre_tr FLOAT32
+/conv_11/Conv FLOAT32
+/conv_11/Conv/post_tr FLOAT32
+/Sigmoid_22 FLOAT32
+/Mul_45 FLOAT32
+/pw2_10/Conv/pre_tr FLOAT32
+/pw2_10/Conv FLOAT32
+/pw2_10/Conv/post_tr FLOAT32
+/Add_22 FLOAT32
+/norm2_10/Mul FLOAT32
+/norm2_10/ReduceMean FLOAT32
+/norm2_10/Add FLOAT32
+/norm2_10/Div FLOAT32
+/norm2_10/Mul_1 FLOAT32
+/norm2_10/Mul_2 FLOAT32
+/norm1_11/Mul FLOAT32
+/norm1_11/ReduceMean FLOAT32
+/norm1_11/Add FLOAT32
+/norm1_11/Div FLOAT32
+/norm1_11/Mul_1 FLOAT32
+/norm1_11/Mul_2 FLOAT32
+/pw1_11/Conv/pre_tr FLOAT32
+/pw1_11/Conv FLOAT32
+/pw1_11/Conv/post_tr FLOAT32
+/Slice_34 FLOAT32
+/Slice_35 FLOAT32
+/Sigmoid_23 FLOAT32
+/Mul_48 FLOAT32
+/Concat_12 FLOAT32
+/Slice_36 FLOAT32
+/conv_12/Conv/pads FLOAT32
+/conv_12/Conv/pre_tr FLOAT32
+/conv_12/Conv FLOAT32
+/conv_12/Conv/post_tr FLOAT32
+/Sigmoid_24 FLOAT32
+/Mul_49 FLOAT32
+/pw2_11/Conv/pre_tr FLOAT32
+/pw2_11/Conv FLOAT32
+/pw2_11/Conv/post_tr FLOAT32
+/Add_24 FLOAT32
+/norm2_11/Mul FLOAT32
+/norm2_11/ReduceMean FLOAT32
+/norm2_11/Add FLOAT32
+/norm2_11/Div FLOAT32
+/norm2_11/Mul_1 FLOAT32
+/norm2_11/Mul_2 FLOAT32
+/expander/latent_pre/latent_pre.0/Mul FLOAT32
+/expander/latent_pre/latent_pre.0/ReduceMean FLOAT32
+/expander/latent_pre/latent_pre.0/Add FLOAT32
+/expander/latent_pre/latent_pre.0/Div FLOAT32
+/expander/latent_pre/latent_pre.0/Mul_1 FLOAT32
+/expander/latent_pre/latent_pre.0/Mul_2 FLOAT32
+/expander/latent_pre/latent_pre.1/Conv/pre_tr FLOAT32
+/expander/latent_pre/latent_pre.1/Conv FLOAT32
+/expander/latent_pre/latent_pre.1/Conv/post_tr FLOAT32
+/expander/latent_pre/latent_pre.2/Sigmoid FLOAT32
+/expander/latent_pre/latent_pre.2/Mul FLOAT32
+/expander/query_pre/query_pre.0/Mul FLOAT32
+/expander/query_pre/query_pre.0/ReduceMean FLOAT32
+/expander/query_pre/query_pre.0/Add FLOAT32
+/expander/query_pre/query_pre.0/Div FLOAT32
+/expander/query_pre/query_pre.0/Mul_1 FLOAT32
+/expander/query_pre/query_pre.0/Mul_2 FLOAT32
+/expander/query_pre/query_pre.1/Conv/pre_tr FLOAT32
+/expander/query_pre/query_pre.1/Conv FLOAT32
+/expander/query_pre/query_pre.1/Conv/post_tr FLOAT32
+/expander/query_pre/query_pre.2/Sigmoid FLOAT32
+/expander/query_pre/query_pre.2/Mul FLOAT32
+/expander/Concat FLOAT32
+/expander/fuse/fuse.0/Conv/pre_tr FLOAT32
+/expander/fuse/fuse.0/Conv FLOAT32
+/expander/fuse/fuse.0/Conv/post_tr FLOAT32
+/expander/fuse/fuse.1/Sigmoid FLOAT32
+/expander/fuse/fuse.1/Mul FLOAT32
+/expander/band_gain/Conv/pre_tr FLOAT32
+/expander/band_gain/Conv FLOAT32
+/expander/band_gain/Conv/post_tr FLOAT32
+/expander/Sigmoid FLOAT32
+/expander/Mul FLOAT32
+/expander/Add FLOAT32
+/expander/Transpose FLOAT32
+/expander/Add_1 FLOAT32
+/expander/Mul_1 FLOAT32
+/expander/Transpose_1 FLOAT32
+/expander/ReduceSum FLOAT32
+/expander/Transpose_2 FLOAT32
+/expander/Add_2 FLOAT32
+/expander/Div FLOAT32
+/expander/Mul_2 FLOAT32
+/expander/Add_3 FLOAT32
+/expander/Transpose_3 FLOAT32
+/expander/Reshape FLOAT32
+/expander/Transpose_4 FLOAT32
+/expander/MatMul/reshape FLOAT32
+/expander/MatMul/tr FLOAT32
+/expander/MatMul FLOAT32
+/expander/Reshape_2 FLOAT32
+/expander/Transpose_5 FLOAT32
+/out_proj/Conv/pre_tr FLOAT32
+/out_proj/Conv FLOAT32
+/out_proj/Conv/post_tr FLOAT32

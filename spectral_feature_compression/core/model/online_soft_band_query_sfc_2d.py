@@ -164,7 +164,10 @@ class SoftBandQueryExpander2d(nn.Module):
         gains = gains.permute(0, 3, 2, 1)  # (B, K, T, 1)
 
         coeff = self.expansion_basis * (self.basis_scale + gains)
-        coeff = coeff / coeff.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        # Avoid ONNX Clip lowering from clamp_min for ONE importer compatibility.
+        coeff_tr = coeff.transpose(1, -1)
+        coeff = coeff / (coeff_tr.sum(dim=-1, keepdim=True).transpose(1, -1) + 1e-6)
+        # coeff = coeff / (coeff.sum(dim=1, keepdim=True) + 1e-6) #This make NPU Complilation ERROR
 
         tokens = latent_h + query_h * self.query_skip_scale
         batch, channels, n_frames, n_bands = tokens.shape
