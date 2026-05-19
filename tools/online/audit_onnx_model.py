@@ -35,6 +35,7 @@ def get_allowed_ops(preset: str) -> set[str]:
             "ReduceMean",
             "ReduceSum",
             "Reshape",
+            "Resize",
             "Relu",
             "Shape",
             "Sigmoid",

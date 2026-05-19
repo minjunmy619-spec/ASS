@@ -30,6 +30,16 @@ from .sparse_io import (
     split_bands,
 )
 
+#Replace the nn.PReLU with a custom subgraph that is compatible with the NPU
+class PReluSubgraph(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = self.alpha.view(1, -1, 1, 1).to(dtype=x.dtype)
+        return torch.relu(x) + a * torch.minimum(x, torch.zeros_like(x))
+
 
 class _SeparationStage(nn.Module):
     """CrossBand then NarrowBand pair."""

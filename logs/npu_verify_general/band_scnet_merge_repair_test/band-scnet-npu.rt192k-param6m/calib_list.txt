@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/band_scnet_merge_repair_test/band-scnet-npu.rt192k-param6m/calib_sample000_input00.npy

@@ -1,0 +1,7 @@
+_base_: ../edge-fusion-npu.tiny.rt192k/config.yaml
+
+# F = n_fft // 2 + 1 = 257. This is the quality-riskier but wider/deeper
+# balanced preset that still fits the strict 192 KiB fp16 packed-state budget.
+n_fft: 512
+hop_length: 128
+edge_fusion_preset: balanced

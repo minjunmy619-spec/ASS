@@ -157,21 +157,44 @@ class NPUCausalConv2dNorm(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# NPU-friendly frequency resize: ConvTranspose2d for upsample, strided Conv2d
-# for downsample. Avoids Tile/repeat_interleave.
+# NPU-friendly frequency resize: Resize-style upsample (± depthwise Conv2d),
+# strided Conv2d for downsample. Avoids grouped ConvTranspose (ONNX group>1),
+# which circle-mlir does not legalize today. Avoids Tile/repeat_interleave.
 # ---------------------------------------------------------------------------
 
 
 class NPUFreqResize2D(nn.Module):
     """
-    Frequency-axis resize using ConvTranspose2d (up) or strided Conv2d (down).
-    Avoids Tile/repeat_interleave operators.
+    Frequency-axis resize: upsample via ``interpolate`` (ONNX ``Resize``-style)
+    with optional depthwise ``Conv2d`` after each doubling step; downsample via
+    strided depthwise ``Conv2d``. Avoids Tile/repeat_interleave.
+
+    Optional kwargs (defaults preserve drop-in behavior): ``upsample_mode``
+    (``nearest``, ``linear`` / ``bilinear``), ``use_dw_conv`` (per-step DW conv).
     """
 
-    def __init__(self, channels: int, source_bins: int, target_bins: int):
+    def __init__(
+        self,
+        channels: int,
+        source_bins: int,
+        target_bins: int,
+        *,
+        upsample_mode: str = "nearest",
+        use_dw_conv: bool = True,
+    ):
         super().__init__()
         self.source_bins = source_bins
         self.target_bins = target_bins
+        self.use_dw_conv = use_dw_conv
+
+        if upsample_mode in ("linear", "bilinear"):
+            self._up_interp_mode: str = "bilinear"
+        elif upsample_mode == "nearest":
+            self._up_interp_mode = "nearest"
+        else:
+            raise ValueError(
+                f"upsample_mode must be 'nearest', 'linear', or 'bilinear', got {upsample_mode!r}"
+            )
 
         if source_bins == target_bins:
             self.mode = "identity"
@@ -189,15 +212,28 @@ class NPUFreqResize2D(nn.Module):
                 current = (current + 1) // 2
         else:
             self.mode = "upsample"
-            # Use ConvTranspose2d with stride-2 on freq axis
-            self.up_layers = nn.ModuleList()
+            # Previous upsample (grouped ConvTranspose2d); ONNX exports group>1 and
+            # circle-mlir does not legalize it — kept verbatim for reference:
+            # self.up_layers = nn.ModuleList()
+            # current = source_bins
+            # while current < target_bins:
+            #     self.up_layers.append(nn.ConvTranspose2d(
+            #         channels, channels, (2, 1), stride=(2, 1), padding=(0, 0),
+            #         groups=channels, bias=False,
+            #     ))
+            #     current = current * 2
+            self._up_steps = 0
             current = source_bins
             while current < target_bins:
-                self.up_layers.append(nn.ConvTranspose2d(
-                    channels, channels, (2, 1), stride=(2, 1), padding=(0, 0),
-                    groups=channels, bias=False,
-                ))
+                self._up_steps += 1
                 current = current * 2
+            self.up_dw_convs = nn.ModuleList()
+            if use_dw_conv:
+                for _ in range(self._up_steps):
+                    self.up_dw_convs.append(nn.Conv2d(
+                        channels, channels, (3, 1), padding=(1, 0),
+                        groups=channels, bias=False,
+                    ))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.mode == "identity":
@@ -206,9 +242,19 @@ class NPUFreqResize2D(nn.Module):
             for layer in self.down_layers:
                 x = layer(x)
             return x[:, :, :self.target_bins, :]
-        # upsample
-        for layer in self.up_layers:
-            x = layer(x)
+        # Previous upsample forward (paired with commented ``self.up_layers`` above):
+        # for layer in self.up_layers:
+        #     x = layer(x)
+        align_corners = False if self._up_interp_mode == "bilinear" else None
+        for i in range(self._up_steps):
+            x = torch.nn.functional.interpolate(
+                x,
+                scale_factor=(2.0, 1.0),
+                mode=self._up_interp_mode,
+                align_corners=align_corners,
+            )
+            if self.use_dw_conv and len(self.up_dw_convs) > 0:
+                x = self.up_dw_convs[i](x)
         return x[:, :, :self.target_bins, :]
 
 

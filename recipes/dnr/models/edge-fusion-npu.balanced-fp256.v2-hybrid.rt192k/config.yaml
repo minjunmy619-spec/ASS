@@ -1,0 +1,5 @@
+_base_: ../edge-fusion-npu.balanced.fp256.rt192k/config.yaml
+
+# Wider V2 hybrid at F=257. This is the strongest tiny-state candidate when
+# frequency pre-processing is acceptable.
+edge_fusion_preset: balanced-v2-hybrid

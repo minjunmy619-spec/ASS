@@ -1,0 +1,5 @@
+_base_: ../edge-fusion-npu.compact.fp512.rt192k/config.yaml
+
+# V2 band-token adds a Conv/ConvTranspose frequency bottleneck inspired by
+# band-split and sparse-compression models, without adding new runtime state.
+edge_fusion_preset: compact-v2-bandtoken

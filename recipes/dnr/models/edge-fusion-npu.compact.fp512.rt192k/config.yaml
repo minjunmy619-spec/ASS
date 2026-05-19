@@ -1,0 +1,7 @@
+_base_: ../edge-fusion-npu.tiny.rt192k/config.yaml
+
+# F = n_fft // 2 + 1 = 513. This keeps the packed single-state cache under
+# 192 KiB fp16 while allowing a wider/deeper separator than tiny.
+n_fft: 1024
+hop_length: 256
+edge_fusion_preset: compact

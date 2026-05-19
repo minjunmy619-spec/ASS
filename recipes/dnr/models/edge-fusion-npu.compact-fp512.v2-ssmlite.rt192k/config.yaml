@@ -1,0 +1,5 @@
+_base_: ../edge-fusion-npu.compact.fp512.rt192k/config.yaml
+
+# V2 SSM-lite keeps the same F=513 packed-state budget while replacing the
+# raw rolling cache update with a learnable finite recurrent state.
+edge_fusion_preset: compact-v2-ssmlite

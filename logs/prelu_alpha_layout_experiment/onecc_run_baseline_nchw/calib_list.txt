@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/prelu_alpha_layout_experiment/onecc_run_baseline_nchw/calib_sample000_input00.npy

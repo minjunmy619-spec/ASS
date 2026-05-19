@@ -114,6 +114,12 @@ Limit number of variants:
 ./.venv/bin/python tools/online/verify_npu_variants.py --mode all --limit 5
 ```
 
+Temporary quantization unblock (layer granularity retry):
+
+```bash
+./.venv/bin/python tools/online/verify_npu_variants.py --mode all --quantize-layer-fallback
+```
+
 Custom output run folder:
 
 ```bash
@@ -154,9 +160,36 @@ Per-variant folder:
 The generated ONE config enables these key passes:
 
 - `replace_non_const_fc_with_batch_matmul=True`
+
+  Set `replace_non_const_fc_with_batch_matmul=True` to fix "Unsupported non const input ... MatMul/tr" during quantization.
+
 - `convert_nchw_to_nhwc=True`
 
 This matches the previously validated workaround set for quantization compatibility.
+
+
+Quantization:
+
+- default: `granularity=channel` (preferred for accuracy)
+
+Optional escape hatch:
+
+- `--quantize-layer-fallback`: if quantization fails with
+  `Non-channel dimension of const node must be 1`, retry once with
+  `granularity=layer`. Layer-wise quantization often hurts accuracy versus channel-wise,
+  so this flag is **off by default**.
+
+Typical trigger (example): PyTorch-exported **PReLU** slopes shaped like `[C, 1, 1]` in NCHW.
+ONE channel-wise const quantization (`quant_const_per_channel`) currently assumes the channel axis is the **last**
+dimension for those tensors, which rejects valid `[C, 1, 1]` layouts. **Do not “fix” this by blindly reshaping slopes**
+to `[1, 1, C]` in ONNX—that changes broadcast semantics relative to NCHW activations.
+
+Proper fixes are upstream:
+
+- extend ONE to quantize those constants along the graph’s channel axis (or handle **CirclePRelu** alpha explicitly), or
+- change the source model/export (e.g. different activation) only after validating equivalence.
+
+Until then, use `--quantize-layer-fallback` only as a temporary unblock for blocked models.
 
 ---
 
@@ -221,6 +254,13 @@ Checks:
 - inspect `=== ONECC ===` in `run.log`
 - verify shared libs in ONE build tree
 - verify `model.circle`, `model.opt.circle`, `model.q.circle` existence
+
+If ONE stops during quantization with:
+
+`Non-channel dimension of const node must be 1`
+
+then channel-wise quantization hit a constant layout ONE does not accept yet (often **PReLU** slopes).
+Prefer fixing ONE or the model as described in **Quantization** above. Only use `--quantize-layer-fallback` if you explicitly accept the accuracy trade-off.
 
 ---
 

@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .streaming_io import build_causal_ri_sequence, invert_causal_ri_sequence
+from .npu_edge_utils import sanitize_for_npu_edge
 from .tiger_npu_edge import TIGERNPUEdgeV1
 from .tiger_npu_edge_v2 import TIGERNPUEdgeV2
 from .tiger_online import (
@@ -204,7 +205,7 @@ def build_tiger_core(
             "num_stages": 2,
         }
         defaults.update(kwargs)
-        return TIGERNPULargeDeployable(**common, **defaults)
+        return sanitize_for_npu_edge(TIGERNPULargeDeployable(**common, **defaults))
 
     compact_defaults = {
         "out_channels": 132,
@@ -223,7 +224,7 @@ def build_tiger_core(
         "ctx-deployable": TIGERCtxDeployable,
         "ctx-tiger-like": TIGERCtxTigerLikeApprox,
     }[variant]
-    return model_cls(**common, **compact_defaults)
+    return sanitize_for_npu_edge(model_cls(**common, **compact_defaults))
 
 
 class TIGERWaveformSeparator(nn.Module):

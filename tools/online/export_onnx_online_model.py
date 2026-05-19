@@ -43,6 +43,11 @@ def import_object(target: str):
 def parse_scalar(value: str):
     if not value:
         return ""
+    if value.startswith("{") and value.endswith("}"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
     if value.startswith("[") and value.endswith("]"):
         inner = value[1:-1].strip()
         if not inner:
@@ -226,6 +231,42 @@ def load_frequency_preprocess_metadata(model_path: Path) -> dict[str, object] | 
     }
 
 
+def infer_export_freq_bins(config_path: Path) -> int:
+    """Infer ONNX spectral bin count ``F`` for ``[B, 2*n_chan, T, F]`` exports."""
+    top_level = merge_top_level_scalars(config_path)
+    meta = load_frequency_preprocess_metadata(config_path)
+    if meta is not None and meta.get("keep_bins") is not None:
+        return int(meta["keep_bins"])  # type: ignore[arg-type]
+    n_fft = int(top_level.get("n_fft", 2048))
+    return n_fft // 2 + 1
+
+
+class _TigerCellOnnxExportWrapper(torch.nn.Module):
+    """Routes ONNX dummy tensors into ``core.forward_cell`` for TIGER spectral cores."""
+
+    def __init__(self, core: torch.nn.Module):
+        super().__init__()
+        self.core = core
+
+    def forward(self, subband_spec_RIs: torch.Tensor, *states: torch.Tensor):  # type: ignore[override]
+        if len(states) == 3:
+            return self.core.forward_cell(subband_spec_RIs, states[0], states[1], states[2])
+        if len(states) == 6:
+            return self.core.forward_cell(
+                subband_spec_RIs,
+                states[0],
+                states[1],
+                states[2],
+                states[3],
+                states[4],
+                states[5],
+            )
+        raise ValueError(
+            "TIGER export expects init_streaming_state to return 3 or 6 tensors, "
+            f"got {len(states)}"
+        )
+
+
 def get_export_core(task):
     model_wrapper = task.ema_model.module if getattr(task, "use_ema_model", False) else task.model
     online_model = model_wrapper.model
@@ -298,13 +339,16 @@ def get_allowed_ops(preset: str) -> set[str]:
             "Range",
             "ReduceMean",
             "ReduceSum",
+            "Relu",
             "Reshape",
+            "Resize",
             "Shape",
             "Sigmoid",
             "Slice",
             "Softmax",
             "Split",
             "Sqrt",
+            "Squeeze",
             "Sub",
             "Tanh",
             "Tile",
@@ -437,67 +481,149 @@ def main():
     core.eval()
 
     core_freqs = getattr(core, "n_freq", None)
-    export_freqs = args.freqs if args.freqs is not None else core_freqs
-    if export_freqs is None:
-        raise ValueError("Could not infer export frequency bins. Please pass --freqs explicitly.")
-    if core_freqs is not None and int(export_freqs) != int(core_freqs):
-        raise ValueError(f"Export freqs mismatch: --freqs={export_freqs}, but core expects n_freq={core_freqs}.")
+    tiger_like = (
+        hasattr(core, "forward_cell")
+        and callable(getattr(core, "forward_cell"))
+        and hasattr(core, "init_streaming_state")
+        and callable(getattr(core, "init_streaming_state"))
+        and hasattr(core, "enc_dim")
+    )
 
-    dummy = torch.randn(1, 2 * args.n_chan, args.frames, export_freqs, dtype=torch.float32, device=args.device)
-    model_to_export: torch.nn.Module = core
-    export_args: tuple[torch.Tensor, ...] = (dummy,)
-    input_names = ["x"]
-    output_names = ["y"]
     state_meta: dict[str, object] | None = None
     all_constant_bindings = collect_external_constant_bindings(core)
-    all_constant_tensors = get_external_constant_tensors(core, all_constant_bindings) if all_constant_bindings else ()
+    all_constant_tensors = (
+        get_external_constant_tensors(core, all_constant_bindings) if all_constant_bindings else ()
+    )
     constant_bindings = all_constant_bindings if args.externalize_band_constants else ()
     constant_tensors = all_constant_tensors if args.externalize_band_constants else ()
-    constant_meta = {
-        "count": len(constant_bindings),
-        "input_names": [f"const_{idx}_{binding.qualified_name.replace('.', '_')}" for idx, binding in enumerate(constant_bindings)],
-        "qualified_names": [binding.qualified_name for binding in constant_bindings],
-        "shapes": [list(t.shape) for t in constant_tensors],
-    } if constant_bindings else None
-    embedded_constant_meta = {
-        "count": len(all_constant_bindings),
-        "qualified_names": [binding.qualified_name for binding in all_constant_bindings],
-        "shapes": [list(t.shape) for t in all_constant_tensors],
-    } if (all_constant_bindings and not args.externalize_band_constants) else None
-
-    if args.streaming:
-        wrapper = StreamingStateIOWrapper(
-            core,
-            batch_size=1,
-            device=dummy.device,
-            dtype=dummy.dtype,
-            externalize_constants=args.externalize_band_constants,
-        ).to(args.device)
-        wrapper.eval()
-        init_state = core.init_stream_state(batch_size=1, device=dummy.device, dtype=dummy.dtype)
-        flat_state, _ = flatten_tensor_tree(init_state)
-        state_input_names = [f"state_{idx}" for idx in range(len(flat_state))]
-        state_output_names = [f"next_state_{idx}" for idx in range(len(flat_state))]
-        model_to_export = wrapper
-        export_args = (dummy, *flat_state, *constant_tensors)
-        input_names = [
-            "x",
-            *state_input_names,
-            *(constant_meta["input_names"] if constant_meta is not None else []),
-        ]
-        output_names = ["y", *state_output_names]
-        state_meta = {
-            "state_count": len(flat_state),
-            "input_names": state_input_names,
-            "output_names": state_output_names,
-            "shapes": tensor_tree_shapes(init_state),
+    constant_meta = (
+        {
+            "count": len(constant_bindings),
+            "input_names": [
+                f"const_{idx}_{binding.qualified_name.replace('.', '_')}"
+                for idx, binding in enumerate(constant_bindings)
+            ],
+            "qualified_names": [binding.qualified_name for binding in constant_bindings],
+            "shapes": [list(t.shape) for t in constant_tensors],
         }
-    elif args.externalize_band_constants:
-        wrapper = ExternalizedConstantsWrapper(core).to(args.device)
+        if constant_bindings
+        else None
+    )
+    embedded_constant_meta = (
+        {
+            "count": len(all_constant_bindings),
+            "qualified_names": [binding.qualified_name for binding in all_constant_bindings],
+            "shapes": [list(t.shape) for t in all_constant_tensors],
+        }
+        if (all_constant_bindings and not args.externalize_band_constants)
+        else None
+    )
+
+    device_torch = torch.device(args.device)
+    dtype_torch = torch.float32
+
+    if tiger_like:
+        if args.streaming:
+            raise ValueError(
+                "TIGER spectral cores export via forward_cell with explicit streaming tensors; "
+                "omit --streaming (StreamingStateIOWrapper uses forward_stream, which these cores "
+                "do not implement)."
+            )
+        if args.externalize_band_constants:
+            raise ValueError("--externalize-band-constants is not supported for TIGER cell exports.")
+        init_pack = tuple(
+            core.init_streaming_state(batch_size=1, device=device_torch, dtype=dtype_torch)
+        )
+        n_pack = len(init_pack)
+        if n_pack == 3:
+            input_names = ["subband_spec_RIs", "past_kvs", "past_valid_mask", "time_ctx"]
+            output_names = ["band_masked_output", "new_kv", "new_valid_mask", "new_time_ctx"]
+        elif n_pack == 6:
+            input_names = [
+                "subband_spec_RIs",
+                "past_kvs",
+                "past_valid_mask",
+                "prev_states_0",
+                "prev_states_1",
+                "prev_states_2",
+                "prev_global_states",
+            ]
+            output_names = [
+                "band_masked_output",
+                "new_kv",
+                "new_valid_mask",
+                "new_states_0",
+                "new_states_1",
+                "new_states_2",
+                "new_global_states",
+            ]
+        else:
+            raise ValueError(
+                f"Unsupported TIGER streaming state arity {n_pack} (expected 3 or 6 tensors)."
+            )
+
+        enc = int(core.enc_dim)
+        export_freqs = enc
+        dummy_ri = torch.zeros(1, 1, enc * 2, 1, dtype=dtype_torch, device=device_torch)
+        wrapper = _TigerCellOnnxExportWrapper(core).to(device_torch)
         wrapper.eval()
         model_to_export = wrapper
-        export_args = (dummy, *constant_tensors)
-        input_names = ["x", *(constant_meta["input_names"] if constant_meta is not None else [])]
+        export_args = (dummy_ri, *init_pack)
+    else:
+        export_freqs = args.freqs if args.freqs is not None else core_freqs
+        if export_freqs is None:
+            raise ValueError("Could not infer export frequency bins. Please pass --freqs explicitly.")
+        if core_freqs is not None and int(export_freqs) != int(core_freqs):
+            raise ValueError(
+                f"Export freqs mismatch: --freqs={export_freqs}, but core expects n_freq={core_freqs}."
+            )
+
+        dummy = torch.randn(
+            1,
+            2 * args.n_chan,
+            args.frames,
+            export_freqs,
+            dtype=dtype_torch,
+            device=device_torch,
+        )
+        model_to_export = core
+        export_args = (dummy,)
+        input_names = ["x"]
+        output_names = ["y"]
+
+        if args.streaming:
+            wrapper = StreamingStateIOWrapper(
+                core,
+                batch_size=1,
+                device=dummy.device,
+                dtype=dummy.dtype,
+                externalize_constants=args.externalize_band_constants,
+            ).to(args.device)
+            wrapper.eval()
+            init_state = core.init_stream_state(batch_size=1, device=dummy.device, dtype=dummy.dtype)
+            flat_state, _ = flatten_tensor_tree(init_state)
+            state_input_names = [f"state_{idx}" for idx in range(len(flat_state))]
+            state_output_names = [f"next_state_{idx}" for idx in range(len(flat_state))]
+            model_to_export = wrapper
+            export_args = (dummy, *flat_state, *constant_tensors)
+            input_names = [
+                "x",
+                *state_input_names,
+                *(constant_meta["input_names"] if constant_meta is not None else []),
+            ]
+            output_names = ["y", *state_output_names]
+            state_meta = {
+                "state_count": len(flat_state),
+                "input_names": state_input_names,
+                "output_names": state_output_names,
+                "shapes": tensor_tree_shapes(init_state),
+            }
+        elif args.externalize_band_constants:
+            wrapper = ExternalizedConstantsWrapper(core).to(args.device)
+            wrapper.eval()
+            model_to_export = wrapper
+            export_args = (dummy, *constant_tensors)
+            input_names = ["x", *(constant_meta["input_names"] if constant_meta is not None else [])]
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
@@ -583,8 +709,16 @@ def main():
             "frequency_preprocessing": frequency_preprocess_meta,
             "input_names": input_names,
             "output_names": output_names,
-            "dynamic_inputs": ["x", *(state_meta["input_names"] if state_meta is not None else [])],
-            "dynamic_outputs": ["y", *(state_meta["output_names"] if state_meta is not None else [])],
+            "dynamic_inputs": (
+                list(input_names)
+                if tiger_like
+                else ["x", *(state_meta["input_names"] if state_meta is not None else [])]
+            ),
+            "dynamic_outputs": (
+                list(output_names)
+                if tiger_like
+                else ["y", *(state_meta["output_names"] if state_meta is not None else [])]
+            ),
             "state_meta_file": str(args.state_meta_out) if args.state_meta_out is not None else None,
             "state_meta_inline": state_meta,
             "band_constants_mode": (
@@ -616,14 +750,21 @@ def main():
     print(f"Masking inside graph: {not args.disable_masking}")
     print(f"Keep initializers as inputs: {args.keep_initializers_as_inputs}")
     print(f"Externalize band constants: {args.externalize_band_constants}")
-    print(f"Input shape:  (1, {2 * args.n_chan}, {args.frames}, {export_freqs})")
+    if tiger_like:
+        print(f"TIGER cell export input: subband_spec_RIs shape (1, 1, {export_freqs * 2}, 1)")
+        print("  (+ past_kvs / past_valid_mask / ctx or prev_* state tensors)")
+    else:
+        print(f"Input shape:  (1, {2 * args.n_chan}, {args.frames}, {export_freqs})")
     if args.streaming:
         print(f"Flattened state tensors: {state_meta['state_count'] if state_meta is not None else 0}")
     if constant_meta is not None:
         print(f"Externalized constant tensors: {constant_meta['count']}")
     elif embedded_constant_meta is not None:
         print(f"Embedded band/basis tensors: {embedded_constant_meta['count']}")
-    print("Output shape: (1, 2*N*M, T, F) or raw masks if masking is disabled")
+    if tiger_like:
+        print("Output: band_masked_output + updated streaming tensors")
+    else:
+        print("Output shape: (1, 2*N*M, T, F) or raw masks if masking is disabled")
     print(f"ONNX ops: {', '.join(audit['ops'])}")
     print(
         "Initializers: "

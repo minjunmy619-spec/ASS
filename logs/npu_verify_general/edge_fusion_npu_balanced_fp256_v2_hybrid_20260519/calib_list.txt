@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/edge_fusion_npu_balanced_fp256_v2_hybrid_20260519/calib_sample000_input00.npy /home/cmj/works/ASS/logs/npu_verify_general/edge_fusion_npu_balanced_fp256_v2_hybrid_20260519/calib_sample000_input01.npy

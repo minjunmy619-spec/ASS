@@ -319,7 +319,7 @@ class StaticFreqResize2D(nn.Module):
                 )
             return x
         for _ in range(self.upsample_steps):
-            x = x.repeat_interleave(2, dim=2)
+            x = F.interpolate(x, scale_factor=(2.0, 1.0), mode="nearest")
         return x[:, :, :self.target_bins, :]
 
 class FrameConv2dNorm(nn.Module):
@@ -1428,11 +1428,15 @@ class Unified2DAttentionOnFrameAsym(nn.Module):
 
         x = x.transpose(-2, -1).contiguous()  # [B, C, 1, F]
         qkv = self.qkv_conv(x)
-        qkv = qkv.permute(0, 2, 1, 3).reshape(B, T, self.num_heads, -1).transpose(1, 2)
+        per_head_channels = 2 * self.hid_channels + self.v_hid_channels
+        qkv = qkv.view(B, self.num_heads, per_head_channels, T, F)
 
-        q = qkv[:, :, :, 0:self.head_dim]
-        k = qkv[:, :, :, self.head_dim:2 * self.head_dim]
-        v = qkv[:, :, :, 2 * self.head_dim:]
+        q = qkv[:, :, 0:self.hid_channels, :, :]
+        k = qkv[:, :, self.hid_channels:2 * self.hid_channels, :, :]
+        v = qkv[:, :, 2 * self.hid_channels:2 * self.hid_channels + self.v_hid_channels, :, :]
+        q = q.permute(0, 1, 3, 2, 4).reshape(B, self.num_heads, T, self.head_dim)
+        k = k.permute(0, 1, 3, 2, 4).reshape(B, self.num_heads, T, self.head_dim)
+        v = v.permute(0, 1, 3, 2, 4).reshape(B, self.num_heads, T, self.v_head_dim)
 
         if past_kv is None:
             past_kv = x.new_zeros(B, self.num_heads, self.window_size, self.head_dim + self.v_head_dim)
@@ -1440,28 +1444,27 @@ class Unified2DAttentionOnFrameAsym(nn.Module):
             past_valid_mask = x.new_zeros(B, 1, self.window_size, 1)
 
         prev_k = past_kv[:, :, :, 0:self.head_dim]
-        prev_v = past_kv[:, :, :, self.head_dim:]
-        current_valid = x.new_ones(B, 1, T, 1)
-
+        prev_v = past_kv[:, :, :, self.head_dim:self.head_dim + self.v_head_dim]
         if torch.onnx.is_in_onnx_export() or T == 1:
-            new_k = torch.cat([prev_k[:, :, T:, :], k], dim=2)
-            new_v = torch.cat([prev_v[:, :, T:, :], v], dim=2)
-            next_valid_mask = torch.cat([past_valid_mask[:, :, T:, :], current_valid], dim=2)
+            current_valid = (
+                past_valid_mask[:, :, self.window_size - 1:self.window_size, :] * 0.0 + 1.0
+            )
+            new_k = torch.cat([prev_k[:, :, 1:self.window_size, :], k], dim=2)
+            new_v = torch.cat([prev_v[:, :, 1:self.window_size, :], v], dim=2)
+            next_valid_mask = torch.cat(
+                [past_valid_mask[:, :, 1:self.window_size, :], current_valid],
+                dim=2,
+            )
 
-            head_contexts = []
-            invalid_mask = 1.0 - next_valid_mask.reshape(B, 1, self.window_size)
-            for head_idx in range(self.num_heads):
-                q_vec = q[:, head_idx, :, :]
-                k_mat = new_k[:, head_idx, :, :].transpose(1, 2).contiguous()
-                v_mat = new_v[:, head_idx, :, :]
-
-                attn_scores = torch.bmm(q_vec, k_mat) * self.attn_scale
-                attn_scores = attn_scores + invalid_mask * (-1e4)
-                attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
-                head_contexts.append(torch.bmm(attn_weights, v_mat))
-            context = torch.stack(head_contexts, dim=1)
+            k_mat = new_k.transpose(2, 3).contiguous()
+            attn_scores = torch.matmul(q, k_mat) * self.attn_scale
+            invalid_mask = (1.0 - next_valid_mask.reshape(B, 1, 1, self.window_size)) * (-1e4)
+            attn_scores = attn_scores + invalid_mask
+            attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
+            context = torch.matmul(attn_weights, new_v)
             next_state = torch.cat([new_k, new_v], dim=3)
         else:
+            current_valid = x.new_ones(B, 1, T, 1)
             total_k = torch.cat([prev_k, k], dim=2)
             total_v = torch.cat([prev_v, v], dim=2)
             total_valid_mask = torch.cat([past_valid_mask, current_valid], dim=2)
@@ -1477,9 +1480,16 @@ class Unified2DAttentionOnFrameAsym(nn.Module):
             head_contexts = []
             invalid_mask = (1.0 - total_valid_mask.reshape(B, 1, self.window_size + T)) * (-1e4)
             for head_idx in range(self.num_heads):
-                q_vec = q[:, head_idx, :, :]
-                k_mat = total_k[:, head_idx, :, :].transpose(1, 2).contiguous()
-                v_mat = total_v[:, head_idx, :, :]
+                q_vec = q[:, head_idx:head_idx + 1, :, :].reshape(B, T, self.head_dim)
+                k_mat = (
+                    total_k[:, head_idx:head_idx + 1, :, :]
+                    .reshape(B, self.window_size + T, self.head_dim)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+                v_mat = total_v[:, head_idx:head_idx + 1, :, :].reshape(
+                    B, self.window_size + T, self.v_head_dim
+                )
 
                 attn_scores = torch.bmm(q_vec, k_mat) * self.attn_scale
                 attn_scores = attn_scores + full_mask.unsqueeze(0)
@@ -1568,19 +1578,45 @@ class Unified2DAttentionOnFreqAsym(nn.Module):
             assert F == self.freq_bins, f"expected {self.freq_bins} bands, got {F}"
 
         qkv = self.qkv_conv(x)
-        head_chunks = torch.chunk(qkv, self.num_heads, dim=1)
+        per_head_channels = 2 * self.hid_channels + self.v_hid_channels
+        qkv = qkv.view(B, self.num_heads, per_head_channels, F, T)
+        q = qkv[:, :, 0:self.hid_channels, :, :]
+        k = qkv[:, :, self.hid_channels:2 * self.hid_channels, :, :]
+        v = qkv[:, :, 2 * self.hid_channels:2 * self.hid_channels + self.v_hid_channels, :, :]
         head_outputs = []
 
-        for head_chunk in head_chunks:
-            q = head_chunk[:, 0:self.head_dim, :, :]
-            k = head_chunk[:, self.head_dim:2 * self.head_dim, :, :]
-            v = head_chunk[:, 2 * self.head_dim:, :, :]
+        if torch.onnx.is_in_onnx_export() or T == 1:
+            q_t = q.reshape(B, self.num_heads, self.hid_channels, F).permute(0, 1, 3, 2)
+            k_t = k.reshape(B, self.num_heads, self.hid_channels, F)
+            v_t = v.reshape(B, self.num_heads, self.v_hid_channels, F).permute(0, 1, 3, 2)
+
+            attn_scores = torch.matmul(q_t, k_t) * self.attn_scale
+            attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
+            ctx = torch.matmul(attn_weights, v_t)
+            out = ctx.permute(0, 1, 3, 2).reshape(B, self.num_heads * self.v_hid_channels, F, T)
+            out = self.proj_conv(out)
+            return out, None
+
+        for head_idx in range(self.num_heads):
+            q_head = q[:, head_idx:head_idx + 1, :, :, :].reshape(B, self.hid_channels, F, T)
+            k_head = k[:, head_idx:head_idx + 1, :, :, :].reshape(B, self.hid_channels, F, T)
+            v_head = v[:, head_idx:head_idx + 1, :, :, :].reshape(B, self.v_hid_channels, F, T)
 
             time_contexts = []
             for t in range(T):
-                q_t = q[:, :, :, t].transpose(1, 2).contiguous()  # [B, F, D]
-                k_t = k[:, :, :, t].contiguous()  # [B, D, F]
-                v_t = v[:, :, :, t].transpose(1, 2).contiguous()  # [B, F, V]
+                q_t = (
+                    q_head[:, :, :, t:t + 1]
+                    .reshape(B, self.hid_channels, F)
+                    .transpose(1, 2)
+                    .contiguous()
+                )  # [B, F, D]
+                k_t = k_head[:, :, :, t:t + 1].reshape(B, self.hid_channels, F).contiguous()
+                v_t = (
+                    v_head[:, :, :, t:t + 1]
+                    .reshape(B, self.v_hid_channels, F)
+                    .transpose(1, 2)
+                    .contiguous()
+                )  # [B, F, V]
 
                 attn_scores = torch.bmm(q_t, k_t) * self.attn_scale
                 attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
@@ -2167,9 +2203,15 @@ class ContextTimeUConvBlock(nn.Module):
             expanded = self.last_layer[i](x_fused[i], expanded)
 
         res_output = self.res_conv(expanded)
-        valid_output = res_output[:, :, :, -chunk_T:] + x
+        if torch.onnx.is_in_onnx_export() or chunk_T == 1:
+            valid_output = res_output[:, :, :, self.context_size:self.context_size + 1] + x
+        else:
+            valid_output = res_output[:, :, :, -chunk_T:] + x
         if self.context_size > 0:
-            next_ctx = projected_full[:, :, :, -self.context_size:].detach()
+            if torch.onnx.is_in_onnx_export() or chunk_T == 1:
+                next_ctx = projected_full[:, :, :, 1:self.context_size + 1].detach()
+            else:
+                next_ctx = projected_full[:, :, :, -self.context_size:].detach()
         else:
             next_ctx = projected_full[:, :, :, :0].detach()
 

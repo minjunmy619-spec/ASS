@@ -1,0 +1,4 @@
+_base_: ../edge-fusion-npu.compact.fp512.rt192k/config.yaml
+
+# V2 hybrid combines the SSM-lite cache update and the band-token bottleneck.
+edge_fusion_preset: compact-v2-hybrid
