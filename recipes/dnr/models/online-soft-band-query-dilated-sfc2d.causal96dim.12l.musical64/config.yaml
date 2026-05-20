@@ -1,0 +1,8 @@
+_base_: ../online-soft-band-query-sfc2d.causal96dim.12l.musical64/config.yaml
+
+online_dilation_cycle: [1, 2, 4, 6]
+
+task:
+  model:
+    _target_: spectral_feature_compression.core.model.online_soft_band_query_dilated_sfc_2d.build_online_soft_band_query_dilated_sfc_system
+    dilation_cycle: ${online_dilation_cycle}

@@ -1,0 +1,3 @@
+_base_: ../band-sfc-net-npu.safe.rt192k.fp512/config.yaml
+
+band_sfc_preset: quality

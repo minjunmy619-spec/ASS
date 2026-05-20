@@ -1,0 +1,6 @@
+_base_: ../online-soft-band-query-dilated-sfc2d.rt192k.causal24dim.6l.64b/config.yaml
+
+online_freq_preprocess_enabled: true
+online_freq_preprocess_keep_bins: 475
+online_freq_preprocess_target_bins: 512
+online_freq_preprocess_mode: triangular

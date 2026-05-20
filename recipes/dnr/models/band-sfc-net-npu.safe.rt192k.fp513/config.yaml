@@ -1,0 +1,5 @@
+_base_: ../band-sfc-net-npu.safe.rt192k.fp512/config.yaml
+
+n_fft: 1024
+hop_length: 256
+band_sfc_freq_preprocess_enabled: false
