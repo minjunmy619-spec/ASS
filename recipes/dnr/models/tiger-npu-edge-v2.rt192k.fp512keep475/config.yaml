@@ -1,0 +1,7 @@
+_base_: ../tiger-npu-edge-v2.rt192k/config.yaml
+
+# Full n_fft=2048 frontend, fixed F=1025 -> F=512 preprocessing before TIGER.
+tiger_freq_preprocess_enabled: true
+tiger_freq_preprocess_keep_bins: 475
+tiger_freq_preprocess_target_bins: 512
+tiger_freq_preprocess_mode: triangular

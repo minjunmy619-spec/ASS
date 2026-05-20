@@ -15,6 +15,11 @@ from __future__ import annotations
 import torch.nn as nn
 
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
+from spectral_feature_compression.core.model.frequency_preprocessing import (
+    FrequencyPreprocessedOnlineModel,
+    build_frequency_preprocessor,
+    resolve_preprocessed_n_freq,
+)
 from spectral_feature_compression.core.model.online_sfc_2d import (
     pack_complex_stft_as_2d,
     unpack_2d_to_complex_stft,
@@ -58,6 +63,10 @@ def build_dolphin_sfc_npu_system(
     preset: str = "large_6m",
     band_config: str = "musical",
     scaling: bool = False,
+    freq_preprocess_enabled: bool = False,
+    freq_preprocess_keep_bins: int | None = None,
+    freq_preprocess_target_bins: int | None = None,
+    freq_preprocess_mode: str = "triangular",
     css_segment_size: int = 12,
     css_shift_size: int = 6,
     css_batch_size: int = 1,
@@ -75,10 +84,23 @@ def build_dolphin_sfc_npu_system(
           n_chan: ${n_chan}
           preset: large_6m
     """
-    n_freq = (n_fft // 2) + 1
+    full_n_freq = (n_fft // 2) + 1
+    core_n_freq = resolve_preprocessed_n_freq(
+        full_n_freq,
+        enabled=freq_preprocess_enabled,
+        keep_bins=freq_preprocess_keep_bins,
+        target_bins=freq_preprocess_target_bins,
+    )
+    freq_preprocessor = build_frequency_preprocessor(
+        full_n_freq,
+        enabled=freq_preprocess_enabled,
+        keep_bins=freq_preprocess_keep_bins,
+        target_bins=freq_preprocess_target_bins,
+        mode=freq_preprocess_mode,
+    )
     core = build_dolphin_sfc_npu_preset(
         preset,
-        n_freq=n_freq,
+        n_freq=core_n_freq,
         n_fft=n_fft,
         sample_rate=fs,
         n_src=n_src,
@@ -86,7 +108,15 @@ def build_dolphin_sfc_npu_system(
         band_config=band_config,
         masking=True,
     )
-    model = DolphinSFCNPUOnlineModel(core=core, n_src=n_src, n_chan=n_chan)
+    if freq_preprocessor is None:
+        model = DolphinSFCNPUOnlineModel(core=core, n_src=n_src, n_chan=n_chan)
+    else:
+        model = FrequencyPreprocessedOnlineModel(
+            core=core,
+            n_src=n_src,
+            n_chan=n_chan,
+            freq_preprocessor=freq_preprocessor,
+        )
     return OnlineModelWrapper(
         model=model,
         n_fft=n_fft,

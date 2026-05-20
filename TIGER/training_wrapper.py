@@ -16,6 +16,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectral_feature_compression.core.model.frequency_preprocessing import (
+    build_frequency_preprocessor,
+    resolve_preprocessed_n_freq,
+)
+from spectral_feature_compression.core.model.online_sfc_2d import (
+    pack_complex_stft_as_2d,
+    unpack_2d_to_complex_stft,
+)
+
 from .streaming_io import build_causal_ri_sequence, invert_causal_ri_sequence
 from .npu_edge_utils import sanitize_for_npu_edge
 from .tiger_npu_edge import TIGERNPUEdgeV1
@@ -244,6 +253,7 @@ class TIGERWaveformSeparator(nn.Module):
         hop: int = 512,
         startup_packet: int = 256,
         analysis_window: str = "sqrt_hann",
+        freq_preprocessor: nn.Module | None = None,
         detach_state: bool = False,
         chunk_size: int = 8,
         css_segment_size: int = 12,
@@ -261,6 +271,7 @@ class TIGERWaveformSeparator(nn.Module):
         self.hop = hop
         self.startup_packet = startup_packet
         self.detach_state = detach_state
+        self.freq_preprocessor = freq_preprocessor
         self.chunk_size = chunk_size
         self.css_segment_size = css_segment_size
         self.css_shift_size = css_shift_size
@@ -317,6 +328,36 @@ class TIGERWaveformSeparator(nn.Module):
         est_imag = mix_real.unsqueeze(1) * mask_imag + mix_imag.unsqueeze(1) * mask_real
         return torch.cat([est_real, est_imag], dim=2)
 
+    @staticmethod
+    def _ri_sequence_to_2d(x_ri: torch.Tensor) -> torch.Tensor:
+        batch, channels, ri_bins, frames = x_ri.shape
+        freq = ri_bins // 2
+        real = x_ri[:, :, :freq, :]
+        imag = x_ri[:, :, freq:, :]
+        complex_stft = torch.complex(real.to(torch.float32), imag.to(torch.float32))
+        return pack_complex_stft_as_2d(complex_stft)
+
+    @staticmethod
+    def _two_d_to_ri_sequence(x2d: torch.Tensor, *, n_src: int, n_chan: int) -> torch.Tensor:
+        complex_stft = unpack_2d_to_complex_stft(x2d, n_src=n_src, n_chan=n_chan)
+        batch, n_src_out, n_chan_out, freq, frames = complex_stft.shape
+        flat = complex_stft.reshape(batch, n_src_out * n_chan_out, freq, frames)
+        return torch.cat([flat.real, flat.imag], dim=2)
+
+    def _preprocess_ri_sequence(self, x_ri: torch.Tensor) -> torch.Tensor:
+        if self.freq_preprocessor is None:
+            return x_ri
+        x2d = self._ri_sequence_to_2d(x_ri)
+        reduced = self.freq_preprocessor.analysis(x2d)
+        return self._two_d_to_ri_sequence(reduced, n_src=1, n_chan=self.n_chan)
+
+    def _postprocess_ri_sequence(self, y_ri: torch.Tensor) -> torch.Tensor:
+        if self.freq_preprocessor is None:
+            return y_ri
+        y2d = self._ri_sequence_to_2d(y_ri)
+        full = self.freq_preprocessor.synthesis(y2d)
+        return self._two_d_to_ri_sequence(full, n_src=self.n_src, n_chan=self.n_chan)
+
     def forward(self, wav: torch.Tensor, **kwargs) -> torch.Tensor:
         if wav.dim() == 2:
             wav = wav.unsqueeze(1)
@@ -333,12 +374,14 @@ class TIGERWaveformSeparator(nn.Module):
                 startup_packet=self.startup_packet,
                 analysis_window=window,
             )
+        subband_ri_core = self._preprocess_ri_sequence(subband_ri)
         mask_logits = self.core.forward_sequence(
-            subband_ri,
+            subband_ri_core,
             detach_state=self.detach_state,
             chunk_size=self.chunk_size,
         )[0]
-        est_ri = self._apply_masks(mask_logits, subband_ri)
+        est_ri = self._apply_masks(mask_logits, subband_ri_core)
+        est_ri = self._postprocess_ri_sequence(est_ri)
         with self._no_autocast(est_ri):
             est_wav = invert_causal_ri_sequence(
                 est_ri.float(),
@@ -420,15 +463,34 @@ def build_tiger_system(
     chunk_size: int = 8,
     model_kwargs: dict[str, Any] | None = None,
     scaling: bool = False,
+    freq_preprocess_enabled: bool = False,
+    freq_preprocess_keep_bins: int | None = None,
+    freq_preprocess_target_bins: int | None = None,
+    freq_preprocess_mode: str = "triangular",
     css_segment_size: int = 12,
     css_shift_size: int = 6,
     css_batch_size: int = 1,
 ) -> TIGERWaveformSeparator:
     if scaling:
         raise ValueError("TIGER streaming training does not support global scaling.")
+    full_n_freq = (n_fft // 2) + 1
+    core_n_freq = resolve_preprocessed_n_freq(
+        full_n_freq,
+        enabled=freq_preprocess_enabled,
+        keep_bins=freq_preprocess_keep_bins,
+        target_bins=freq_preprocess_target_bins,
+    )
+    core_n_fft = 2 * (core_n_freq - 1)
+    freq_preprocessor = build_frequency_preprocessor(
+        full_n_freq,
+        enabled=freq_preprocess_enabled,
+        keep_bins=freq_preprocess_keep_bins,
+        target_bins=freq_preprocess_target_bins,
+        mode=freq_preprocess_mode,
+    )
     core = build_tiger_core(
         variant=variant,
-        n_fft=n_fft,
+        n_fft=core_n_fft,
         hop_length=hop_length,
         fs=fs,
         n_src=n_src,
@@ -442,6 +504,7 @@ def build_tiger_system(
         hop=hop_length,
         startup_packet=startup_packet,
         analysis_window=analysis_window,
+        freq_preprocessor=freq_preprocessor,
         detach_state=detach_state,
         chunk_size=chunk_size,
         css_segment_size=css_segment_size,

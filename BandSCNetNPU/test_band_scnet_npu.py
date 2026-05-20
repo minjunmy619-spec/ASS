@@ -36,6 +36,7 @@ from BandSCNetNPU import (  # noqa: E402
     build_band_scnet_npu_preset,
     split_bands,
 )
+from BandSCNetNPU.training_wrapper import build_band_scnet_npu_system  # noqa: E402
 from spectral_feature_compression.utils.onnx_streaming import flatten_tensor_tree  # noqa: E402
 
 
@@ -204,6 +205,24 @@ def test_edge_small_forward_shape() -> None:
         y = model(x)
     # masking=True -> [B, 2*n_src*n_chan, T, F]
     assert y.shape == (1, 2 * model.n_src * model.n_chan, 5, N_FREQ_SMALL)
+
+
+def test_training_wrapper_frequency_preprocessing_shape() -> None:
+    system = build_band_scnet_npu_system(
+        n_fft=1024,
+        hop_length=256,
+        fs=16000,
+        preset=EDGE_PRESET,
+        freq_preprocess_enabled=True,
+        freq_preprocess_keep_bins=192,
+        freq_preprocess_target_bins=N_FREQ_SMALL,
+    ).eval()
+    x = torch.complex(torch.randn(1, 1, 513, 3), torch.randn(1, 1, 513, 3))
+    with torch.no_grad():
+        y = system.model(x)
+    assert y.shape == (1, 3, 1, 513, 3)
+    assert system.model.input_n_freq == 513
+    assert system.model.core_n_freq == N_FREQ_SMALL
 
 
 def test_edge_small_streaming_matches_full() -> None:

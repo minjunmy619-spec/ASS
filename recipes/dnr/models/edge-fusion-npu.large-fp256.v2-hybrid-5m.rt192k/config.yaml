@@ -1,0 +1,12 @@
+_base_: ../edge-fusion-npu.tiny.rt192k/config.yaml
+
+# Larger quality candidate. Training keeps the full n_fft=2048 STFT frontend
+# and uses fixed frequency preprocessing to feed an F=257 NPU core.
+edge_fusion_preset: large-v2-hybrid-5m
+edge_fusion_freq_preprocess_enabled: true
+edge_fusion_freq_preprocess_keep_bins: 192
+edge_fusion_freq_preprocess_target_bins: 257
+edge_fusion_freq_preprocess_mode: triangular
+
+datamodule:
+  batch_size: 1

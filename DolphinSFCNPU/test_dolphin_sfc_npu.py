@@ -15,6 +15,7 @@ from DolphinSFCNPU import (  # noqa: E402
     DolphinSFCNPUStreamingExportWrapper,
     build_dolphin_sfc_npu_preset,
 )
+from DolphinSFCNPU.training_wrapper import build_dolphin_sfc_npu_system  # noqa: E402
 
 FORBIDDEN_EXPORT_OPS = {
     "ConstantOfShape",
@@ -86,6 +87,24 @@ def test_forward_stream_matches_forward() -> None:
 
     assert full.shape == streamed.shape == (1, 6, 5, model.n_freq)
     assert torch.allclose(full, streamed, atol=1e-5, rtol=1e-5)
+
+
+def test_training_wrapper_frequency_preprocessing_shape() -> None:
+    system = build_dolphin_sfc_npu_system(
+        n_fft=1024,
+        hop_length=256,
+        fs=16000,
+        preset="edge_small",
+        freq_preprocess_enabled=True,
+        freq_preprocess_keep_bins=192,
+        freq_preprocess_target_bins=257,
+    ).eval()
+    x = torch.complex(torch.randn(1, 1, 513, 3), torch.randn(1, 1, 513, 3))
+    with torch.no_grad():
+        y = system.model(x)
+    assert y.shape == (1, 3, 1, 513, 3)
+    assert system.model.input_n_freq == 513
+    assert system.model.core_n_freq == 257
 
 
 def test_slim_presets_forward_stream_match() -> None:

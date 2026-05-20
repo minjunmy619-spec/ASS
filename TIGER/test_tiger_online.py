@@ -23,6 +23,7 @@ from TIGER import (
     build_causal_ri_sequence,
     invert_causal_ri_sequence,
 )
+from TIGER.training_wrapper import build_tiger_system
 
 
 def build_test_window(kind: str, win: int, device=None, dtype=None) -> torch.Tensor | None:
@@ -190,6 +191,30 @@ def print_state_budget(model: torch.nn.Module, state_tuple) -> None:
     print(f"[budget] int8 bytes={total_elements}")
     print(f"[budget] int16 bytes={total_elements * 2}")
     print(f"[budget] fp32 bytes={total_elements * 4}")
+
+
+def test_waveform_wrapper_frequency_preprocessing_for_edge_and_tf_mlpnet() -> None:
+    torch.manual_seed(0)
+    for variant in ("npu-edge-v2", "tf-mlpnet-edge"):
+        model = build_tiger_system(
+            n_fft=2048,
+            hop_length=512,
+            fs=44100,
+            variant=variant,
+            startup_packet=256,
+            chunk_size=2,
+            freq_preprocess_enabled=True,
+            freq_preprocess_keep_bins=475,
+            freq_preprocess_target_bins=512,
+        ).eval()
+        wav = torch.randn(1, 1, 256 + 2 * 512)
+        with torch.no_grad():
+            out = model(wav)
+        assert out.shape == (1, 3, 1, wav.shape[-1])
+        assert model.freq_preprocessor.n_freq_in == 1025
+        assert model.freq_preprocessor.n_freq_out == 512
+        assert min(model.core.band_width) >= 1
+        assert sum(model.core.band_width) == 512
 
 
 def main() -> int:

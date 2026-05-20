@@ -135,12 +135,16 @@ class HybridFrequencyProjector2d(nn.Module):
     def n_freq_out(self) -> int:
         return self.target_bins
 
+    def _matrix_for(self, matrix: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        return matrix.to(device=ref.device, dtype=ref.dtype)
+
     def analysis(self, x: torch.Tensor) -> torch.Tensor:
         batch, channels, frames, n_freq = x.shape
         if n_freq != self.n_freq_in:
             raise ValueError(f"Expected {self.n_freq_in} input bins, got {n_freq}")
         flat = x.reshape(batch * channels * frames, n_freq)
-        y = flat @ self.analysis_matrix.transpose(0, 1)
+        analysis_matrix = self._matrix_for(self.analysis_matrix, flat)
+        y = flat @ analysis_matrix.transpose(0, 1)
         return y.reshape(batch, channels, frames, self.n_freq_out)
 
     def synthesis(self, x: torch.Tensor) -> torch.Tensor:
@@ -148,7 +152,8 @@ class HybridFrequencyProjector2d(nn.Module):
         if n_freq != self.n_freq_out:
             raise ValueError(f"Expected {self.n_freq_out} projected bins, got {n_freq}")
         flat = x.reshape(batch * channels * frames, n_freq)
-        y = flat @ self.synthesis_matrix.transpose(0, 1)
+        synthesis_matrix = self._matrix_for(self.synthesis_matrix, flat)
+        y = flat @ synthesis_matrix.transpose(0, 1)
         return y.reshape(batch, channels, frames, self.n_freq_in)
 
     def manifest(self) -> dict[str, object]:

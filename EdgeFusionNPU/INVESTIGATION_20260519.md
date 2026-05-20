@@ -569,3 +569,250 @@ Compiled artifact:
 ```text
 logs/npu_verify_general/edge_fusion_npu_compact_fp512_v2_hybrid_reviewfix_20260519/model.q.circle
 ```
+
+## Chunk Training / Frame Export Fix
+
+Update date: 2026-05-20.
+
+The training path now supports chunk or clip processing while preserving the
+single-frame ONNX export contract.
+
+PyTorch training paths:
+
+```text
+EdgeFusionNPU core:
+  input  [B, 2*n_chan, F, T]
+  state  [B, state_channels, F, context]
+  output [B, n_src*n_chan, F, T], next_state
+
+EdgeFusionNPUOnlineModel:
+  input  complex STFT [B, M, F, T]
+  output complex estimates [B, n_src, M, F, T]
+```
+
+`EdgeFusionNPUOnlineModel.forward(...)` now accepts:
+
+```text
+initial_state: optional packed state for split-chunk training
+return_state:  return final packed state with the estimates
+detach_state:  detach incoming state for truncated BPTT
+```
+
+This means a full clip and split chunks with carried state produce the same
+result, while training can choose whether gradients cross chunk boundaries.
+
+ONNX export path:
+
+```text
+EdgeFusionNPUExportWrapper.forward(x, state)
+```
+
+calls the single-frame `_forward_frame(...)` path directly. Exported ONNX remains:
+
+```text
+inputs:  x, state
+outputs: mask, next_state
+```
+
+with `x` and `mask` fixed to one streaming frame.
+
+Validation:
+
+```text
+./.venv/bin/python -m py_compile \
+  EdgeFusionNPU/edge_fusion_npu.py \
+  EdgeFusionNPU/training_wrapper.py \
+  EdgeFusionNPU/export_compile.py
+
+./.venv/bin/python -m pytest EdgeFusionNPU/test_edge_fusion_npu.py -q
+```
+
+Result:
+
+```text
+9 passed
+```
+
+Post-fix frame export and ONE compile:
+
+```text
+./.venv/bin/python EdgeFusionNPU/export_compile.py \
+  --preset compact-v2-hybrid \
+  --out-dir logs/npu_verify_general/edge_fusion_npu_compact_fp512_v2_hybrid_chunktrain_frameexport_20260520 \
+  --compile
+```
+
+Result:
+
+| Variant | n_freq | ONNX Inputs | ONNX Outputs | Params | State fp16 KiB | ONE q.circle |
+|---|---:|---:|---:|---:|---:|---|
+| `compact-v2-hybrid` chunk-train/frame-export | 513 | 2 | 2 | 6,291 | 160.31 | PASS |
+
+ONNX op audit:
+
+```text
+Disallowed ops: none
+```
+
+Compiled artifact:
+
+```text
+logs/npu_verify_general/edge_fusion_npu_compact_fp512_v2_hybrid_chunktrain_frameexport_20260520/model.q.circle
+```
+
+## Bigger 2-6M Parameter Variants
+
+Update date: 2026-05-20.
+
+The earlier EdgeFusionNPU variants were intentionally tiny and proved the export
+contract, but they were likely under-parameterized for quality. The bigger
+variants scale model capacity through stateless per-frame 1x1 Conv FFN expansion
+inside each streaming block:
+
+```text
+hidden -> capacity_channels -> hidden
+```
+
+This adds parameters without widening the recurrent cache. The streaming state
+therefore remains one packed tensor and still uses only:
+
+```text
+inputs:  x, state
+outputs: mask, next_state
+```
+
+New presets:
+
+| Preset | Hidden | Blocks | Capacity Channels | n_freq | Params | Param fp16 | State fp16 KiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `big-v2-hybrid-2m` | 24 | 5 | 8,192 | 257 | 2,020,483 | 3.85 MiB | 120.47 |
+| `large-v2-hybrid-5m` | 24 | 7 | 16,384 | 257 | 5,637,235 | 10.75 MiB | 168.66 |
+
+New DnR recipes:
+
+```text
+recipes/dnr/models/edge-fusion-npu.big-fp256.v2-hybrid-2m.rt192k/config.yaml
+recipes/dnr/models/edge-fusion-npu.large-fp256.v2-hybrid-5m.rt192k/config.yaml
+```
+
+The recipes inherit the F=257 balanced recipe. The `big` recipe uses batch size
+2; the `large` recipe uses batch size 1 because its per-frame FFN activations
+are substantially larger.
+
+Validation:
+
+```text
+./.venv/bin/python -m py_compile \
+  EdgeFusionNPU/edge_fusion_npu.py \
+  EdgeFusionNPU/training_wrapper.py \
+  EdgeFusionNPU/export_compile.py
+
+./.venv/bin/python -m pytest EdgeFusionNPU/test_edge_fusion_npu.py -q
+```
+
+Result:
+
+```text
+10 passed
+```
+
+ONE compiles:
+
+```text
+./.venv/bin/python EdgeFusionNPU/export_compile.py \
+  --preset big-v2-hybrid-2m \
+  --out-dir logs/npu_verify_general/edge_fusion_npu_big_fp256_v2_hybrid_2m_20260520 \
+  --compile
+
+./.venv/bin/python EdgeFusionNPU/export_compile.py \
+  --preset large-v2-hybrid-5m \
+  --out-dir logs/npu_verify_general/edge_fusion_npu_large_fp256_v2_hybrid_5m_20260520 \
+  --compile
+```
+
+Results:
+
+| Variant | ONNX Inputs | ONNX Outputs | Params | State fp16 KiB | ONE q.circle |
+|---|---:|---:|---:|---:|---|
+| `big-v2-hybrid-2m` | 2 | 2 | 2,020,483 | 120.47 | PASS |
+| `large-v2-hybrid-5m` | 2 | 2 | 5,637,235 | 168.66 | PASS |
+
+ONNX op audits:
+
+```text
+big-v2-hybrid-2m:   Disallowed ops: none
+large-v2-hybrid-5m: Disallowed ops: none
+```
+
+Compiled artifacts:
+
+```text
+logs/npu_verify_general/edge_fusion_npu_big_fp256_v2_hybrid_2m_20260520/model.q.circle
+logs/npu_verify_general/edge_fusion_npu_large_fp256_v2_hybrid_5m_20260520/model.q.circle
+```
+
+Recommendation:
+
+- Train `big-v2-hybrid-2m` first as the safer quality/cost point.
+- Train `large-v2-hybrid-5m` if the target NPU can afford the larger 1x1 Conv
+  weight bandwidth and activation footprint.
+- Keep `compact-v2-hybrid` as the fallback for low-power devices.
+
+## Big Variant Status Correction
+
+Update date: 2026-05-20.
+
+The first big-variant implementation reached the parameter targets by applying a
+huge 1x1 Conv FFN at the full frequency resolution. That compiled, but it was
+not the right edge-NPU shape: parameter count looked good while the implied
+per-frame compute and activation footprint were too large.
+
+A second attempt moved the large FFN onto a highly compressed frequency token,
+but used grouped `ConvTranspose2d` for the upsampler. ONE rejected it:
+
+```text
+loc("/token_capacity/up/up.0/ConvTranspose"): error: failed to legalize operation 'onnx.ConvTranspose'
+```
+
+The corrected design now uses:
+
+- frequency-token bottleneck from F=257 down to one token,
+- large 1x1 Conv FFN only at that one-token resolution,
+- dense stride-2 `ConvTranspose2d` stages for upsampling,
+- `band_stride=2` so transposed conv stride follows the AGENTS rule.
+
+Corrected presets:
+
+| Preset | Params | Param fp16 | State fp16 KiB | Rough GMAC/s at 44.1k hop512 | ONE q.circle |
+|---|---:|---:|---:|---:|---|
+| `compact-v2-hybrid` stride2 | 5,779 | 12.17 KiB | 160.31 | 0.224 | PASS |
+| `big-v2-hybrid-2m` token stride2 | 2,148,515 | 4.10 MiB | 120.47 | 0.478 | PASS |
+| `large-v2-hybrid-5m` token stride2 | 5,304,419 | 10.12 MiB | 168.66 | 0.832 | PASS |
+
+The GMAC/s values are rough Conv/ConvTranspose hook estimates, not hardware
+profiling, but they are useful for screening against the project guideline of
+less than 3 GMAC/s.
+
+The big DnR recipes were also corrected to train with the full STFT frontend:
+
+```text
+n_fft=2048
+hop_length=512
+freq_preprocess_enabled=true
+freq_preprocess_keep_bins=192
+freq_preprocess_target_bins=257
+freq_preprocess_mode=triangular
+```
+
+This avoids the earlier quality-risky recipe path that inherited `n_fft=512`
+just to make the core see F=257. The NPU core still exports and compiles at
+F=257, while training and host inference preserve the higher-resolution STFT
+frontend and apply fixed frequency preprocessing.
+
+Corrected compiled artifacts:
+
+```text
+logs/npu_verify_general/edge_fusion_npu_compact_fp512_v2_hybrid_stride2_20260520/model.q.circle
+logs/npu_verify_general/edge_fusion_npu_big_fp256_v2_hybrid_2m_token_stride2_20260520/model.q.circle
+logs/npu_verify_general/edge_fusion_npu_large_fp256_v2_hybrid_5m_token_stride2_20260520/model.q.circle
+```

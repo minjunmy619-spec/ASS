@@ -1,0 +1,7 @@
+_base_: ../edge-fusion-npu.tiny.rt192k/config.yaml
+
+# Full n_fft=2048 frontend, fixed F=1025 -> F=257 preprocessing before EdgeFusionNPU.
+edge_fusion_freq_preprocess_enabled: true
+edge_fusion_freq_preprocess_keep_bins: 192
+edge_fusion_freq_preprocess_target_bins: 257
+edge_fusion_freq_preprocess_mode: triangular

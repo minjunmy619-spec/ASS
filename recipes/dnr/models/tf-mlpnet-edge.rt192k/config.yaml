@@ -20,6 +20,10 @@ tiger_analysis_window: sqrt_hann
 tiger_detach_state: false
 tiger_chunk_size: 8
 tiger_model_kwargs: {}
+tiger_freq_preprocess_enabled: false
+tiger_freq_preprocess_keep_bins: 475
+tiger_freq_preprocess_target_bins: 512
+tiger_freq_preprocess_mode: triangular
 
 trainer:
   max_epochs: 150
@@ -87,6 +91,10 @@ task:
     detach_state: ${tiger_detach_state}
     chunk_size: ${tiger_chunk_size}
     model_kwargs: ${tiger_model_kwargs}
+    freq_preprocess_enabled: ${tiger_freq_preprocess_enabled}
+    freq_preprocess_keep_bins: ${tiger_freq_preprocess_keep_bins}
+    freq_preprocess_target_bins: ${tiger_freq_preprocess_target_bins}
+    freq_preprocess_mode: ${tiger_freq_preprocess_mode}
   loss:
     _target_: spectral_feature_compression.core.loss.snr.ThresSNRLossWithInactiveSource
     solve_perm: false

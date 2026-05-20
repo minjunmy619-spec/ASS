@@ -1,0 +1,7 @@
+_base_: ../dolphin-sfc-npu.large-6m/config.yaml
+
+# Full n_fft=4096 frontend, fixed F=2049 -> F=512 preprocessing before DolphinSFCNPU.
+freq_preprocess_enabled: true
+freq_preprocess_keep_bins: 475
+freq_preprocess_target_bins: 512
+freq_preprocess_mode: triangular

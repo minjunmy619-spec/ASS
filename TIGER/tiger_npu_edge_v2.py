@@ -1042,15 +1042,23 @@ class NPUStackedSeparator(nn.Module):
 def _calculate_band_widths(enc_dim: int, sample_rate: int) -> List[int]:
     """Calculate subband widths matching the original TIGER design."""
     import numpy as np
+    if enc_dim < 67:
+        raise ValueError(f"TIGER requires at least 67 frequency bins, got enc_dim={enc_dim}.")
     bandwidth_25 = int(np.floor(25 / (sample_rate / 2.0) * enc_dim))
     bandwidth_100 = int(np.floor(100 / (sample_rate / 2.0) * enc_dim))
     bandwidth_250 = int(np.floor(250 / (sample_rate / 2.0) * enc_dim))
     bandwidth_500 = int(np.floor(500 / (sample_rate / 2.0) * enc_dim))
-    band_width = [bandwidth_25] * 40
-    band_width += [bandwidth_100] * 10
-    band_width += [bandwidth_250] * 8
-    band_width += [bandwidth_500] * 8
-    band_width.append(int(enc_dim - int(np.sum(band_width))))
+    band_width = [max(1, bandwidth_25)] * 40
+    band_width += [max(1, bandwidth_100)] * 10
+    band_width += [max(1, bandwidth_250)] * 8
+    band_width += [max(1, bandwidth_500)] * 8
+    remainder = int(enc_dim - int(np.sum(band_width)))
+    if remainder <= 0:
+        raise ValueError(
+            f"TIGER band split over-allocates enc_dim={enc_dim}; "
+            f"minimum nonzero bands need {int(np.sum(band_width)) + 1} bins."
+        )
+    band_width.append(remainder)
     return band_width
 
 
