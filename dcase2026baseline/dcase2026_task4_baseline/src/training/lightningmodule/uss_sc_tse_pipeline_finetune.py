@@ -4,6 +4,7 @@ from typing import Dict, Optional
 
 import lightning.pytorch as pl
 import torch
+import torch.nn.functional as F
 
 from src.training.lightningmodule.online_teacher_tse import (
     OnlineTeacherTSELightning,
@@ -188,13 +189,109 @@ class USSScTSEPipelineFinetuneLightning(OnlineTeacherTSELightning):
                 loss_dict[key] = value.mean()
         return loss_dict
 
+    def _oracle_target_from_batch(self, batch):
+        target = {
+            "waveform": batch["waveform"],
+            "label_vector": batch["label_vector"],
+            "active_mask": batch["active_mask"],
+        }
+        if "span_sec" in batch:
+            target["span_sec"] = batch["span_sec"]
+        return target
+
+    def _prepare_uss_enrollment_and_sc(self, batch):
+        mixture = batch["mixture"]
+        uss_out = self.uss_model({"mixture": mixture})
+        if self.uss_output_key not in uss_out:
+            raise KeyError(f"USS output does not contain '{self.uss_output_key}'")
+        enrollment = uss_out[self.uss_output_key].detach()
+        if enrollment.dim() != 4:
+            raise ValueError(f"USS enrollment must have shape [B,S,C,T], got {tuple(enrollment.shape)}")
+        if enrollment.shape[-1] != mixture.shape[-1]:
+            enrollment = F.interpolate(
+                enrollment.flatten(0, 1),
+                size=mixture.shape[-1],
+                mode="linear",
+                align_corners=False,
+            ).view(enrollment.shape[0], enrollment.shape[1], enrollment.shape[2], mixture.shape[-1])
+        sc_out = self._teacher_sc_predict(enrollment)
+        query_condition = self._build_query_condition(uss_out, enrollment)
+        return uss_out, enrollment, sc_out, query_condition
+
+    def _masked_tse_target_from_alignment(self, aligned, active_mask):
+        masked = {
+            "waveform": aligned["waveform"].clone(),
+            "label_vector": aligned["label_vector"].clone(),
+            "active_mask": active_mask,
+        }
+        masked["waveform"][~active_mask] = 0.0
+        masked["label_vector"][~active_mask] = 0.0
+        if aligned["span_sec"] is not None:
+            masked["span_sec"] = aligned["span_sec"].clone()
+            masked["span_sec"][~active_mask] = -1.0
+        return masked
+
+    def _build_sc_after_tse_teacher_batch(self, batch):
+        mixture = batch["mixture"]
+        oracle_target = self._oracle_target_from_batch(batch)
+        with torch.no_grad():
+            uss_out, enrollment, sc_out, query_condition = self._prepare_uss_enrollment_and_sc(batch)
+
+        aligned = self._align_oracle_to_estimate_slots(enrollment, oracle_target)
+        sc_active = sc_out["label_vector"].abs().sum(dim=-1) > 0
+        class_match = self._class_match_mask(sc_out["label_vector"], aligned["label_vector"])
+
+        tse_active_mask = aligned["active_mask"].clone()
+        if self.require_sc_active_for_loss:
+            tse_active_mask = tse_active_mask & sc_active
+        if self.require_sc_class_match_for_loss:
+            tse_active_mask = tse_active_mask & class_match
+        tse_target = self._masked_tse_target_from_alignment(aligned, tse_active_mask)
+
+        if self.label_source == "sc":
+            tse_label = sc_out["label_vector"].detach()
+        elif self.label_source == "oracle":
+            tse_label = aligned["label_vector"].detach()
+        else:
+            raise ValueError("label_source must be 'sc' or 'oracle'")
+
+        input_dict = {
+            "mixture": mixture,
+            "enrollment": enrollment.detach(),
+            "label_vector": tse_label,
+        }
+        if query_condition is not None:
+            input_dict["query_condition"] = query_condition.detach()
+
+        temporal_conditioning = None
+        if self.temporal_conditioning_source in {"auto", "sc"} and "activity_probabilities" in sc_out:
+            temporal_conditioning = sc_out["activity_probabilities"]
+        elif self.temporal_conditioning_source in {"auto", "uss"} and "foreground_activity_logits" in uss_out:
+            temporal_conditioning = uss_out["foreground_activity_logits"].sigmoid()
+        if temporal_conditioning is not None:
+            input_dict["temporal_conditioning"] = temporal_conditioning.detach()
+
+        diagnostics = {
+            "teacher_matched_slots": aligned["active_mask"].float().sum(dim=1).mean(),
+            "teacher_tse_supervised_slots": tse_active_mask.float().sum(dim=1).mean(),
+            "teacher_sc_active_rate": sc_active.float().mean(),
+            "teacher_sc_class_match_rate": class_match[aligned["active_mask"]].float().mean()
+            if aligned["active_mask"].any()
+            else mixture.new_zeros(()),
+            "teacher_estimate_energy_db": aligned["estimate_energy_db"].mean(),
+        }
+        finite_scores = torch.isfinite(aligned["match_score"])
+        diagnostics["teacher_match_score"] = (
+            aligned["match_score"][finite_scores].mean() if finite_scores.any() else mixture.new_zeros(())
+        )
+        return input_dict, tse_target, oracle_target, diagnostics
+
     def _run_frozen_tse_pipeline(self, batch):
         _freeze_eval(self.uss_model)
         _freeze_eval(self.model)
-        input_dict, target_dict, diagnostics = self._build_teacher_batch(batch)
+        input_dict, target_dict, oracle_target, diagnostics = self._build_sc_after_tse_teacher_batch(batch)
         first_output = self.model(input_dict)
         final_output = first_output
-        final_target = target_dict
         refinement_passes = self._validate_tse_refinement_passes(getattr(self, "tse_refinement_passes", 1))
         if refinement_passes == 2:
             second_input, second_target, second_diagnostics = self._build_second_pass_input(
@@ -203,7 +300,6 @@ class USSScTSEPipelineFinetuneLightning(OnlineTeacherTSELightning):
                 target_dict,
             )
             final_output = self.model(second_input)
-            final_target = second_target
             diagnostics = {
                 **diagnostics,
                 **second_diagnostics,
@@ -214,7 +310,7 @@ class USSScTSEPipelineFinetuneLightning(OnlineTeacherTSELightning):
                 **diagnostics,
                 "teacher_second_pass_enabled": batch["mixture"].new_tensor(0.0),
             }
-        return final_output, final_target, diagnostics
+        return final_output, oracle_target, diagnostics
 
     def _sc_target_from_tse_target(self, target_dict, device, dtype, is_training):
         label_vector = target_dict["label_vector"].to(device=device)
@@ -246,10 +342,20 @@ class USSScTSEPipelineFinetuneLightning(OnlineTeacherTSELightning):
         teacher_sc_was_training = self.sc_model.training
         self.sc_model.eval()
         with torch.no_grad():
-            tse_out, target_dict, diagnostics = self._run_frozen_tse_pipeline(batch)
+            tse_out, oracle_target, diagnostics = self._run_frozen_tse_pipeline(batch)
             if "waveform" not in tse_out:
                 raise KeyError("TSE output does not contain 'waveform'")
             waveform = tse_out["waveform"].detach()
+            target_dict = self._align_oracle_to_estimate_slots(waveform, oracle_target)
+            diagnostics = {
+                **diagnostics,
+                "pipeline_sc_final_matched_slots": target_dict["active_mask"].float().sum(dim=1).mean(),
+                "pipeline_sc_final_estimate_energy_db": target_dict["estimate_energy_db"].mean(),
+            }
+            finite_scores = torch.isfinite(target_dict["match_score"])
+            diagnostics["pipeline_sc_final_match_score"] = (
+                target_dict["match_score"][finite_scores].mean() if finite_scores.any() else waveform.new_zeros(())
+            )
         self.sc_model.train(stage == "train" and teacher_sc_was_training)
 
         batch_size, n_sources, channels, samples = waveform.shape

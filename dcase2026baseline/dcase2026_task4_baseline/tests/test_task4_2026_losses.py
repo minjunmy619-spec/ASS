@@ -123,6 +123,15 @@ class _RecordingTwoPassTSE(torch.nn.Module):
         }
 
 
+class _IdentityTSE(torch.nn.Module):
+    def forward(self, input_dict):
+        activity_logits = input_dict["enrollment"].new_zeros(input_dict["enrollment"].shape[:2] + (4,))
+        return {
+            "waveform": input_dict["enrollment"],
+            "activity_logits": activity_logits,
+        }
+
+
 class _SecondPassSilentSC(torch.nn.Module):
     def __init__(self, first_label_vector, second_label_vector):
         super().__init__()
@@ -405,6 +414,39 @@ def test_pipeline_sc_after_tse_trains_sc_on_final_tse_outputs():
     assert loss_dict["pipeline_sc_silence_slots"].item() == 1.0
     assert loss_dict["pipeline_sc_sample_weight_mean"].item() == pytest.approx((1.0 + 1.0 + 0.25) / 3.0)
     assert loss_dict["loss"].requires_grad
+
+
+def test_pipeline_sc_after_tse_does_not_turn_sc_false_negative_into_silence_target():
+    module = _pipeline_finetune_shell()
+    target_waveform = torch.zeros(1, 3, 1, 8)
+    target_waveform[0, 0, 0, 0:2] = 1.0
+    target_waveform[0, 1, 0, 3:5] = 1.0
+    enrollment = target_waveform[:, [1, 0, 2]].clone()
+    sc_labels = torch.zeros(1, 3, 4)
+    sc_labels[0, 0, 1] = 1.0
+    label_vector = torch.zeros(1, 3, 4)
+    label_vector[0, 0, 0] = 1.0
+    label_vector[0, 1, 1] = 1.0
+    sc = _TrainableRecordingSC(sc_labels)
+    object.__setattr__(module, "uss_model", _DummyUSS(enrollment))
+    object.__setattr__(module, "model", _IdentityTSE())
+    object.__setattr__(module, "sc_model", sc)
+
+    loss_dict = module._step_sc_after_tse(
+        {
+            "mixture": torch.zeros(1, 4, 8),
+            "waveform": target_waveform,
+            "label_vector": label_vector,
+            "active_mask": torch.tensor([[True, True, False]]),
+            "span_sec": torch.tensor([[[0.0, 0.25], [0.375, 0.625], [-1.0, -1.0]]]),
+        },
+        "train",
+    )
+
+    assert loss_dict["teacher_tse_supervised_slots"].item() == 1.0
+    assert loss_dict["pipeline_sc_final_matched_slots"].item() == 2.0
+    assert loss_dict["pipeline_sc_active_slots"].item() == 2.0
+    assert loss_dict["pipeline_sc_silence_slots"].item() == 1.0
 
 
 def test_pipeline_finetune_configs_reuse_pretraining_components():

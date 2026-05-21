@@ -35,6 +35,10 @@ def _select_prefixed_model_state(state_dict, model, preferred_prefixes=()):
         if stripped and any(key in model_state for key in stripped):
             return stripped
 
+    exact_matches = {key: value for key, value in state_dict.items() if key in model_state}
+    if exact_matches:
+        return exact_matches
+
     one_model_key = next(iter(model_state.keys()))
     suffix_matches = [
         key for key in state_dict
@@ -59,7 +63,7 @@ def _load_model_checkpoint(model, checkpoint_path, strict=True, name="model", al
     preferred_prefixes = {
         "uss": ("uss_model.",),
         "sc": ("sc_model.",),
-        "tse": ("tse_model.",),
+        "tse": ("tse_model.", "model."),
     }.get(name, ())
     state = _select_prefixed_model_state(state, model, preferred_prefixes=preferred_prefixes)
     if strict:

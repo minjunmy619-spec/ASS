@@ -282,6 +282,28 @@ def test_online_teacher_loader_can_extract_uss_and_sc_from_joint_checkpoint(tmp_
     assert torch.equal(sc.weight, sc_weight)
 
 
+def test_online_teacher_loader_can_extract_tse_from_pipeline_checkpoint(tmp_path):
+    tse = torch.nn.Linear(2, 2, bias=False)
+    tse_weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    uss_weight = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+    sc_weight = torch.tensor([[9.0, 10.0], [11.0, 12.0]])
+    ckpt_path = tmp_path / "pipeline.ckpt"
+    torch.save(
+        {
+            "state_dict": {
+                "model.weight": tse_weight,
+                "uss_model.weight": uss_weight,
+                "sc_model.weight": sc_weight,
+            }
+        },
+        ckpt_path,
+    )
+
+    _load_teacher_checkpoint(tse, str(ckpt_path), strict=True, name="tse")
+
+    assert torch.equal(tse.weight, tse_weight)
+
+
 def test_stage_loader_can_select_sc_prefix_from_joint_checkpoint(tmp_path):
     sc = torch.nn.Linear(2, 2, bias=False)
     uss_weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])

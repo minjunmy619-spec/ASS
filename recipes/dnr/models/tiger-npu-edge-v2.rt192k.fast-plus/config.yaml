@@ -1,0 +1,19 @@
+_base_: ../tiger-npu-edge-v2.rt192k/config.yaml
+
+# Fast quality-recovery V2 ablation.
+#
+# Keep two separator stages so graph size and layout-transpose count stay near
+# base V2, but strengthen each stage's temporal/attention path.  We keep
+# out_channels at the base value so the already-large fused encoder/decoder do
+# not grow; the added capacity lands in the separator instead.
+tiger_model_kwargs:
+  in_channels: 160
+  num_stages: 2
+  att_hid_chan: 4
+  att_val_hid_chan: 4
+  kv_window_size: 8
+  time_hidden_channels: 16
+  time_dilations: [1, 2, 4]
+  time_global_kernel_size: 7
+
+tiger_chunk_size: 16

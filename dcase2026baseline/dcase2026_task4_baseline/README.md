@@ -249,6 +249,108 @@ For stronger SC branches, use sibling configs such as
 in `_robust.yaml` and should be used only after a matching non-robust branch has
 been measured.
 
+### Online pipeline fine-tuning: USS -> SC -> TSE -> SC
+
+The repo also provides an opt-in general pipeline wrapper for fine-tuning on
+the same live handoff used by S5 inference. This is different from the cached
+estimated-source recipes above: USS, SC, and TSE are joined inside the
+Lightning module on every training batch.
+
+Main wrapper:
+
+```text
+src/training/lightningmodule/uss_sc_tse_pipeline_finetune.py
+```
+
+Detailed operation notes:
+
+```text
+docs/pipeline_finetune_operation.md
+```
+
+The wrapper has two modes.
+
+| Config | Trainable model | Frozen models | Training signal |
+| --- | --- | --- | --- |
+| `config/separation/modified_deft_pipeline_finetune_tse_uss_sc.yaml` | TSE | USS, SC | `masked_snr` TSE loss on oracle sources aligned to USS slots |
+| `config/separation/modified_deft_pipeline_finetune_sc_after_tse.yaml` | SC | USS, TSE | `m2d_sc_arcface` SC loss on final TSE outputs re-matched to oracle sources |
+
+The recommended order is:
+
+1. Train or select a strong USS checkpoint.
+2. Train or select an SC checkpoint adapted to estimated sources.
+3. Fine-tune TSE with frozen USS and SC.
+4. Evaluate the full S5 path with the new TSE checkpoint.
+5. Fine-tune SC after frozen USS and frozen TSE.
+6. Evaluate the full S5 path again, especially source classification F1,
+   CAPI-SDRi, false positives, silence accuracy, and duplicate-class recovery.
+
+TSE pipeline fine-tune:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 NUMBA_CACHE_DIR=/tmp/numba_cache \
+  .venv/bin/python -m src.train \
+  -c config/separation/modified_deft_pipeline_finetune_tse_uss_sc.yaml \
+  --workspace workspace/pipeline_finetune
+```
+
+This stage uses:
+
+```text
+mixture -> frozen USS -> estimated source slots
+estimated source slots -> frozen SC -> query labels/activity
+mixture + USS slots + SC labels -> trainable TSE
+```
+
+Only TSE parameters are optimized. USS and SC are kept in eval mode with
+gradients disabled. The TSE input dictionary contains `mixture`, `enrollment`,
+`label_vector`, and optional `query_condition` / `temporal_conditioning`.
+
+SC-after-TSE fine-tune:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 NUMBA_CACHE_DIR=/tmp/numba_cache \
+  .venv/bin/python -m src.train \
+  -c config/separation/modified_deft_pipeline_finetune_sc_after_tse.yaml \
+  --workspace workspace/pipeline_finetune
+```
+
+Before running this stage, set `pretrained_model_ckpt` in
+`modified_deft_pipeline_finetune_sc_after_tse.yaml` to the TSE checkpoint
+produced by the previous stage. The checkpoint loader can extract TSE weights
+from a pipeline checkpoint containing `model.*`, `uss_model.*`, and
+`sc_model.*` keys.
+
+This stage uses:
+
+```text
+mixture -> frozen USS -> estimated source slots
+estimated source slots -> SC query prediction for frozen TSE
+mixture + USS slots + SC labels -> frozen TSE -> refined waveforms
+refined waveforms -> oracle re-match -> trainable SC loss
+```
+
+The final SC target is intentionally built from a fresh waveform-to-oracle match
+on the final TSE output, not from the SC-gated TSE supervision mask. This avoids
+two common failure modes:
+
+- SC false negatives becoming silence labels for the final SC update.
+- Wrong SC query labels being blindly treated as correct final SC supervision.
+
+Useful logs to watch:
+
+- `teacher_matched_slots`: how many USS slots matched oracle sources before TSE.
+- `teacher_tse_supervised_slots`: how many rows were useful for frozen TSE
+  supervision after SC-active/class gating.
+- `pipeline_sc_final_matched_slots`: how many final TSE outputs could be
+  matched back to oracle sources for SC training.
+- `pipeline_sc_final_match_score`: quality of the final TSE-to-oracle match.
+- `pipeline_sc_top1`: SC top-1 on active final matched TSE outputs.
+
+If `pipeline_sc_final_matched_slots` or `pipeline_sc_final_match_score` is low,
+the SC-after-TSE stage is likely to hurt instead of help; first improve USS/TSE
+or relax the match only after checking waveform quality.
+
 ### Training hyperparameters
 
 Some hyperparameters that affect training time and performance can be set in the YAML configuration files
