@@ -2,6 +2,7 @@ import os
 import sys
 import datetime
 import logging
+import copy
 from typing import Dict, List, NoReturn
 import yaml
 import importlib
@@ -68,6 +69,54 @@ def logging_setup(directory, file_log_level = "INFO", console_log_level = 'DEBUG
     root_logger.addHandler(console_handler)
 
 
+def _get_by_path(obj, dotted_path):
+    cur = obj
+    for part in dotted_path.split("."):
+        if isinstance(cur, dict):
+            cur = cur[part]
+        elif isinstance(cur, list):
+            cur = cur[int(part)]
+        else:
+            raise KeyError(f"Cannot descend into {type(cur)} at '{part}' for path '{dotted_path}'")
+    return cur
+
+
+def _deep_update(base, updates):
+    base = copy.deepcopy(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key] = _deep_update(base[key], value)
+        else:
+            base[key] = copy.deepcopy(value)
+    return base
+
+
+def _resolve_config_references(obj, base_dir=None):
+    if isinstance(obj, list):
+        return [_resolve_config_references(x, base_dir=base_dir) for x in obj]
+    if not isinstance(obj, dict):
+        return obj
+
+    ref_path = obj.get("from_training_config", obj.get("config_ref", None))
+    if ref_path is not None:
+        candidate = ref_path
+        if not os.path.isabs(candidate) and not os.path.exists(candidate) and base_dir:
+            candidate = os.path.join(base_dir, candidate)
+        with open(candidate, "r") as fr:
+            ref_cfg = yaml.load(fr, Loader=yaml.FullLoader)
+        ref_cfg = _resolve_config_references(ref_cfg, base_dir=os.path.dirname(os.path.abspath(candidate)))
+        key = obj.get("key", "lightning_module.args.model")
+        value = copy.deepcopy(_get_by_path(ref_cfg, key))
+        overrides = obj.get("overrides", obj.get("override", None))
+        if overrides:
+            if not isinstance(value, dict) or not isinstance(overrides, dict):
+                raise TypeError("override(s) can only be applied when both referenced value and override are dictionaries")
+            value = _deep_update(value, overrides)
+        return value
+
+    return {k: _resolve_config_references(v, base_dir=base_dir) for k, v in obj.items()}
+
+
 def parse_yaml(config_yaml: str) -> Dict:
     r"""Parse yaml file.
 
@@ -79,7 +128,8 @@ def parse_yaml(config_yaml: str) -> Dict:
     """
 
     with open(config_yaml, "r") as fr:
-        return yaml.load(fr, Loader=yaml.FullLoader)
+        cfg = yaml.load(fr, Loader=yaml.FullLoader)
+    return _resolve_config_references(cfg, base_dir=os.path.dirname(os.path.abspath(config_yaml)))
 
 def initialize_config(module_cfg, reload=False):
     if reload and module_cfg["module"] in sys.modules:

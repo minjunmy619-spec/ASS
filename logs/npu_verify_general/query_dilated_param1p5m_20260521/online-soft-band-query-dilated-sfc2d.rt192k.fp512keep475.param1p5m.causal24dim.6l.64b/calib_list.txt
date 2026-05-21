@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/query_dilated_param1p5m_20260521/online-soft-band-query-dilated-sfc2d.rt192k.fp512keep475.param1p5m.causal24dim.6l.64b/calib_sample000_input00.npy

@@ -1,0 +1,62 @@
+task_name: modified_deft_pipeline_finetune_tse_uss_sc
+description: >
+  General pipeline wrapper for finetuning TSE from the live USS -> SC -> TSE
+  handoff. USS and SC are frozen teachers; TSE is the only trainable model.
+
+deterministic: true
+manual_seed: 0
+
+datamodule:
+  from_training_config: modified_deft_tse_lite_6s_online_teacher_uss_sc.yaml
+  key: datamodule
+
+lightning_module:
+  module: src.training.lightningmodule.uss_sc_tse_pipeline_finetune
+  main: USSScTSEPipelineFinetuneLightning
+  args:
+    target_stage: tse
+    uss_pretrained_ckpt: checkpoint/modified_deft_uss_lite_6s_unified_all_features.ckpt
+    sc_pretrained_ckpt: checkpoint/m2d_sc_stage3_estimated_pretrainedsed_fusion.ckpt
+    pretrained_model_ckpt: checkpoint/modified_deft_tse_lite_6s_temporal.ckpt
+    pretrained_model_strict: false
+    uss_pretrained_strict: true
+    sc_pretrained_strict: true
+    match_metric: sa_sdr
+    min_match_score: -20.0
+    min_estimate_energy_db: -80.0
+    require_sc_active_for_loss: true
+    require_sc_class_match_for_loss: false
+    label_source: sc
+    query_condition_enabled: true
+    temporal_conditioning_source: auto
+    tse_refinement_passes: 1
+    uss_model:
+      from_training_config: modified_deft_sc_primary_frozenuss_pretrainedsed_fusion.yaml
+      key: lightning_module.args.uss_model
+    sc_model:
+      from_training_config: ../label/m2d_sc_stage3_estimated_pretrainedsed_fusion.yaml
+      key: lightning_module.args.model
+    model:
+      from_training_config: modified_deft_tse_lite_6s_temporal.yaml
+      key: lightning_module.args.model
+      overrides:
+        args:
+          query_condition_dim: 256
+          query_condition_hidden_dim: 256
+          query_condition_scale: 0.5
+          query_condition_dropout: 0.0
+          require_query_condition: true
+    loss:
+      from_training_config: modified_deft_tse_lite_6s_temporal.yaml
+      key: lightning_module.args.loss
+    optimizer:
+      from_training_config: modified_deft_tse_lite_6s_temporal.yaml
+      key: lightning_module.args.optimizer
+      overrides:
+        args:
+          lr: 0.00005
+    is_validation: true
+
+train:
+  from_training_config: modified_deft_tse_lite_6s_online_teacher_uss_sc.yaml
+  key: train

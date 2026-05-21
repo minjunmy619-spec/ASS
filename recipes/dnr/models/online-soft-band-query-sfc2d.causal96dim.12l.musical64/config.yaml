@@ -86,7 +86,9 @@ task:
     band_config: ${online_band_config}
     d_model: ${online_d_model}
     n_layers: ${online_n_layers}
-    kernel_size: [${online_kernel_t}, ${online_kernel_f}]
+    kernel_size:
+      - ${online_kernel_t}
+      - ${online_kernel_f}
     causal: ${online_causal}
     masking: ${online_masking}
     routing_normalization: ${online_routing_normalization}

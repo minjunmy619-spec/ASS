@@ -66,10 +66,20 @@ def get_loss_func(
 
         loss = output["plain_logits"].new_tensor(0.0)
         metrics = {}
-        sample_weights = torch.ones_like(is_silence, dtype=output["plain_logits"].dtype)
         plain_logits = output["plain_logits"].float()
+        sample_weights = target.get("sample_weight", None)
+        if sample_weights is None:
+            sample_weights = torch.ones_like(is_silence, dtype=plain_logits.dtype, device=plain_logits.device)
+        else:
+            sample_weights = sample_weights.to(device=plain_logits.device, dtype=plain_logits.dtype).clamp_min(0.0)
+        metrics["sample_weight_mean"] = sample_weights.mean()
+        metrics["sample_weight_active_mean"] = (
+            sample_weights[~is_silence].mean() if (~is_silence).any() else loss.new_tensor(0.0)
+        )
+        effective_sample_weights = sample_weights.clone()
 
         if (~is_silence).any():
+            active_sample_weights = sample_weights[~is_silence]
             active_losses = F.cross_entropy(
                 output["logits"].float()[~is_silence],
                 class_index[~is_silence],
@@ -82,22 +92,29 @@ def get_loss_func(
                 reduction="none",
             )
             plain_pred = torch.argmax(plain_logits[~is_silence], dim=-1)
-            metrics["loss_plain_ce"] = plain_ce.mean()
-            metrics["active_top1"] = (plain_pred == class_index[~is_silence]).float().mean() * 100.0
+            metrics["loss_plain_ce"] = _weighted_mean(plain_ce, active_sample_weights)
+            metrics["active_top1"] = (
+                _weighted_mean(
+                    (plain_pred == class_index[~is_silence]).to(dtype=plain_logits.dtype),
+                    active_sample_weights,
+                )
+                * 100.0
+            )
             if robust_active:
-                active_weights = _loss_truncation_weights(
+                truncation_weights = _loss_truncation_weights(
                     active_losses,
                     quantile=truncation_quantile,
                     drop_weight=truncation_drop_weight,
                     min_keep_ratio=min_keep_ratio,
                 )
-                sample_weights[~is_silence] = active_weights
+                active_weights = active_sample_weights * truncation_weights.to(dtype=active_sample_weights.dtype)
+                effective_sample_weights[~is_silence] = active_weights
                 loss_arc = _weighted_mean(active_losses, active_weights)
                 metrics["loss_arcface_raw"] = active_losses.mean()
-                metrics["loss_truncation_weight_mean"] = active_weights.mean()
-                metrics["loss_truncation_kept_ratio"] = active_weights.gt(truncation_drop_weight).to(active_weights.dtype).mean()
+                metrics["loss_truncation_weight_mean"] = truncation_weights.mean()
+                metrics["loss_truncation_kept_ratio"] = truncation_weights.gt(truncation_drop_weight).to(truncation_weights.dtype).mean()
             else:
-                loss_arc = active_losses.mean()
+                loss_arc = _weighted_mean(active_losses, active_sample_weights)
                 metrics["loss_arcface_raw"] = loss_arc
                 metrics["loss_truncation_weight_mean"] = loss.new_tensor(1.0)
                 metrics["loss_truncation_kept_ratio"] = loss.new_tensor(1.0)
@@ -114,11 +131,13 @@ def get_loss_func(
         if is_silence.any():
             log_probs = F.log_softmax(plain_logits[is_silence], dim=-1)
             uniform = torch.full_like(log_probs, 1.0 / log_probs.shape[-1])
-            loss_kl = F.kl_div(log_probs, uniform, reduction="batchmean")
+            kl_each = F.kl_div(log_probs, uniform, reduction="none").sum(dim=-1)
+            silence_weights = sample_weights[is_silence]
+            loss_kl = _weighted_mean(kl_each, silence_weights)
             loss = loss + loss_kl
             metrics["loss_kl"] = loss_kl
             silence_confidence = torch.softmax(plain_logits[is_silence], dim=-1).max(dim=-1).values
-            metrics["silence_max_probability"] = silence_confidence.mean() * 100.0
+            metrics["silence_max_probability"] = _weighted_mean(silence_confidence, silence_weights) * 100.0
         else:
             metrics["loss_kl"] = loss.new_tensor(0.0)
             metrics["silence_max_probability"] = loss.new_tensor(0.0)
@@ -127,8 +146,16 @@ def get_loss_func(
             energy = output["energy"].float()
             loss_in = energy[~is_silence] - m_in if (~is_silence).any() else energy.new_zeros(1)
             loss_out = m_out - energy[is_silence] if is_silence.any() else energy.new_zeros(1)
-            hinge_in = torch.clamp(loss_in, min=0.0).pow(2).mean() if (~is_silence).any() else energy.new_tensor(0.0)
-            hinge_out = torch.clamp(loss_out, min=0.0).pow(2).mean() if is_silence.any() else energy.new_tensor(0.0)
+            hinge_in = (
+                _weighted_mean(torch.clamp(loss_in, min=0.0).pow(2), sample_weights[~is_silence])
+                if (~is_silence).any()
+                else energy.new_tensor(0.0)
+            )
+            hinge_out = (
+                _weighted_mean(torch.clamp(loss_out, min=0.0).pow(2), sample_weights[is_silence])
+                if is_silence.any()
+                else energy.new_tensor(0.0)
+            )
             loss_energy = hinge_in + hinge_out
             loss = loss + lambda_energy * loss_energy
             metrics["loss_energy"] = loss_energy
@@ -141,7 +168,7 @@ def get_loss_func(
         if lambda_duplicate_recall > 0.0 and duplicate_mask is not None and duplicate_mask.any():
             duplicate_energy = output["energy"][duplicate_mask]
             duplicate_penalty = torch.clamp(duplicate_energy - duplicate_m_in, min=0.0).pow(2)
-            duplicate_weights = sample_weights.to(device=duplicate_penalty.device, dtype=duplicate_penalty.dtype)[duplicate_mask]
+            duplicate_weights = effective_sample_weights.to(device=duplicate_penalty.device, dtype=duplicate_penalty.dtype)[duplicate_mask]
             loss_duplicate_recall = _weighted_mean(duplicate_penalty, duplicate_weights)
             loss = loss + lambda_duplicate_recall * loss_duplicate_recall
             metrics["loss_duplicate_recall"] = loss_duplicate_recall

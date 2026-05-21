@@ -26,6 +26,8 @@ from src.training.loss.m2d_sc_arcface import get_loss_func as get_sc_loss_func
 from src.training.loss.masked_snr import get_loss_func as get_tse_loss_func
 from src.training.loss.uss_loss import get_loss_func as get_uss_loss_func
 from src.training.lightningmodule.online_teacher_tse import OnlineTeacherTSELightning
+from src.training.lightningmodule.uss_sc_tse_pipeline_finetune import USSScTSEPipelineFinetuneLightning
+from src.utils import parse_yaml
 from src.evaluation.metrics.s5capi_metric import (
     S5ClassAwareMetric,
     S5ClassAwareMetricAssignmentComparison,
@@ -143,8 +145,56 @@ class _SecondPassSilentSC(torch.nn.Module):
         }
 
 
+class _TrainableRecordingSC(torch.nn.Module):
+    def __init__(self, label_vector):
+        super().__init__()
+        self.label_vector = label_vector
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.forward_waveform = None
+
+    def predict(self, input_dict):
+        flat = self.label_vector.reshape(-1, self.label_vector.shape[-1])
+        active = flat.abs().sum(dim=-1) > 0
+        return {
+            "label_vector": flat,
+            "raw_label_vector": flat,
+            "class_indices": torch.argmax(flat, dim=-1),
+            "probabilities": active.float(),
+            "energy": flat.new_zeros(flat.shape[0]),
+            "silence": ~active,
+        }
+
+    def forward(self, input_dict):
+        self.forward_waveform = input_dict["waveform"].detach().clone()
+        class_index = input_dict["class_index"]
+        logits = torch.zeros(
+            class_index.numel(),
+            self.label_vector.shape[-1],
+            device=class_index.device,
+            dtype=self.scale.dtype,
+        )
+        logits = logits + self.scale * torch.nn.functional.one_hot(
+            class_index,
+            num_classes=self.label_vector.shape[-1],
+        ).to(dtype=logits.dtype)
+        return {
+            "plain_logits": logits,
+            "logits": logits,
+            "energy": -torch.logsumexp(logits, dim=-1),
+        }
+
+
 def _simple_tse_loss(output_dict, target_dict):
     return {"loss": (output_dict["waveform"] - target_dict["waveform"]).abs().mean()}
+
+
+def _simple_sc_loss(output_dict, target_dict):
+    losses = torch.nn.functional.cross_entropy(
+        output_dict["logits"],
+        target_dict["class_index"],
+        reduction="none",
+    )
+    return {"loss": (losses * target_dict["sample_weight"]).mean()}
 
 
 def _online_teacher_shell():
@@ -162,6 +212,27 @@ def _online_teacher_shell():
     module.tse_refinement_passes = 1
     module.second_pass_loss_weight = 1.0
     module.second_pass_detach_enrollment = True
+    return module
+
+
+def _pipeline_finetune_shell():
+    module = object.__new__(USSScTSEPipelineFinetuneLightning)
+    module.uss_output_key = "foreground_waveform"
+    module.match_metric = "sa_sdr"
+    module.min_match_score = -100.0
+    module.min_estimate_energy_db = -100.0
+    module.require_sc_active_for_loss = True
+    module.require_sc_class_match_for_loss = False
+    module.label_source = "sc"
+    module.query_condition_enabled = True
+    module.query_condition_key = None
+    module.temporal_conditioning_source = "auto"
+    module.tse_refinement_passes = 1
+    module.second_pass_loss_weight = 1.0
+    module.second_pass_detach_enrollment = True
+    module.sc_active_sample_weight = 1.0
+    module.sc_silence_sample_weight = 0.25
+    module.sc_loss_func = _simple_sc_loss
     return module
 
 
@@ -298,6 +369,57 @@ def test_online_teacher_two_pass_masks_second_loss_with_second_sc_output():
     assert second_target_dict["active_mask"].tolist() == [[True, False, False]]
     assert torch.allclose(second_target_dict["waveform"][0, 1], torch.zeros_like(second_target_dict["waveform"][0, 1]))
     assert diagnostics["teacher_second_pass_matched_slots"].item() == 1.0
+
+
+def test_pipeline_sc_after_tse_trains_sc_on_final_tse_outputs():
+    module = _pipeline_finetune_shell()
+    target_waveform = torch.zeros(1, 3, 1, 8)
+    target_waveform[0, 0, 0, 0:2] = 1.0
+    target_waveform[0, 1, 0, 3:5] = 1.0
+    enrollment = target_waveform[:, [1, 0, 2]].clone()
+    sc_labels = torch.zeros(1, 3, 4)
+    sc_labels[0, 0, 1] = 1.0
+    sc_labels[0, 1, 0] = 1.0
+    label_vector = torch.zeros(1, 3, 4)
+    label_vector[0, 0, 0] = 1.0
+    label_vector[0, 1, 1] = 1.0
+    tse = _RecordingTwoPassTSE()
+    sc = _TrainableRecordingSC(sc_labels)
+    object.__setattr__(module, "uss_model", _DummyUSS(enrollment))
+    object.__setattr__(module, "model", tse)
+    object.__setattr__(module, "sc_model", sc)
+
+    loss_dict = module._step_sc_after_tse(
+        {
+            "mixture": torch.zeros(1, 4, 8),
+            "waveform": target_waveform,
+            "label_vector": label_vector,
+            "active_mask": torch.tensor([[True, True, False]]),
+            "span_sec": torch.tensor([[[0.0, 0.25], [0.375, 0.625], [-1.0, -1.0]]]),
+        },
+        "train",
+    )
+
+    assert torch.allclose(sc.forward_waveform.view(1, 3, 1, 8), enrollment + 0.5)
+    assert loss_dict["pipeline_sc_active_slots"].item() == 2.0
+    assert loss_dict["pipeline_sc_silence_slots"].item() == 1.0
+    assert loss_dict["pipeline_sc_sample_weight_mean"].item() == pytest.approx((1.0 + 1.0 + 0.25) / 3.0)
+    assert loss_dict["loss"].requires_grad
+
+
+def test_pipeline_finetune_configs_reuse_pretraining_components():
+    tse_cfg = parse_yaml("config/separation/modified_deft_pipeline_finetune_tse_uss_sc.yaml")
+    sc_cfg = parse_yaml("config/separation/modified_deft_pipeline_finetune_sc_after_tse.yaml")
+
+    assert tse_cfg["lightning_module"]["main"] == "USSScTSEPipelineFinetuneLightning"
+    assert tse_cfg["lightning_module"]["args"]["target_stage"] == "tse"
+    assert tse_cfg["lightning_module"]["args"]["model"]["main"] == "ModifiedDeFTTSEMemoryEfficientTemporal"
+    assert tse_cfg["lightning_module"]["args"]["sc_model"]["main"] == "M2DPretrainedSEDFusionClassifier"
+    assert tse_cfg["lightning_module"]["args"]["model"]["args"]["require_query_condition"] is True
+
+    assert sc_cfg["lightning_module"]["args"]["target_stage"] == "sc_after_tse"
+    assert sc_cfg["lightning_module"]["args"]["sc_loss"]["module"] == "src.training.loss.m2d_sc_arcface"
+    assert sc_cfg["train"]["trainer"]["args"]["devices"] == 1
 
 
 def test_estimated_enrollment_crop_deactivates_out_of_window_sources():
@@ -895,6 +1017,39 @@ def test_sc_loss_truncation_downweights_high_loss_active_labels():
     assert robust["loss_arcface"].item() < plain["loss_arcface"].item()
     assert robust["loss_arcface_raw"].item() == pytest.approx(plain["loss_arcface"].item())
     assert robust["loss_truncation_kept_ratio"].item() == pytest.approx(2.0 / 3.0)
+
+
+def test_sc_loss_respects_external_sample_weights():
+    logits = torch.tensor(
+        [
+            [8.0, -8.0],
+            [8.0, -8.0],
+        ],
+        requires_grad=True,
+    )
+    output = {
+        "logits": logits,
+        "plain_logits": logits,
+        "energy": torch.zeros(2, requires_grad=True),
+    }
+    target = {
+        "class_index": torch.tensor([0, 1]),
+        "is_silence": torch.tensor([False, False]),
+        "sample_weight": torch.tensor([1.0, 0.0]),
+    }
+
+    weighted = get_sc_loss_func(lambda_energy=0.0)(output, target)
+    unweighted = get_sc_loss_func(lambda_energy=0.0)(
+        output,
+        {
+            "class_index": target["class_index"],
+            "is_silence": target["is_silence"],
+        },
+    )
+
+    assert weighted["loss_arcface"].item() < unweighted["loss_arcface"].item()
+    assert weighted["active_top1"].item() == pytest.approx(100.0)
+    assert weighted["sample_weight_active_mean"].item() == pytest.approx(0.5)
 
 
 def test_sc_loss_truncation_respects_warmup_and_validation_default():

@@ -1,0 +1,16 @@
+_base_: ../online-soft-band-query-dilated-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml
+
+# Large variant with fewer streaming I/O tensors. The first 3 separator layers
+# use temporal kernel 1, so they refine channel/band features without exposing
+# cache tensors. The last 3 layers keep causal temporal kernels, ending with a
+# dilation-2 layer for extra receptive field while staying ONE-import friendly.
+online_d_model: 32
+online_n_layers: 6
+online_dilation_cycle: [1, 1, 1, 1, 1, 2]
+online_pooled_mixer_hidden: 1856
+online_stateless_separator_layers: 3
+
+task:
+  model:
+    pooled_mixer_hidden: ${online_pooled_mixer_hidden}
+    stateless_separator_layers: ${online_stateless_separator_layers}

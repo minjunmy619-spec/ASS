@@ -108,8 +108,13 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         clean_match_margin: float = -1.0e9,
         uncertain_weight: float = 0.35,
         use_uncertain_matches: bool = False,
+        bad_match_silence_weight: float = 0.0,
         sc_update_every: int = 1,
         detach_waveform_for_sc: bool = False,
+        clean_source_mix_prob: float = 0.0,
+        clean_source_mix_weight: float = 1.0,
+        clean_silence_mix_prob: float = 0.0,
+        clean_silence_mix_weight: float = 1.0,
         is_validation: bool = True,
     ):
         super().__init__()
@@ -144,8 +149,13 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         self.clean_match_margin = float(clean_match_margin)
         self.uncertain_weight = float(uncertain_weight)
         self.use_uncertain_matches = bool(use_uncertain_matches)
+        self.bad_match_silence_weight = max(0.0, float(bad_match_silence_weight))
         self.sc_update_every = max(1, int(sc_update_every))
         self.detach_waveform_for_sc = bool(detach_waveform_for_sc)
+        self.clean_source_mix_prob = min(1.0, max(0.0, float(clean_source_mix_prob)))
+        self.clean_source_mix_weight = max(0.0, float(clean_source_mix_weight))
+        self.clean_silence_mix_prob = min(1.0, max(0.0, float(clean_silence_mix_prob)))
+        self.clean_silence_mix_weight = max(0.0, float(clean_silence_mix_weight))
         self.is_validation = bool(is_validation)
 
         # Sanity check: cannot freeze both models
@@ -232,7 +242,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         target["current_epoch"] = self.current_epoch
         return target
 
-    def _build_slot_targets(self, sep, batch):
+    def _build_slot_targets(self, sep, batch, return_ref_index: bool = False):
         """Assign oracle class/span labels to predicted USS foreground slots."""
         ref = self._to_uss(batch["foreground_waveform"])
         class_index_ref = self._to_uss(batch["class_index"])
@@ -244,6 +254,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         is_silence = torch.ones(bsz, n_est, dtype=torch.bool, device=self.uss_device)
         sample_weight = torch.zeros(bsz, n_est, dtype=sep.dtype, device=self.uss_device)
         quality_code = torch.zeros(bsz, n_est, dtype=torch.long, device=self.uss_device)
+        ref_index = torch.full((bsz, n_est), -1, dtype=torch.long, device=self.uss_device)
         span_sec = None
         if span_ref is not None:
             span_sec = torch.tensor(SILENCE_SPAN_SEC, dtype=sep.dtype, device=self.uss_device).view(1, 1, 2).expand(bsz, n_est, 2).clone()
@@ -254,6 +265,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
                 active_refs = _active_indices(is_silence_ref[b])
                 est_to_ref = _best_assignment(scores[b], active_refs, n_est)
                 for est_idx, ref_idx in est_to_ref.items():
+                    ref_index[b, est_idx] = int(ref_idx)
                     score = float(scores[b, ref_idx, est_idx].item())
                     _, margin = second_best_and_margin(scores[b], ref_idx, est_idx)
                     energy = source_energy_db(sep[b, est_idx].detach().cpu())
@@ -274,6 +286,8 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
                         quality_code[b, est_idx] = 2
                     else:
                         quality_code[b, est_idx] = 3
+                        if self.bad_match_silence_weight > 0.0 and energy >= self.min_energy_db:
+                            sample_weight[b, est_idx] = self.bad_match_silence_weight
                     if not valid or (quality == "uncertain" and not self.use_uncertain_matches):
                         continue
                     class_idx[b, est_idx] = class_index_ref[b, ref_idx]
@@ -281,7 +295,145 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
                     sample_weight[b, est_idx] = float(weight)
                     if span_sec is not None:
                         span_sec[b, est_idx] = span_ref[b, ref_idx]
+        if return_ref_index:
+            return class_idx, is_silence, sample_weight, span_sec, quality_code, ref_index
         return class_idx, is_silence, sample_weight, span_sec, quality_code
+
+    def _maybe_mix_clean_sources(
+        self,
+        sep,
+        batch,
+        class_idx,
+        is_silence,
+        sample_weight,
+        span_sec,
+        ref_index,
+        is_training: bool,
+    ):
+        """Randomly replace some SC rows with oracle clean sources.
+
+        This is a regularizer for SC adaptation: USS estimates still dominate
+        when ``clean_source_mix_prob`` is low, while clean sources keep the class
+        boundary anchored to the stage-1 training distribution.
+        """
+        clean_mask = torch.zeros(ref_index.shape, dtype=torch.bool, device=self.uss_device)
+        if (not is_training) or self.clean_source_mix_prob <= 0.0:
+            return sep, class_idx, is_silence, sample_weight, span_sec, clean_mask
+
+        ref = self._to_uss(batch["foreground_waveform"])
+        if ref.shape[2:] != sep.shape[2:]:
+            raise ValueError(
+                "Clean-source mixing requires foreground_waveform and USS "
+                f"estimate shapes to match after source dim, got {tuple(ref.shape)} "
+                f"and {tuple(sep.shape)}."
+            )
+
+        class_index_ref = self._to_uss(batch["class_index"])
+        is_silence_ref = self._to_uss(batch["is_silence"]).bool()
+        span_ref = self._to_uss(batch["foreground_span_sec"]) if "foreground_span_sec" in batch else None
+
+        ref_clamped = ref_index.clamp_min(0)
+        ref_is_active = ~torch.gather(is_silence_ref, dim=1, index=ref_clamped)
+        eligible = ref_index.ge(0) & ref_is_active
+        if not eligible.any():
+            return sep, class_idx, is_silence, sample_weight, span_sec, clean_mask
+
+        gate = torch.rand(eligible.shape, device=self.uss_device) < self.clean_source_mix_prob
+        clean_mask = eligible & gate
+        if not clean_mask.any():
+            return sep, class_idx, is_silence, sample_weight, span_sec, clean_mask
+
+        b_idx, est_idx = clean_mask.nonzero(as_tuple=True)
+        ref_idx = ref_index[b_idx, est_idx]
+
+        sep = sep.clone()
+        class_idx = class_idx.clone()
+        is_silence = is_silence.clone()
+        sample_weight = sample_weight.clone()
+        if span_sec is not None:
+            span_sec = span_sec.clone()
+
+        sep[b_idx, est_idx] = ref[b_idx, ref_idx].to(dtype=sep.dtype)
+        class_idx[b_idx, est_idx] = class_index_ref[b_idx, ref_idx]
+        is_silence[b_idx, est_idx] = False
+        sample_weight[b_idx, est_idx] = self.clean_source_mix_weight
+        if span_sec is not None and span_ref is not None:
+            span_sec[b_idx, est_idx] = span_ref[b_idx, ref_idx].to(dtype=span_sec.dtype)
+
+        return sep, class_idx, is_silence, sample_weight, span_sec, clean_mask
+
+    def _maybe_mix_clean_silence_sources(
+        self,
+        sep,
+        batch,
+        class_idx,
+        is_silence,
+        sample_weight,
+        span_sec,
+        is_training: bool,
+    ):
+        """Randomly replace silence rows with padded oracle silence waveforms."""
+        clean_silence_mask = torch.zeros(is_silence.shape, dtype=torch.bool, device=self.uss_device)
+        if (not is_training) or self.clean_silence_mix_prob <= 0.0:
+            return sep, class_idx, is_silence, sample_weight, span_sec, clean_silence_mask
+
+        ref = self._to_uss(batch["foreground_waveform"])
+        if ref.shape[2:] != sep.shape[2:]:
+            raise ValueError(
+                "Clean-silence mixing requires foreground_waveform and USS "
+                f"estimate shapes to match after source dim, got {tuple(ref.shape)} "
+                f"and {tuple(sep.shape)}."
+            )
+
+        is_silence_ref = self._to_uss(batch["is_silence"]).bool()
+        if not is_silence_ref.any():
+            return sep, class_idx, is_silence, sample_weight, span_sec, clean_silence_mask
+
+        selected_batch = []
+        selected_est = []
+        selected_ref = []
+        for b in range(sep.shape[0]):
+            silence_refs = torch.nonzero(is_silence_ref[b], as_tuple=False).flatten()
+            candidate_mask = is_silence[b] & sample_weight[b].le(0.0)
+            candidate_est = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+            if silence_refs.numel() == 0 or candidate_est.numel() == 0:
+                continue
+            gate = torch.rand(candidate_est.shape, device=self.uss_device) < self.clean_silence_mix_prob
+            candidate_est = candidate_est[gate]
+            if candidate_est.numel() == 0:
+                continue
+            ref_for_est = silence_refs[torch.arange(candidate_est.numel(), device=self.uss_device) % silence_refs.numel()]
+            selected_batch.append(torch.full_like(candidate_est, b))
+            selected_est.append(candidate_est)
+            selected_ref.append(ref_for_est)
+
+        if not selected_batch:
+            return sep, class_idx, is_silence, sample_weight, span_sec, clean_silence_mask
+
+        b_idx = torch.cat(selected_batch)
+        est_idx = torch.cat(selected_est)
+        ref_idx = torch.cat(selected_ref)
+
+        sep = sep.clone()
+        class_idx = class_idx.clone()
+        is_silence = is_silence.clone()
+        sample_weight = sample_weight.clone()
+        if span_sec is not None:
+            span_sec = span_sec.clone()
+
+        sep[b_idx, est_idx] = ref[b_idx, ref_idx].to(dtype=sep.dtype)
+        class_idx[b_idx, est_idx] = 0
+        is_silence[b_idx, est_idx] = True
+        sample_weight[b_idx, est_idx] = self.clean_silence_mix_weight
+        clean_silence_mask[b_idx, est_idx] = True
+        if span_sec is not None:
+            span_ref = self._to_uss(batch["foreground_span_sec"]) if "foreground_span_sec" in batch else None
+            if span_ref is not None:
+                span_sec[b_idx, est_idx] = span_ref[b_idx, ref_idx].to(dtype=span_sec.dtype)
+            else:
+                span_sec[b_idx, est_idx] = torch.tensor(SILENCE_SPAN_SEC, dtype=span_sec.dtype, device=self.uss_device)
+
+        return sep, class_idx, is_silence, sample_weight, span_sec, clean_silence_mask
 
     def _sc_forward_and_loss(self, uss_out, batch, is_training: bool):
         sep = uss_out["foreground_waveform"]
@@ -290,7 +442,30 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         # flow back into USS, detach explicitly.
         if self.detach_waveform_for_sc:
             sep = sep.detach()
-        class_idx, is_silence, sample_weight, span_sec, quality_code = self._build_slot_targets(sep, batch)
+        class_idx, is_silence, sample_weight, span_sec, quality_code, ref_index = self._build_slot_targets(
+            sep,
+            batch,
+            return_ref_index=True,
+        )
+        sep, class_idx, is_silence, sample_weight, span_sec, clean_source_mask = self._maybe_mix_clean_sources(
+            sep,
+            batch,
+            class_idx,
+            is_silence,
+            sample_weight,
+            span_sec,
+            ref_index,
+            is_training=is_training,
+        )
+        sep, class_idx, is_silence, sample_weight, span_sec, clean_silence_mask = self._maybe_mix_clean_silence_sources(
+            sep,
+            batch,
+            class_idx,
+            is_silence,
+            sample_weight,
+            span_sec,
+            is_training=is_training,
+        )
 
         bsz, n_slots, channels, samples = sep.shape
         waveform = sep.reshape(bsz * n_slots, channels, samples).to(self.sc_device)
@@ -302,6 +477,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         sc_target = {
             "class_index": class_flat,
             "is_silence": silence_flat,
+            "sample_weight": weight_flat,
             "current_epoch": self.current_epoch,
             "is_training": is_training,
         }
@@ -312,25 +488,30 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         sc_out = self.sc_model(sc_input)
         sc_loss_dict = self.sc_loss_func(sc_out, sc_target)
 
-        # Weighted CE on active matched slots.
         logits = sc_out.get("plain_logits", sc_out.get("logits"))
-        ce_all = F.cross_entropy(logits.float(), class_flat, reduction="none")
-        active_weight = (~silence_flat).to(dtype=ce_all.dtype) * weight_flat.to(dtype=ce_all.dtype)
-        loss_sc_weighted = (ce_all * active_weight).sum() / active_weight.sum().clamp_min(1.0)
-        top1 = torch.zeros((), device=self.sc_device, dtype=ce_all.dtype)
+        active_weight = (~silence_flat).to(dtype=logits.dtype) * weight_flat.to(dtype=logits.dtype)
+        loss_sc = sc_loss_dict["loss"]
+        top1 = torch.zeros((), device=self.sc_device, dtype=logits.dtype)
         if active_weight.sum() > 0:
             pred = logits.argmax(dim=-1)
             top1 = ((pred == class_flat).float() * active_weight).sum() / active_weight.sum().clamp_min(1.0) * 100.0
 
         out = {f"sc_{k}": v for k, v in sc_loss_dict.items() if torch.is_tensor(v)}
-        out["loss_sc_weighted"] = loss_sc_weighted
+        out["loss_sc"] = loss_sc
+        out["loss_sc_weighted"] = loss_sc
         out["sc_joint_top1"] = top1
         out["sc_active_weight_mean"] = active_weight.mean()
         quality_flat = quality_code.reshape(bsz * n_slots).to(self.sc_device)
-        out["sc_clean_match_count"] = (quality_flat == 1).to(dtype=ce_all.dtype).sum()
-        out["sc_uncertain_match_count"] = (quality_flat == 2).to(dtype=ce_all.dtype).sum()
-        out["sc_bad_match_count"] = (quality_flat == 3).to(dtype=ce_all.dtype).sum()
-        out["sc_used_match_count"] = active_weight.gt(0).to(dtype=ce_all.dtype).sum()
+        out["sc_clean_match_count"] = (quality_flat == 1).to(dtype=logits.dtype).sum()
+        out["sc_uncertain_match_count"] = (quality_flat == 2).to(dtype=logits.dtype).sum()
+        out["sc_bad_match_count"] = (quality_flat == 3).to(dtype=logits.dtype).sum()
+        out["sc_used_match_count"] = weight_flat.gt(0).to(dtype=logits.dtype).sum()
+        clean_source_flat = clean_source_mask.reshape(bsz * n_slots).to(self.sc_device)
+        out["sc_clean_source_mix_count"] = clean_source_flat.to(dtype=logits.dtype).sum()
+        out["sc_clean_source_mix_ratio"] = clean_source_flat.to(dtype=logits.dtype).mean()
+        clean_silence_flat = clean_silence_mask.reshape(bsz * n_slots).to(self.sc_device)
+        out["sc_clean_silence_mix_count"] = clean_silence_flat.to(dtype=logits.dtype).sum()
+        out["sc_clean_silence_mix_ratio"] = clean_silence_flat.to(dtype=logits.dtype).mean()
 
         if self.lambda_consistency > 0.0 and "class_logits" in uss_out:
             uss_logits = uss_out["class_logits"].reshape(bsz * n_slots, -1).to(self.sc_device)
@@ -418,7 +599,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         if self.freeze_uss:
             # SC loss is the primary training signal
             loss = (
-                self.lambda_sc * sc_loss_dict["loss_sc_weighted"].to(self.sc_device)
+                self.lambda_sc * sc_loss_dict["loss_sc"].to(self.sc_device)
                 + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.sc_device)
             )
             loss_for_log = loss.detach().to(self.uss_device)
@@ -426,7 +607,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
             # Original: USS loss is primary, SC is auxiliary
             loss = (
                 self.lambda_uss * uss_loss_dict["loss"]
-                + self.lambda_sc * sc_loss_dict["loss_sc_weighted"].to(self.uss_device)
+                + self.lambda_sc * sc_loss_dict["loss_sc"].to(self.uss_device)
                 + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.uss_device)
             )
             loss_for_log = loss.detach().to(self.uss_device)
@@ -470,13 +651,13 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
             sc_loss_dict = self._sc_forward_and_loss(uss_out, batch, is_training=False)
             if self.freeze_uss:
                 loss = (
-                    self.lambda_sc * sc_loss_dict["loss_sc_weighted"].to(self.uss_device)
+                    self.lambda_sc * sc_loss_dict["loss_sc"].to(self.uss_device)
                     + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.uss_device)
                 )
             else:
                 loss = (
                     self.lambda_uss * uss_loss_dict["loss"]
-                    + self.lambda_sc * sc_loss_dict["loss_sc_weighted"].to(self.uss_device)
+                    + self.lambda_sc * sc_loss_dict["loss_sc"].to(self.uss_device)
                     + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.uss_device)
                 )
         batchsize = batch["mixture"].shape[0]

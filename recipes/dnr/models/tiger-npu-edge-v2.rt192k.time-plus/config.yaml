@@ -1,0 +1,19 @@
+_base_: ../tiger-npu-edge-v2.rt192k/config.yaml
+
+# Quality-recovery V2 ablation.
+#
+# The base V2 has ~6.1M parameters, but almost all of them sit in the fused
+# full-band encoder/decoder; the recurrent separator is only ~0.14M params.
+# This variant spends the extra budget on the actual temporal/attention path
+# while keeping the exported one-frame V2 contract.
+tiger_model_kwargs:
+  in_channels: 192
+  num_stages: 3
+  att_hid_chan: 4
+  att_val_hid_chan: 4
+  kv_window_size: 8
+  time_hidden_channels: 16
+  time_dilations: [1, 2, 4]
+  time_global_kernel_size: 7
+
+tiger_chunk_size: 16

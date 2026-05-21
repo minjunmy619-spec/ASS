@@ -78,22 +78,27 @@ class DilatedBandMixBlock2d(nn.Module):
 
         self.norm1 = RMSNorm2d(channels)
         self.pw1 = nn.Conv2d(channels, hidden * 2, kernel_size=1, bias=True)
-        self.time_dw = CausalConv2d(
-            hidden,
-            hidden,
-            kernel_size=(time_kernel_size, 1),
-            dilation=(time_dilation, 1),
-            groups=hidden,
-            bias=True,
-        ) if causal else nn.Conv2d(
-            hidden,
-            hidden,
-            kernel_size=(time_kernel_size, 1),
-            padding=((time_kernel_size - 1) * time_dilation // 2, 0),
-            dilation=(time_dilation, 1),
-            groups=hidden,
-            bias=True,
-        )
+        if time_kernel_size == 1:
+            self.time_dw = nn.Identity()
+        elif causal:
+            self.time_dw = CausalConv2d(
+                hidden,
+                hidden,
+                kernel_size=(time_kernel_size, 1),
+                dilation=(time_dilation, 1),
+                groups=hidden,
+                bias=True,
+            )
+        else:
+            self.time_dw = nn.Conv2d(
+                hidden,
+                hidden,
+                kernel_size=(time_kernel_size, 1),
+                padding=((time_kernel_size - 1) * time_dilation // 2, 0),
+                dilation=(time_dilation, 1),
+                groups=hidden,
+                bias=True,
+            )
         self.band_dw = nn.Conv2d(
             hidden,
             hidden,

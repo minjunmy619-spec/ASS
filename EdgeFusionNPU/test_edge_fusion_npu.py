@@ -193,6 +193,38 @@ def test_frequency_preprocessed_training_wrapper_streaming_split_matches_clip() 
     torch.testing.assert_close(state_b, clip_state)
 
 
+def test_frequency_preprocessed_internal_chunking_matches_single_clip() -> None:
+    full_system = build_edge_fusion_npu_system(
+        n_fft=1024,
+        hop_length=256,
+        fs=16000,
+        preset="tiny",
+        freq_preprocess_enabled=True,
+        freq_preprocess_keep_bins=192,
+        freq_preprocess_target_bins=257,
+    ).eval()
+    chunked_system = build_edge_fusion_npu_system(
+        n_fft=1024,
+        hop_length=256,
+        fs=16000,
+        preset="tiny",
+        freq_preprocess_enabled=True,
+        freq_preprocess_keep_bins=192,
+        freq_preprocess_target_bins=257,
+        chunk_frames=2,
+        detach_state_between_chunks=True,
+    ).eval()
+    chunked_system.model.load_state_dict(full_system.model.state_dict())
+    x = torch.complex(torch.randn(1, 1, 513, 5), torch.randn(1, 1, 513, 5))
+
+    with torch.no_grad():
+        full_out = full_system.model(x)
+        chunked_out = chunked_system.model(x)
+
+    assert chunked_system.model.core.chunk_frames == 2
+    torch.testing.assert_close(chunked_out, full_out)
+
+
 def test_training_wrapper_split_chunks_match_single_clip() -> None:
     core = build_edge_fusion_npu_preset("tiny").eval()
     model = EdgeFusionNPUOnlineModel(core=core, n_src=3, n_chan=1).eval()
@@ -206,6 +238,26 @@ def test_training_wrapper_split_chunks_match_single_clip() -> None:
 
     torch.testing.assert_close(split_out, clip_out)
     torch.testing.assert_close(state_b, clip_state)
+
+
+def test_training_wrapper_internal_chunking_matches_single_clip() -> None:
+    core = build_edge_fusion_npu_preset("tiny").eval()
+    full_model = EdgeFusionNPUOnlineModel(core=core, n_src=3, n_chan=1).eval()
+    chunked_model = EdgeFusionNPUOnlineModel(
+        core=core,
+        n_src=3,
+        n_chan=1,
+        chunk_frames=2,
+        detach_state_between_chunks=True,
+    ).eval()
+    x = torch.complex(torch.randn(1, 1, core.n_freq, 5), torch.randn(1, 1, core.n_freq, 5))
+
+    with torch.no_grad():
+        full_out, full_state = full_model(x, return_state=True)
+        chunk_out, chunk_state = chunked_model(x, return_state=True)
+
+    torch.testing.assert_close(chunk_out, full_out)
+    torch.testing.assert_close(chunk_state, full_state)
 
 
 def test_training_wrapper_chunk_backward() -> None:

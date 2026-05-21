@@ -18,6 +18,9 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+AIACCEL_ROOT = REPO_ROOT / "aiaccel"
+if str(AIACCEL_ROOT) not in sys.path:
+    sys.path.insert(0, str(AIACCEL_ROOT))
 
 from spectral_feature_compression.utils.onnx_streaming import (
     ExternalizedConstantsWrapper,
@@ -159,6 +162,25 @@ def resolve_value(value, context: dict[str, object], *, stack: tuple[str, ...] =
 
 
 def build_model_system_from_recipe_config(config_path: Path):
+    try:
+        from aiaccel.config import load_config, resolve_inherit
+        from hydra.utils import instantiate
+
+        config = load_config(
+            config_path,
+            {
+                "config_path": str(config_path),
+                "working_directory": str(config_path.parent.resolve()),
+                "base_config_path": str(REPO_ROOT / "aiaccel" / "aiaccel" / "torch" / "apps" / "config"),
+            },
+        )
+        config = resolve_inherit(config)
+        return instantiate(config.task.model)
+    except Exception:
+        # Keep the lightweight parser as a fallback for hand-written configs
+        # that are not valid aiaccel/Hydra recipes.
+        pass
+
     top_level = merge_top_level_scalars(config_path)
     model_cfg = merge_task_model_mapping(config_path)
     if "_target_" not in model_cfg:

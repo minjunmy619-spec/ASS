@@ -107,6 +107,13 @@ lightning_module:
     consistency_temperature: 1.0
     # --- SC update every step (no throttling) ---
     sc_update_every: 1
+    # Mix clean oracle foreground rows into SC adaptation as class-boundary anchors.
+    # USS estimates still provide the artifact/leakage distribution.
+    clean_source_mix_prob: 0.25
+    clean_source_mix_weight: 1.0
+    # Also mix padded zero oracle-silence rows as clean silence anchors.
+    clean_silence_mix_prob: 0.10
+    clean_silence_mix_weight: 1.0
     # --- Matching config ---
     match_metric: sa_sdr
     min_match_score: -10.0
@@ -115,7 +122,8 @@ lightning_module:
     clean_match_score: 0.0
     clean_match_margin: 2.0
     uncertain_weight: 0.35
-    use_uncertain_matches: false
+    use_uncertain_matches: true
+    bad_match_silence_weight: 0.05
     # --- Waveform detach: not strictly needed since USS is frozen (outputs
     #     already detached), but set true for clarity ---
     detach_waveform_for_sc: true

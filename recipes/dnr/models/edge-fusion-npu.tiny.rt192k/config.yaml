@@ -14,6 +14,8 @@ edge_fusion_freq_preprocess_enabled: false
 edge_fusion_freq_preprocess_keep_bins: 192
 edge_fusion_freq_preprocess_target_bins: 257
 edge_fusion_freq_preprocess_mode: triangular
+edge_fusion_chunk_frames: 64
+edge_fusion_detach_state_between_chunks: true
 
 trainer:
   max_epochs: 150
@@ -80,6 +82,8 @@ task:
     freq_preprocess_keep_bins: ${edge_fusion_freq_preprocess_keep_bins}
     freq_preprocess_target_bins: ${edge_fusion_freq_preprocess_target_bins}
     freq_preprocess_mode: ${edge_fusion_freq_preprocess_mode}
+    chunk_frames: ${edge_fusion_chunk_frames}
+    detach_state_between_chunks: ${edge_fusion_detach_state_between_chunks}
   loss:
     _target_: spectral_feature_compression.core.loss.snr.ThresSNRLossWithInactiveSource
     solve_perm: false

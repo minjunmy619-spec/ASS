@@ -92,7 +92,9 @@ task:
     pre_layers: ${online_pre_layers}
     mid_layers: ${online_mid_layers}
     bottleneck_layers: ${online_bottleneck_layers}
-    kernel_size: [${online_kernel_t}, ${online_kernel_f}]
+    kernel_size:
+      - ${online_kernel_t}
+      - ${online_kernel_f}
     causal: ${online_causal}
     masking: ${online_masking}
     routing_normalization: ${online_routing_normalization}
@@ -121,4 +123,3 @@ task:
       step_size: 1354
       decay: 0.98
     scheduler_interval: step
-

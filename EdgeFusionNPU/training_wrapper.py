@@ -34,14 +34,37 @@ class EdgeFusionNPUOnlineModel(nn.Module):
     next_state`` graph.
     """
 
-    def __init__(self, core: nn.Module, n_src: int, n_chan: int):
+    def __init__(
+        self,
+        core: nn.Module,
+        n_src: int,
+        n_chan: int,
+        *,
+        chunk_frames: int | None = None,
+        detach_state_between_chunks: bool = False,
+    ):
         super().__init__()
         self.core = core
         self.n_src = n_src
         self.n_chan = n_chan
+        if chunk_frames is not None and chunk_frames <= 0:
+            raise ValueError(f"chunk_frames must be positive or None, got {chunk_frames}")
+        self.chunk_frames = chunk_frames
+        self.detach_state_between_chunks = detach_state_between_chunks
 
     def init_state(self, x: torch.Tensor) -> torch.Tensor:
         return self.core.init_states(batch_size=x.shape[0], device=x.real.device, dtype=x.real.dtype)
+
+    def _forward_chunk(
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        batch, n_chan, n_freq, n_frames = x.shape
+        packed = torch.cat([x.real, x.imag], dim=1)
+        mask, state = self.core(packed, state)
+        mask = mask.reshape(batch, self.n_src, self.n_chan, n_freq, n_frames)
+        return x.unsqueeze(1) * mask, state
 
     def forward(
         self,
@@ -67,10 +90,19 @@ class EdgeFusionNPUOnlineModel(nn.Module):
         state = self.init_state(x) if initial_state is None else initial_state.to(device=x.real.device, dtype=x.real.dtype)
         if detach_state:
             state = state.detach()
-        packed = torch.cat([x.real, x.imag], dim=1)
-        mask, state = self.core(packed, state)
-        mask = mask.reshape(batch, self.n_src, self.n_chan, n_freq, n_frames)
-        est = x.unsqueeze(1) * mask
+
+        if self.chunk_frames is None or n_frames <= self.chunk_frames:
+            est, state = self._forward_chunk(x, state)
+        else:
+            outputs = []
+            for frame_start in range(0, n_frames, self.chunk_frames):
+                frame_end = min(frame_start + self.chunk_frames, n_frames)
+                chunk, state = self._forward_chunk(x[..., frame_start:frame_end], state)
+                outputs.append(chunk)
+                if self.training and self.detach_state_between_chunks:
+                    state = state.detach()
+            est = torch.cat(outputs, dim=-1)
+
         if return_state:
             return est, state
         return est
@@ -79,12 +111,24 @@ class EdgeFusionNPUOnlineModel(nn.Module):
 class EdgeFusionNPU2DPackedCoreAdapter(nn.Module):
     """Expose EdgeFusionNPU as a packed-2D core for shared freq preprocessing."""
 
-    def __init__(self, core: nn.Module, n_src: int, n_chan: int):
+    def __init__(
+        self,
+        core: nn.Module,
+        n_src: int,
+        n_chan: int,
+        *,
+        chunk_frames: int | None = None,
+        detach_state_between_chunks: bool = False,
+    ):
         super().__init__()
         self.core = core
         self.n_src = n_src
         self.n_chan = n_chan
         self.n_freq = core.n_freq
+        if chunk_frames is not None and chunk_frames <= 0:
+            raise ValueError(f"chunk_frames must be positive or None, got {chunk_frames}")
+        self.chunk_frames = chunk_frames
+        self.detach_state_between_chunks = detach_state_between_chunks
 
     def init_stream_state(self, batch_size: int = 1, *, device=None, dtype=None):
         return self.core.init_states(batch_size=batch_size, device=device, dtype=dtype)
@@ -108,7 +152,19 @@ class EdgeFusionNPU2DPackedCoreAdapter(nn.Module):
 
     def forward(self, x2d: torch.Tensor, **kwargs) -> torch.Tensor:
         state = self.init_stream_state(batch_size=x2d.shape[0], device=x2d.device, dtype=x2d.dtype)
-        y2d, _ = self._apply_core_masks(x2d, state)
+        n_frames = x2d.shape[2]
+        if self.chunk_frames is None or n_frames <= self.chunk_frames:
+            y2d, _ = self._apply_core_masks(x2d, state)
+            return y2d
+
+        outputs = []
+        for frame_start in range(0, n_frames, self.chunk_frames):
+            frame_end = min(frame_start + self.chunk_frames, n_frames)
+            y_chunk, state = self._apply_core_masks(x2d[:, :, frame_start:frame_end, :], state)
+            outputs.append(y_chunk)
+            if self.training and self.detach_state_between_chunks:
+                state = state.detach()
+        y2d = torch.cat(outputs, dim=2)
         return y2d
 
     def forward_stream(self, x2d: torch.Tensor, state=None):
@@ -130,6 +186,8 @@ def build_edge_fusion_npu_system(
     freq_preprocess_keep_bins: int | None = None,
     freq_preprocess_target_bins: int | None = None,
     freq_preprocess_mode: str = "triangular",
+    chunk_frames: int | None = None,
+    detach_state_between_chunks: bool = False,
     css_segment_size: int = 12,
     css_shift_size: int = 6,
     css_batch_size: int = 1,
@@ -150,10 +208,22 @@ def build_edge_fusion_npu_system(
     )
     core = build_edge_fusion_npu_preset(preset, n_freq=core_n_freq, n_src=n_src, n_chan=n_chan)
     if freq_preprocessor is None:
-        model = EdgeFusionNPUOnlineModel(core=core, n_src=n_src, n_chan=n_chan)
+        model = EdgeFusionNPUOnlineModel(
+            core=core,
+            n_src=n_src,
+            n_chan=n_chan,
+            chunk_frames=chunk_frames,
+            detach_state_between_chunks=detach_state_between_chunks,
+        )
     else:
         model = FrequencyPreprocessedOnlineModel(
-            core=EdgeFusionNPU2DPackedCoreAdapter(core=core, n_src=n_src, n_chan=n_chan),
+            core=EdgeFusionNPU2DPackedCoreAdapter(
+                core=core,
+                n_src=n_src,
+                n_chan=n_chan,
+                chunk_frames=chunk_frames,
+                detach_state_between_chunks=detach_state_between_chunks,
+            ),
             n_src=n_src,
             n_chan=n_chan,
             freq_preprocessor=freq_preprocessor,

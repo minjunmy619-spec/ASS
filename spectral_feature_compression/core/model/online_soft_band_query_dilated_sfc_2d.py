@@ -65,22 +65,41 @@ def _apply_packed_complex_mask_no_repeat(
     return torch.cat(outputs, dim=1)
 
 
-class PooledBandCapacityMixer2d(nn.Module):
-    """State-free capacity branch over frequency-pooled latent band tokens."""
+class BandAwareCapacityMixer2d(nn.Module):
+    """State-free band-aware capacity branch.
+
+    The expensive channel MLP runs on a pooled current-frame context so it does
+    not add streaming state, but its output gates and colors a local band-mixed
+    feature map. This gives the extra parameters a concrete separation role:
+    condition current-frame local band features on a learned global latent-band
+    summary instead of merely adding a broadcast bias.
+    """
 
     def __init__(self, channels: int, hidden_channels: int):
         super().__init__()
         if hidden_channels <= 0:
             raise ValueError(f"hidden_channels must be positive, got {hidden_channels}")
         self.norm = RMSNorm2d(channels)
-        self.expand = nn.Conv2d(channels, 2 * hidden_channels, kernel_size=1, bias=True)
-        self.project = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=True)
+        self.band_dw = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(1, 3),
+            padding=(0, 1),
+            groups=channels,
+            bias=True,
+        )
+        self.context_expand = nn.Conv2d(channels, 2 * hidden_channels, kernel_size=1, bias=True)
+        self.context_project = nn.Conv2d(hidden_channels, 2 * channels, kernel_size=1, bias=True)
+        self.local_project = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.norm(x).mean(dim=3, keepdim=True)
-        a, b = self.expand(y).chunk(2, dim=1)
-        y = a * torch.sigmoid(b)
-        return x + self.project(y)
+        local = self.band_dw(self.norm(x))
+        context = local.mean(dim=3, keepdim=True)
+        a, b = self.context_expand(context).chunk(2, dim=1)
+        context = a * torch.sigmoid(b)
+        gate, bias = self.context_project(context).chunk(2, dim=1)
+        local = self.local_project(local * torch.sigmoid(gate))
+        return x + local + bias
 
 
 class OnlineSoftBandQueryDilatedSFC2D(nn.Module):
@@ -103,8 +122,15 @@ class OnlineSoftBandQueryDilatedSFC2D(nn.Module):
         routing_normalization: str = "softmax",
         dilation_cycle: tuple[int, ...] | list[int] | None = None,
         pooled_mixer_hidden: int = 0,
+        stateless_separator_layers: int = 0,
     ):
         super().__init__()
+        if stateless_separator_layers < 0:
+            raise ValueError(f"stateless_separator_layers must be non-negative, got {stateless_separator_layers}")
+        if stateless_separator_layers > n_layers:
+            raise ValueError(
+                f"stateless_separator_layers={stateless_separator_layers} exceeds n_layers={n_layers}"
+            )
         self.n_freq = n_freq
         self.n_bands = n_bands
         self.n_src = n_src
@@ -112,6 +138,7 @@ class OnlineSoftBandQueryDilatedSFC2D(nn.Module):
         self.masking = masking
         self.dilation_schedule = _normalize_dilation_schedule(n_layers, dilation_cycle)
         self.pooled_mixer_hidden = pooled_mixer_hidden
+        self.stateless_separator_layers = stateless_separator_layers
 
         in_ch = 2 * n_chan
         out_ch = 2 * n_src * n_chan
@@ -139,17 +166,18 @@ class OnlineSoftBandQueryDilatedSFC2D(nn.Module):
                 DilatedBandMixBlock2d(
                     channels=d_model,
                     expansion=2,
-                    time_kernel_size=kernel_size[0],
+                    time_kernel_size=1 if layer_idx < stateless_separator_layers else kernel_size[0],
                     band_kernel_size=kernel_size[1],
-                    time_dilation=dilation,
+                    time_dilation=1 if layer_idx < stateless_separator_layers else dilation,
                     causal=causal,
                 )
-                for dilation in self.dilation_schedule
+                for layer_idx, dilation in enumerate(self.dilation_schedule)
             ]
         )
+        self.separator_uses_state = tuple(block.stream_context_frames() > 0 for block in self.separator)
         self.pooled_mixers = nn.ModuleList(
             [
-                PooledBandCapacityMixer2d(d_model, pooled_mixer_hidden)
+                BandAwareCapacityMixer2d(d_model, pooled_mixer_hidden)
                 if pooled_mixer_hidden > 0
                 else nn.Identity()
                 for _ in self.dilation_schedule
@@ -190,7 +218,8 @@ class OnlineSoftBandQueryDilatedSFC2D(nn.Module):
         comp = self.compressor.init_stream_state(batch_size, freq_bins=self.n_freq, device=device, dtype=dtype)
         sep = tuple(
             block.init_stream_state(batch_size, freq_bins=self.n_bands, device=device, dtype=dtype)
-            for block in self.separator
+            for block, uses_state in zip(self.separator, self.separator_uses_state)
+            if uses_state
         )
         return (comp, *sep)
 
@@ -208,17 +237,26 @@ class OnlineSoftBandQueryDilatedSFC2D(nn.Module):
         if state is None:
             state = self.init_stream_state(batch_size=x.shape[0], device=x.device, dtype=x.dtype)
 
-        _runtime_assert(len(state) == 1 + len(self.separator), f"Unexpected state tuple: {len(state)}")
+        expected_states = 1 + sum(1 for uses_state in self.separator_uses_state if uses_state)
+        _runtime_assert(len(state) == expected_states, f"Unexpected state tuple: {len(state)}")
         comp_state = state[0]
         sep_state = state[1:]
 
         h = self.in_proj(x)
         (z, q), new_comp_state = self.compressor.forward_stream(h, comp_state)
         new_sep_states = []
-        for block, mixer, block_state in zip(self.separator, self.pooled_mixers, sep_state):
-            z, block_state = block.forward_stream(z, block_state)
+        sep_state_idx = 0
+        for block, mixer, uses_state in zip(self.separator, self.pooled_mixers, self.separator_uses_state):
+            if uses_state:
+                block_state = sep_state[sep_state_idx]
+                z, block_state = block.forward_stream(z, block_state)
+            else:
+                z = block(z)
+                block_state = None
             z = mixer(z)
-            new_sep_states.append(block_state)
+            if uses_state:
+                new_sep_states.append(block_state)
+                sep_state_idx += 1
         h = self.expander(z, q)
         y = self.out_proj(h)
         if self.masking:
@@ -291,6 +329,7 @@ class OnlineSoftBandQueryDilatedSFCModel(nn.Module):
         routing_normalization: str = "softmax",
         dilation_cycle: tuple[int, ...] | list[int] | None = None,
         pooled_mixer_hidden: int = 0,
+        stateless_separator_layers: int = 0,
     ):
         super().__init__()
         self.core = OnlineSoftBandQueryDilatedSFC2D(
@@ -309,6 +348,7 @@ class OnlineSoftBandQueryDilatedSFCModel(nn.Module):
             routing_normalization=routing_normalization,
             dilation_cycle=dilation_cycle,
             pooled_mixer_hidden=pooled_mixer_hidden,
+            stateless_separator_layers=stateless_separator_layers,
         )
         self.n_src = n_src
         self.n_chan = n_chan
@@ -348,6 +388,7 @@ def build_online_soft_band_query_dilated_sfc_system(
     routing_normalization: str = "softmax",
     dilation_cycle: tuple[int, ...] | list[int] | None = None,
     pooled_mixer_hidden: int = 0,
+    stateless_separator_layers: int = 0,
     freq_preprocess_enabled: bool = False,
     freq_preprocess_keep_bins: int | None = None,
     freq_preprocess_target_bins: int | None = None,
@@ -387,6 +428,7 @@ def build_online_soft_band_query_dilated_sfc_system(
         routing_normalization=routing_normalization,
         dilation_cycle=dilation_cycle,
         pooled_mixer_hidden=pooled_mixer_hidden,
+        stateless_separator_layers=stateless_separator_layers,
     )
     model = FrequencyPreprocessedOnlineModel(
         core=core,
