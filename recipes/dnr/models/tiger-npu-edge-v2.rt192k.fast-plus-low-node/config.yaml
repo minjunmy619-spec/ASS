@@ -1,0 +1,20 @@
+_base_: ../tiger-npu-edge-v2.rt192k/config.yaml
+
+# Low-node Fast-Plus V2 ablation.
+#
+# The separator capacity matches fast-plus, but the normalization is switched
+# from RMSNorm to BatchNorm.  That is intentional here: chunked training keeps
+# the BN statistics well-conditioned, while export uses one BatchNormalization
+# node per norm site instead of decomposing RMSNorm into primitive arithmetic.
+tiger_model_kwargs:
+  in_channels: 160
+  num_stages: 2
+  att_hid_chan: 4
+  att_val_hid_chan: 4
+  kv_window_size: 8
+  time_hidden_channels: 16
+  time_dilations: [1, 2, 4]
+  time_global_kernel_size: 7
+  norm_type: batch
+
+tiger_chunk_size: 16

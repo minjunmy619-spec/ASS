@@ -343,6 +343,7 @@ def get_allowed_ops(preset: str) -> set[str]:
         "none": set(),
         "edge_npu_recommended": {
             "Add",
+            "BatchNormalization",
             "Cast",
             "Clip",
             "Concat",

@@ -1,0 +1,25 @@
+_base_: ../tiger-npu-edge-v2.rt192k/config.yaml
+
+# SFC/BandSC/Dolphin-inspired low-node V2 ablation.
+#
+# Instead of paying for a resize-heavy frequency U-block inside every Tiger
+# stage, this keeps Tiger's causal time block and sliding-window attention but
+# swaps the per-stage frequency mixer to a local cross-band block plus a small
+# frequency-pooled channel mixer.  That mirrors the stronger NPU families:
+# compress/mix on a reduced band-token axis, add global channel capacity at
+# frequency width 1, and leave full-frequency decoding to the final head.
+tiger_model_kwargs:
+  in_channels: 96
+  num_stages: 2
+  att_hid_chan: 4
+  att_val_hid_chan: 4
+  kv_window_size: 8
+  time_hidden_channels: 16
+  time_dilations: [1, 2, 4]
+  time_global_kernel_size: 7
+  norm_type: batch
+  freq_block_type: bandmix
+  freq_kernel_size: 5
+  pooled_mixer_hidden: 192
+
+tiger_chunk_size: 16

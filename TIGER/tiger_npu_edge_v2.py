@@ -2,8 +2,9 @@
 TIGERNPUEdgeV2 -- NPU-optimized variant addressing ONNX graph bloat.
 
 Key changes vs V1:
-1. Replace LayerNorm2DOnChannel (5+ ops each) with a lightweight channel-axis
-   RMSNorm (3 ONNX ops, no running stats, train/eval identical).
+1. Replace LayerNorm2DOnChannel (5+ ops each) with a lightweight, configurable
+   channel norm.  RMSNorm is the default for stable training; BatchNorm is an
+   opt-in low-node export mode for chunk-trained recipes.
 2. Replace BNBlock permute-based norm with a direct Conv2d path (no Transpose).
 3. Replace StaticFreqResize2D repeat_interleave (Tile) with ConvTranspose2d.
 4. Vectorize attention heads via batched bmm (no Python for-loop unrolling).
@@ -25,7 +26,10 @@ Normalization notes:
   ``B * F * 1`` per step, ran ~1000 updates per clip with momentum=0.1, and
   drifted between train-mode and eval-mode statistics.  Replacing BN with
   ``NPURMSNormChannel`` removes the train/eval split entirely, adds zero
-  streaming state, and costs only ~3 extra ONNX ops per norm site.
+  streaming state, and costs several primitive ONNX ops per norm site.
+- Newer low-node recipes can opt back into ``norm_type="batch"`` after the
+  chunked training path has fixed the old T=1 BN-statistics problem.  This
+  gives much smaller export graphs while keeping the default recipe unchanged.
 """
 
 from __future__ import annotations
@@ -82,14 +86,32 @@ class NPURMSNormChannel(nn.Module):
         return x * self.weight
 
 
-# NOTE: Earlier revisions of this file used ``NPUBatchNorm2d`` (a thin wrapper
-# around ``nn.BatchNorm2d``).  That class has been removed in favour of
-# ``NPURMSNormChannel``; the parameter shapes are different (RMSNorm stores a
-# single (1, C, 1, 1) weight while BN stores weight/bias/running_mean/
-# running_var/num_batches_tracked), so pre-existing V2 checkpoints will not
-# load verbatim.  This is a deliberate breaking change: the BN statistics
-# accumulated under the old T=1 training loop were poorly conditioned anyway,
-# so re-training from scratch is the right migration.
+def _make_npu_norm(num_features: int, norm_type: str = "rms") -> nn.Module:
+    """Build the channel norm used by Edge V2 blocks.
+
+    ``rms`` stays the default because it is train/eval identical.  ``batch`` is
+    an opt-in low-node export mode: ONNX emits one BatchNormalization node, and
+    ONE can fold it with adjacent Conv2d in optimized graphs.
+    """
+
+    norm_type = norm_type.lower().replace("_", "-")
+    if norm_type in ("rms", "rmsnorm"):
+        return NPURMSNormChannel(num_features)
+    if norm_type in ("batch", "batchnorm", "bn"):
+        return nn.BatchNorm2d(num_features)
+    if norm_type in ("identity", "none"):
+        return nn.Identity()
+    raise ValueError(
+        f"Unsupported TIGERNPUEdgeV2 norm_type={norm_type!r}; "
+        "expected 'rms', 'batch', or 'identity'."
+    )
+
+
+# NOTE: Earlier revisions of this file used ``NPUBatchNorm2d`` everywhere.
+# V2 keeps RMSNorm as the default because train/eval behavior is identical, but
+# also exposes opt-in BatchNorm for low-node chunk-trained recipes.  The
+# parameter shapes differ by mode, so checkpoints are not interchangeable across
+# ``norm_type`` values.
 
 
 # ---------------------------------------------------------------------------
@@ -98,16 +120,17 @@ class NPURMSNormChannel(nn.Module):
 
 
 class NPUConv2dNormAct(nn.Module):
-    """Conv2d + NPURMSNormChannel + ReLU. No permute, no LayerNorm decomposition."""
+    """Conv2d + channel norm + ReLU. No permute, no LayerNorm decomposition."""
 
-    def __init__(self, nIn, nOut, kSize, stride=1, groups=1, dilation=1, bias=False):
+    def __init__(self, nIn, nOut, kSize, stride=1, groups=1, dilation=1, bias=False,
+                 norm_type: str = "rms"):
         super().__init__()
         padding = ((kSize - 1) * dilation) // 2
         self.conv = nn.Conv2d(
             nIn, nOut, kSize, stride=stride, padding=padding, bias=bias,
             groups=groups, dilation=dilation,
         )
-        self.bn = NPURMSNormChannel(nOut)
+        self.bn = _make_npu_norm(nOut, norm_type)
         self.act = nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -115,10 +138,10 @@ class NPUConv2dNormAct(nn.Module):
 
 
 class NPUConv2dNorm(nn.Module):
-    """Conv2d + NPURMSNormChannel without activation."""
+    """Conv2d + channel norm without activation."""
 
     def __init__(self, nIn, nOut, kSize, stride=(1, 1), dilation=(1, 1),
-                 groups=1, bias=False):
+                 groups=1, bias=False, norm_type: str = "rms"):
         super().__init__()
         if isinstance(kSize, int):
             kSize = (kSize, kSize)
@@ -132,7 +155,7 @@ class NPUConv2dNorm(nn.Module):
             nIn, nOut, kSize, stride=stride, padding=(pad_h, pad_w),
             bias=bias, groups=groups, dilation=dilation,
         )
-        self.bn = NPURMSNormChannel(nOut)
+        self.bn = _make_npu_norm(nOut, norm_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.bn(self.conv(x))
@@ -141,14 +164,15 @@ class NPUConv2dNorm(nn.Module):
 class NPUCausalConv2dNorm(nn.Module):
     """Time-causal Conv2d on [B,C,F,T]: left-pad only on time axis."""
 
-    def __init__(self, nIn, nOut, kSize_t, dilation_t=1, groups=1, bias=False):
+    def __init__(self, nIn, nOut, kSize_t, dilation_t=1, groups=1, bias=False,
+                 norm_type: str = "rms"):
         super().__init__()
         self.lookback = (kSize_t - 1) * dilation_t
         self.conv = nn.Conv2d(
             nIn, nOut, (1, kSize_t), stride=(1, 1), padding=(0, 0),
             dilation=(1, dilation_t), bias=bias, groups=groups,
         )
-        self.bn = NPURMSNormChannel(nOut)
+        self.bn = _make_npu_norm(nOut, norm_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.lookback > 0:
@@ -275,7 +299,7 @@ class NPUFusedSubbandEncoder(nn.Module):
     Stage 2: bottleneck -> feature_dim * nband (expand to band features)
     """
 
-    def __init__(self, band_widths: List[int], feature_dim: int):
+    def __init__(self, band_widths: List[int], feature_dim: int, norm_type: str = "rms"):
         super().__init__()
         self.band_widths = band_widths
         self.nband = len(band_widths)
@@ -285,10 +309,10 @@ class NPUFusedSubbandEncoder(nn.Module):
         # Factored projection: enc_dim_2 -> mid -> feature_dim*nband
         mid = min(256, self.enc_dim_2 // 4)
         self.proj1 = nn.Conv2d(self.enc_dim_2, mid, 1, bias=True)
-        self.bn1 = NPURMSNormChannel(mid)
+        self.bn1 = _make_npu_norm(mid, norm_type)
         self.act1 = nn.ReLU()
         self.proj2 = nn.Conv2d(mid, feature_dim * self.nband, 1, bias=True)
-        self.bn2 = NPURMSNormChannel(feature_dim * self.nband)
+        self.bn2 = _make_npu_norm(feature_dim * self.nband, norm_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, 1, 2*enc_dim, T]
@@ -309,7 +333,8 @@ class NPUFusedSubbandDecoder(nn.Module):
     Uses factored projection to keep parameter count reasonable.
     """
 
-    def __init__(self, band_widths: List[int], feature_dim: int, num_sources: int):
+    def __init__(self, band_widths: List[int], feature_dim: int, num_sources: int,
+                 norm_type: str = "rms"):
         super().__init__()
         self.band_widths = band_widths
         self.nband = len(band_widths)
@@ -323,7 +348,7 @@ class NPUFusedSubbandDecoder(nn.Module):
         mid = min(256, in_ch)
         self.act = nn.ReLU()
         self.proj1 = nn.Conv2d(in_ch, mid, 1, bias=True)
-        self.bn1 = NPURMSNormChannel(mid)
+        self.bn1 = _make_npu_norm(mid, norm_type)
         self.act1 = nn.ReLU()
         self.proj2 = nn.Conv2d(mid, self.out_channels, 1, bias=True)
 
@@ -351,7 +376,8 @@ class NPUVectorizedFrameAttention(nn.Module):
     """
 
     def __init__(self, in_channels: int, n_heads: int = 4, hid_chan: int = 2,
-                 v_hid_chan: int = 2, freq_bins: int = 67, window_size: int = 4):
+                 v_hid_chan: int = 2, freq_bins: int = 67, window_size: int = 4,
+                 norm_type: str = "rms"):
         super().__init__()
         self.in_channels = in_channels
         self.n_heads = n_heads
@@ -367,13 +393,13 @@ class NPUVectorizedFrameAttention(nn.Module):
         # QKV projection: [B, C, F, T] -> [B, total_proj, F, T]
         self.qkv_conv = nn.Sequential(
             nn.Conv2d(in_channels, total_proj, 1, bias=True),
-            NPURMSNormChannel(total_proj),
+            _make_npu_norm(total_proj, norm_type),
             nn.ReLU(),
         )
         # Output projection
         self.proj_conv = nn.Sequential(
             nn.Conv2d(n_heads * v_hid_chan, in_channels, 1, bias=True),
-            NPURMSNormChannel(in_channels),
+            _make_npu_norm(in_channels, norm_type),
             nn.ReLU(),
         )
 
@@ -546,7 +572,8 @@ class NPUVectorizedFreqAttention(nn.Module):
     """
 
     def __init__(self, in_channels: int, n_heads: int = 4, hid_chan: int = 2,
-                 v_hid_chan: int = 2, freq_bins: int = 67):
+                 v_hid_chan: int = 2, freq_bins: int = 67,
+                 norm_type: str = "rms"):
         super().__init__()
         self.in_channels = in_channels
         self.n_heads = n_heads
@@ -558,12 +585,12 @@ class NPUVectorizedFreqAttention(nn.Module):
         total_proj = n_heads * (hid_chan * 2 + v_hid_chan)
         self.qkv_conv = nn.Sequential(
             nn.Conv2d(in_channels, total_proj, 1, bias=True),
-            NPURMSNormChannel(total_proj),
+            _make_npu_norm(total_proj, norm_type),
             nn.ReLU(),
         )
         self.proj_conv = nn.Sequential(
             nn.Conv2d(n_heads * v_hid_chan, in_channels, 1, bias=True),
-            NPURMSNormChannel(in_channels),
+            _make_npu_norm(in_channels, norm_type),
             nn.ReLU(),
         )
 
@@ -632,7 +659,7 @@ class NPUVectorizedFreqAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# NPU-friendly Freq/Time U-blocks (using NPURMSNormChannel, no Dropout)
+# NPU-friendly Freq/Time U-blocks (configurable channel norm, no Dropout)
 # ---------------------------------------------------------------------------
 
 
@@ -640,19 +667,20 @@ class NPUFreqUConvBlock(nn.Module):
     """Frequency multi-resolution block using NPU-friendly ops."""
 
     def __init__(self, out_channels: int, in_channels: int,
-                 upsampling_depth: int = 4, nband: int = 67):
+                 upsampling_depth: int = 4, nband: int = 67,
+                 norm_type: str = "rms"):
         super().__init__()
         self.depth = upsampling_depth
-        self.proj = NPUConv2dNormAct(out_channels, in_channels, 1)
+        self.proj = NPUConv2dNormAct(out_channels, in_channels, 1, norm_type=norm_type)
 
         # Downsampling on freq axis
         self.spp_dw = nn.ModuleList()
         self.spp_dw.append(NPUConv2dNorm(in_channels, in_channels, (5, 1),
-                                          groups=in_channels))
+                                          groups=in_channels, norm_type=norm_type))
         for _ in range(1, upsampling_depth):
             self.spp_dw.append(NPUConv2dNorm(
                 in_channels, in_channels, (5, 1), stride=(2, 1),
-                groups=in_channels,
+                groups=in_channels, norm_type=norm_type,
             ))
 
         # Compute level sizes
@@ -668,11 +696,11 @@ class NPUFreqUConvBlock(nn.Module):
 
         # Global MLP
         self.global_mlp = nn.Sequential(
-            NPUConv2dNorm(in_channels, in_channels, 1),
+            NPUConv2dNorm(in_channels, in_channels, 1, norm_type=norm_type),
             nn.Conv2d(in_channels, in_channels, (5, 1), padding=(2, 0),
                       groups=in_channels, bias=True),
             nn.ReLU(),
-            NPUConv2dNorm(in_channels, in_channels, 1),
+            NPUConv2dNorm(in_channels, in_channels, 1, norm_type=norm_type),
         )
 
         # Local-global fusion with resizers
@@ -730,11 +758,97 @@ class NPUFreqUConvBlock(nn.Module):
         return self.res_conv(expanded) + residual
 
 
+class NPUGatedChannelAct(nn.Module):
+    """GLU-style activation that exports as Slice + Sigmoid + Mul."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        c = x.shape[1] // 2
+        a = x[:, :c, :, :]
+        b = x[:, c:, :, :]
+        return a * torch.sigmoid(b)
+
+
+class NPUBandMixFreqBlock(nn.Module):
+    """Low-node cross-band mixer inspired by SFC, BandSCNetNPU, and DolphinSFCNPU.
+
+    Tiger V2's default frequency U-block is strong, but it repeats a
+    resize-heavy frequency pyramid inside every separator stage.  The other NPU
+    families use a different shape: compress/mix on a reduced band axis,
+    combine local band convolution with a cheap frequency-pooled channel branch,
+    then decode once.  This block ports that idea into Tiger's existing
+    subband-token space while preserving the downstream frequency attention.
+    """
+
+    def __init__(
+        self,
+        out_channels: int,
+        in_channels: int,
+        *,
+        freq_kernel: int = 5,
+        pooled_mixer_hidden: int = 0,
+        norm_type: str = "rms",
+    ):
+        super().__init__()
+        if freq_kernel % 2 != 1:
+            raise ValueError(f"freq_kernel must be odd, got {freq_kernel}")
+        if (freq_kernel - 1) > 14:
+            raise ValueError(
+                f"freq_kernel violates NPU kernel rule: (k-1)={freq_kernel - 1}"
+            )
+        if pooled_mixer_hidden < 0:
+            raise ValueError("pooled_mixer_hidden must be non-negative.")
+
+        self.pooled_mixer_hidden = pooled_mixer_hidden
+        self.project_in = NPUConv2dNormAct(
+            out_channels, in_channels, 1, norm_type=norm_type,
+        )
+        self.local_norm = _make_npu_norm(in_channels, norm_type)
+        self.local_expand = nn.Conv2d(in_channels, 2 * in_channels, 1, bias=True)
+        self.local_gate = NPUGatedChannelAct()
+        self.local_freq = nn.Conv2d(
+            in_channels,
+            in_channels,
+            (freq_kernel, 1),
+            padding=(freq_kernel // 2, 0),
+            groups=in_channels,
+            bias=True,
+        )
+        self.local_out = nn.Conv2d(in_channels, out_channels, 1, bias=True)
+
+        if pooled_mixer_hidden > 0:
+            self.pool_norm = _make_npu_norm(in_channels, norm_type)
+            self.pool_expand = nn.Conv2d(in_channels, 2 * pooled_mixer_hidden, 1, bias=True)
+            self.pool_gate = NPUGatedChannelAct()
+            self.pool_out = nn.Conv2d(pooled_mixer_hidden, out_channels, 1, bias=True)
+        else:
+            self.pool_norm = nn.Identity()
+            self.pool_expand = nn.Identity()
+            self.pool_gate = nn.Identity()
+            self.pool_out = nn.Identity()
+        self.act = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        h = self.project_in(x)
+
+        y = self.local_norm(h)
+        y = self.local_gate(self.local_expand(y))
+        y = self.act(self.local_freq(y))
+        y = self.local_out(y)
+
+        if self.pooled_mixer_hidden > 0:
+            pooled = self.pool_norm(h).mean(dim=2, keepdim=True)
+            pooled = self.pool_gate(self.pool_expand(pooled))
+            y = y + self.pool_out(pooled)
+
+        return residual + y
+
+
 
 class NPUCausalTimeBlock(nn.Module):
     """
     Causal time-domain block with context state.
-    Uses depthwise causal Conv2d with NPURMSNormChannel. No Dropout.
+    Uses depthwise causal Conv2d with the configured channel norm. No Dropout.
     
     Architecture: parallel dilated causal convolutions applied to the
     context-prefixed input. Each conv receives the same padded input and
@@ -743,7 +857,8 @@ class NPUCausalTimeBlock(nn.Module):
 
     def __init__(self, out_channels: int, hidden_channels: int = 8,
                  dilations: Tuple[int, ...] = (1, 1, 2),
-                 kernel_size: int = 3, global_kernel_size: int = 5):
+                 kernel_size: int = 3, global_kernel_size: int = 5,
+                 norm_type: str = "rms"):
         super().__init__()
         self.hidden_channels = hidden_channels
         self.dilations = dilations
@@ -756,7 +871,7 @@ class NPUCausalTimeBlock(nn.Module):
         global_ctx = max(0, global_kernel_size - 1)
         self.context_size = conv_ctx + global_ctx
 
-        self.proj = NPUConv2dNormAct(out_channels, hidden_channels, 1)
+        self.proj = NPUConv2dNormAct(out_channels, hidden_channels, 1, norm_type=norm_type)
 
         # Dilated causal convolutions on time axis (no padding, rely on context)
         self.dw_convs = nn.ModuleList([
@@ -764,7 +879,7 @@ class NPUCausalTimeBlock(nn.Module):
                 nn.Conv2d(hidden_channels, hidden_channels, (1, kernel_size),
                           dilation=(1, d), padding=(0, 0),
                           groups=hidden_channels, bias=False),
-                NPURMSNormChannel(hidden_channels),
+                _make_npu_norm(hidden_channels, norm_type),
             )
             for d in dilations
         ])
@@ -775,10 +890,10 @@ class NPUCausalTimeBlock(nn.Module):
         self.global_conv = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, (1, global_kernel_size),
                       padding=(0, 0), groups=hidden_channels, bias=False),
-            NPURMSNormChannel(hidden_channels),
+            _make_npu_norm(hidden_channels, norm_type),
             nn.ReLU(),
             nn.Conv2d(hidden_channels, hidden_channels, 1, bias=False),
-            NPURMSNormChannel(hidden_channels),
+            _make_npu_norm(hidden_channels, norm_type),
         )
 
         # Fusion gates
@@ -857,24 +972,46 @@ class NPUFreqTimeStage(nn.Module):
                  time_hidden_channels: int = 8,
                  time_dilations: Tuple[int, ...] = (1, 1, 2),
                  time_kernel_size: int = 3,
-                 time_global_kernel_size: int = 5):
+                 time_global_kernel_size: int = 5,
+                 freq_block_type: str = "uconv",
+                 freq_kernel_size: int = 5,
+                 pooled_mixer_hidden: int = 0,
+                 norm_type: str = "rms"):
         super().__init__()
-        self.freq_block = NPUFreqUConvBlock(out_channels, in_channels,
-                                             f_upsampling_depth, nband)
+        freq_block_type = freq_block_type.lower().replace("_", "-")
+        if freq_block_type in ("uconv", "pyramid"):
+            self.freq_block = NPUFreqUConvBlock(
+                out_channels, in_channels, f_upsampling_depth, nband,
+                norm_type=norm_type,
+            )
+        elif freq_block_type in ("bandmix", "band-mix", "crossband"):
+            self.freq_block = NPUBandMixFreqBlock(
+                out_channels,
+                in_channels,
+                freq_kernel=freq_kernel_size,
+                pooled_mixer_hidden=pooled_mixer_hidden,
+                norm_type=norm_type,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported TIGERNPUEdgeV2 freq_block_type={freq_block_type!r}; "
+                "expected 'uconv' or 'bandmix'."
+            )
         self.freq_attn = NPUVectorizedFreqAttention(
             out_channels, n_heads, att_hid_chan, att_val_hid_chan, nband,
+            norm_type=norm_type,
         )
-        self.freq_norm = NPURMSNormChannel(out_channels)
+        self.freq_norm = _make_npu_norm(out_channels, norm_type)
 
         self.time_block = NPUCausalTimeBlock(
             out_channels, time_hidden_channels, time_dilations,
-            time_kernel_size, time_global_kernel_size,
+            time_kernel_size, time_global_kernel_size, norm_type=norm_type,
         )
         self.frame_attn = NPUVectorizedFrameAttention(
             out_channels, n_heads, att_hid_chan, att_val_hid_chan, nband,
-            kv_window_size,
+            kv_window_size, norm_type=norm_type,
         )
-        self.frame_norm = NPURMSNormChannel(out_channels)
+        self.frame_norm = _make_npu_norm(out_channels, norm_type)
 
     def forward(self, x: torch.Tensor, past_kv: torch.Tensor,
                 past_valid_mask: torch.Tensor, time_ctx: torch.Tensor
@@ -933,7 +1070,11 @@ class NPUStackedSeparator(nn.Module):
                  time_hidden_channels: int = 8,
                  time_dilations: Tuple[int, ...] = (1, 1, 2),
                  time_kernel_size: int = 3,
-                 time_global_kernel_size: int = 5):
+                 time_global_kernel_size: int = 5,
+                 freq_block_type: str = "uconv",
+                 freq_kernel_size: int = 5,
+                 pooled_mixer_hidden: int = 0,
+                 norm_type: str = "rms"):
         super().__init__()
         self.out_channels = out_channels
         self.in_channels = in_channels
@@ -949,7 +1090,8 @@ class NPUStackedSeparator(nn.Module):
                 out_channels, in_channels, nband, f_upsampling_depth,
                 n_heads, att_hid_chan, att_val_hid_chan, kv_window_size,
                 time_hidden_channels, time_dilations, time_kernel_size,
-                time_global_kernel_size,
+                time_global_kernel_size, freq_block_type, freq_kernel_size,
+                pooled_mixer_hidden, norm_type,
             )
             for _ in range(num_stages)
         ])
@@ -1068,8 +1210,8 @@ class TIGERNPUEdgeV2(nn.Module):
 
     Key architectural choices:
     - Fused subband encoder/decoder (single Conv2d instead of 67-band loop)
-    - NPURMSNormChannel everywhere (stream-safe, train-eval identical, ~3 ops)
-      instead of LayerNorm (5+ nodes) or BatchNorm (bad under T=1 training)
+    - Configurable channel norm: RMSNorm by default, BatchNorm for low-node
+      chunk-trained recipes
     - Vectorized attention (no Python for-loop over heads)
     - ConvTranspose2d frequency resizing (no Tile/repeat_interleave)
     - No Dropout, no PReLU (ReLU only)
@@ -1095,6 +1237,10 @@ class TIGERNPUEdgeV2(nn.Module):
         time_dilations: Tuple[int, ...] = (1, 1, 2),
         time_kernel_size: int = 3,
         time_global_kernel_size: int = 5,
+        freq_block_type: str = "uconv",
+        freq_kernel_size: int = 5,
+        pooled_mixer_hidden: int = 0,
+        norm_type: str = "rms",
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -1108,7 +1254,7 @@ class TIGERNPUEdgeV2(nn.Module):
         self.nband = len(self.band_width)
 
         # Fused encoder: [B, 1, 2*enc_dim, T] -> [B, feature_dim, nband, T]
-        self.encoder = NPUFusedSubbandEncoder(self.band_width, out_channels)
+        self.encoder = NPUFusedSubbandEncoder(self.band_width, out_channels, norm_type=norm_type)
 
         # Separator
         self.separator = NPUStackedSeparator(
@@ -1125,10 +1271,16 @@ class TIGERNPUEdgeV2(nn.Module):
             time_dilations=time_dilations,
             time_kernel_size=time_kernel_size,
             time_global_kernel_size=time_global_kernel_size,
+            freq_block_type=freq_block_type,
+            freq_kernel_size=freq_kernel_size,
+            pooled_mixer_hidden=pooled_mixer_hidden,
+            norm_type=norm_type,
         )
 
         # Fused decoder: [B, feature_dim, nband, T] -> [B, 4*num_sources, enc_dim, T]
-        self.decoder = NPUFusedSubbandDecoder(self.band_width, out_channels, num_sources)
+        self.decoder = NPUFusedSubbandDecoder(
+            self.band_width, out_channels, num_sources, norm_type=norm_type,
+        )
 
         # Store params for state init
         self._n_heads = att_n_head
@@ -1140,6 +1292,10 @@ class TIGERNPUEdgeV2(nn.Module):
         self._time_dilations = time_dilations
         self._time_kernel_size = time_kernel_size
         self._time_global_kernel_size = time_global_kernel_size
+        self._freq_block_type = freq_block_type
+        self._freq_kernel_size = freq_kernel_size
+        self._pooled_mixer_hidden = pooled_mixer_hidden
+        self._norm_type = norm_type
 
         # Chunked training is supported -- ``forward_sequence`` uses a single
         # T-generic kernel (``_forward_chunk``) and slices the total frame
