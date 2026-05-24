@@ -2,6 +2,14 @@ import torch
 
 from src.utils import LABELS, initialize_config
 
+_TSE_EXTRA_CONDITION_KEYS = (
+    "class_logits",
+    "silence_logits",
+    "pred_doa_vector",
+    "doa_vector",
+    "spatial_embedding",
+)
+
 
 class Kwon2025S5(torch.nn.Module):
     def __init__(
@@ -66,20 +74,15 @@ class Kwon2025S5(torch.nn.Module):
             return model_ckpt
         for prefix in preferred_prefixes:
             stripped = {
-                k[len(prefix):]: v
-                for k, v in model_ckpt.items()
-                if isinstance(k, str) and k.startswith(prefix)
+                k[len(prefix) :]: v for k, v in model_ckpt.items() if isinstance(k, str) and k.startswith(prefix)
             }
             if stripped and any(k in model_state for k in stripped):
                 return stripped
         one_model_key = next(iter(model_state.keys()))
-        ckpt_corresponding_key = [
-            k for k in model_ckpt.keys()
-            if isinstance(k, str) and k.endswith(one_model_key)
-        ]
+        ckpt_corresponding_key = [k for k in model_ckpt.keys() if isinstance(k, str) and k.endswith(one_model_key)]
         if ckpt_corresponding_key:
-            prefix = ckpt_corresponding_key[0][:-len(one_model_key)]
-            return {k[len(prefix):]: v for k, v in model_ckpt.items() if isinstance(k, str) and k.startswith(prefix)}
+            prefix = ckpt_corresponding_key[0][: -len(one_model_key)]
+            return {k[len(prefix) :]: v for k, v in model_ckpt.items() if isinstance(k, str) and k.startswith(prefix)}
         return model_ckpt
 
     def _load_ckpt(self, path, model, preferred_prefixes=()):
@@ -167,7 +170,9 @@ class Kwon2025S5(torch.nn.Module):
         if "class_logits" in uss_out:
             parts.append(self._match_condition_slots(uss_out["class_logits"].softmax(dim=-1), n_sources, device, dtype))
         if "silence_logits" in uss_out:
-            parts.append(self._match_condition_slots(uss_out["silence_logits"].sigmoid().unsqueeze(-1), n_sources, device, dtype))
+            parts.append(
+                self._match_condition_slots(uss_out["silence_logits"].sigmoid().unsqueeze(-1), n_sources, device, dtype)
+            )
         if "count_logits" in uss_out:
             count_prob = uss_out["count_logits"].softmax(dim=-1).to(device=device, dtype=dtype)
             parts.append(count_prob.unsqueeze(1).expand(-1, n_sources, -1))
@@ -183,7 +188,23 @@ class Kwon2025S5(torch.nn.Module):
         parts.append(slot_rms)
         return torch.cat(parts, dim=-1) if parts else None
 
-    def _run_tse(self, mixture, enroll, label_vector, query_condition=None):
+    def _build_tse_extra_conditions(self, uss_out, stage_waveform):
+        if not getattr(self, "tse_uss_conditioning_enabled", False):
+            return {}
+        n_sources = stage_waveform.shape[1]
+        device = stage_waveform.device
+        dtype = stage_waveform.dtype
+        out = {}
+        for key in _TSE_EXTRA_CONDITION_KEYS:
+            if key not in uss_out:
+                continue
+            value = uss_out[key]
+            if not torch.is_tensor(value):
+                continue
+            out[key] = self._match_condition_slots(value, n_sources, device, dtype)
+        return out
+
+    def _run_tse(self, mixture, enroll, label_vector, query_condition=None, extra_conditions=None):
         input_dict = {
             "mixture": mixture,
             "enrollment": enroll,
@@ -191,6 +212,8 @@ class Kwon2025S5(torch.nn.Module):
         }
         if query_condition is not None:
             input_dict["query_condition"] = query_condition
+        if extra_conditions:
+            input_dict.update(extra_conditions)
         return self.tse(input_dict)["waveform"]
 
     def _slot_silence_mask(self, label_vector):
@@ -254,6 +277,7 @@ class Kwon2025S5(torch.nn.Module):
                 uss_out, stage1_waveform, stage1_labels, stage1_probs, stage1_vector
             )
             stage1_condition = self._build_tse_query_condition(uss_out, stage1_waveform)
+            stage1_extra_conditions = self._build_tse_extra_conditions(uss_out, stage1_waveform)
             silent_slots = self._slot_silence_mask(stage1_vector)
             stage1_waveform, stage1_labels, stage1_probs, stage1_vector = self._force_silent_slots(
                 stage1_waveform, stage1_labels, stage1_probs, stage1_vector, silent_slots
@@ -269,7 +293,13 @@ class Kwon2025S5(torch.nn.Module):
                     output["query_condition"] = stage1_condition
                 return output
 
-            stage2_waveform = self._run_tse(mixture, stage1_waveform, stage1_vector, stage1_condition)
+            stage2_waveform = self._run_tse(
+                mixture,
+                stage1_waveform,
+                stage1_vector,
+                stage1_condition,
+                stage1_extra_conditions,
+            )
             stage2_labels, stage2_probs, stage2_vector = self._classify_sources(stage2_waveform)
             silent_slots = silent_slots | self._slot_silence_mask(stage2_vector)
             stage2_waveform, stage2_labels, stage2_probs, stage2_vector = self._force_silent_slots(
@@ -285,7 +315,13 @@ class Kwon2025S5(torch.nn.Module):
                     output["query_condition"] = stage1_condition
                 return output
 
-            stage3_waveform = self._run_tse(mixture, stage2_waveform, stage2_vector, stage1_condition)
+            stage3_waveform = self._run_tse(
+                mixture,
+                stage2_waveform,
+                stage2_vector,
+                stage1_condition,
+                stage1_extra_conditions,
+            )
             stage3_labels, stage3_probs, stage3_vector = self._classify_sources(stage3_waveform)
             silent_slots = silent_slots | self._slot_silence_mask(stage3_vector)
             stage3_waveform, stage3_labels, stage3_probs, _ = self._force_silent_slots(

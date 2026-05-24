@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
-import lightning.pytorch as pl
 import torch
 import torch.nn.functional as F
+
+import lightning.pytorch as pl
 
 from src.training.lightningmodule.online_teacher_tse import (
     OnlineTeacherTSELightning,
@@ -168,8 +169,7 @@ class USSScTSEPipelineFinetuneLightning(OnlineTeacherTSELightning):
             for key, value in second_loss_dict.items():
                 loss_dict[f"second_pass_{key}"] = value
             loss_dict["loss"] = (
-                loss_dict["loss"]
-                + getattr(self, "second_pass_loss_weight", 1.0) * second_loss_dict["loss"]
+                loss_dict["loss"] + getattr(self, "second_pass_loss_weight", 1.0) * second_loss_dict["loss"]
             )
             diagnostics = {
                 **diagnostics,
@@ -262,6 +262,7 @@ class USSScTSEPipelineFinetuneLightning(OnlineTeacherTSELightning):
         }
         if query_condition is not None:
             input_dict["query_condition"] = query_condition.detach()
+        input_dict.update(self._build_tse_extra_conditions(uss_out, enrollment))
 
         temporal_conditioning = None
         if self.temporal_conditioning_source in {"auto", "sc"} and "activity_probabilities" in sc_out:

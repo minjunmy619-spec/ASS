@@ -144,7 +144,7 @@ class Kwon2025TemporalS5(Kwon2025S5):
         labels = [self._vector_to_label(label_vector[i]) for i in range(batch_size)]
         return labels, probs, label_vector, activity
 
-    def _run_tse_temporal(self, mixture, enroll, label_vector, activity, query_condition=None):
+    def _run_tse_temporal(self, mixture, enroll, label_vector, activity, query_condition=None, extra_conditions=None):
         input_dict = {
             "mixture": mixture,
             "enrollment": enroll,
@@ -154,6 +154,8 @@ class Kwon2025TemporalS5(Kwon2025S5):
             input_dict["temporal_conditioning"] = activity
         if query_condition is not None:
             input_dict["query_condition"] = query_condition
+        if extra_conditions:
+            input_dict.update(extra_conditions)
         out = self.tse(input_dict)
         waveform = out["waveform"]
         tse_activity = out.get("activity_logits")
@@ -184,6 +186,7 @@ class Kwon2025TemporalS5(Kwon2025S5):
                 uss_activity = torch.sigmoid(uss_activity)
             stage1_waveform = self._gate_waveforms(stage1_waveform, uss_activity)
             stage1_condition = self._build_tse_query_condition(uss_out, stage1_waveform)
+            stage1_extra_conditions = self._build_tse_extra_conditions(uss_out, stage1_waveform)
 
             stage1_labels, stage1_probs, stage1_vector, stage1_activity = self._classify_sources_temporal(
                 stage1_waveform,
@@ -214,6 +217,7 @@ class Kwon2025TemporalS5(Kwon2025S5):
                 stage1_vector,
                 stage1_activity,
                 stage1_condition,
+                stage1_extra_conditions,
             )
             stage2_activity_prior = self._combine_activity(stage1_activity, tse2_activity)
             stage2_waveform = self._gate_waveforms(stage2_waveform, stage2_activity_prior)
@@ -246,6 +250,7 @@ class Kwon2025TemporalS5(Kwon2025S5):
                 stage2_vector,
                 stage2_activity,
                 stage1_condition,
+                stage1_extra_conditions,
             )
             stage3_activity_prior = self._combine_activity(stage2_activity, tse3_activity)
             stage3_waveform = self._gate_waveforms(stage3_waveform, stage3_activity_prior)

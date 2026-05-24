@@ -8,6 +8,7 @@ from src.evaluation.export_sc_finetune_cache import (
     _save_query_conditions,
     _uss_labels,
 )
+from src.models.deft.two_stage_tse import TwoStageRobustSpatialBridgeTSE
 
 
 class RecordingTSE(torch.nn.Module):
@@ -142,3 +143,38 @@ def test_export_cache_uss_pseudo_labels_respect_silence_logits():
     labels = _uss_labels(output, ["cat", "dog"])
 
     assert labels == [["dog", "silence", "dog"]]
+
+
+def test_two_stage_tse_confidence_features_treat_silence_logits_as_active_logits():
+    model = TwoStageRobustSpatialBridgeTSE(
+        mixture_channels=4,
+        enrollment_channels=1,
+        output_channels=1,
+        hidden_channels=8,
+        scene_blocks=1,
+        query_blocks=1,
+        n_heads=2,
+        label_dim=2,
+        window_size=128,
+        hop_size=64,
+        time_window_size=4,
+        freq_group_size=8,
+        enable_foa_spatial_features=False,
+        query_condition_dim=0,
+        spatial_condition_dim=0,
+        temporal_conditioning_enabled=False,
+        use_confidence_gates=True,
+        confidence_gate_hidden_dim=8,
+    )
+    enrollment = torch.ones(1, 2, 1, 32)
+    label_vector = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    input_dict = {
+        "silence_logits": torch.tensor([[4.0, -4.0]]),
+        "class_logits": torch.tensor([[[4.0, 0.0], [0.0, 4.0]]]),
+    }
+
+    features = model._confidence_features(input_dict, enrollment, label_vector)
+
+    # Historical key name is silence_logits, but high logit means active slot.
+    assert features[0, 0, 1].item() > 0.98
+    assert features[0, 1, 1].item() < 0.02

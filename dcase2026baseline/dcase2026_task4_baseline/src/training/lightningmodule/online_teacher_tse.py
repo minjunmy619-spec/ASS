@@ -1,15 +1,25 @@
 from __future__ import annotations
 
-from itertools import permutations
 from typing import Dict, Optional
 
-import lightning.pytorch as pl
+from itertools import permutations
+
 import torch
 import torch.nn.functional as F
+
+import lightning.pytorch as pl
 
 from src.tools.estimated_source_matching import pairwise_match_score
 from src.training.loss.class_aware_pit import infer_active_mask_from_label
 from src.utils import initialize_config
+
+_TSE_EXTRA_CONDITION_KEYS = (
+    "class_logits",
+    "silence_logits",
+    "pred_doa_vector",
+    "doa_vector",
+    "spatial_embedding",
+)
 
 
 def _strip_lightning_prefix(state_dict):
@@ -28,7 +38,7 @@ def _select_prefixed_model_state(state_dict, model, preferred_prefixes=()):
 
     for prefix in preferred_prefixes:
         stripped = {
-            key[len(prefix):]: value
+            key[len(prefix) :]: value
             for key, value in state_dict.items()
             if isinstance(key, str) and key.startswith(prefix)
         }
@@ -40,14 +50,11 @@ def _select_prefixed_model_state(state_dict, model, preferred_prefixes=()):
         return exact_matches
 
     one_model_key = next(iter(model_state.keys()))
-    suffix_matches = [
-        key for key in state_dict
-        if isinstance(key, str) and key.endswith(one_model_key)
-    ]
+    suffix_matches = [key for key in state_dict if isinstance(key, str) and key.endswith(one_model_key)]
     if suffix_matches:
-        prefix = suffix_matches[0][:-len(one_model_key)]
+        prefix = suffix_matches[0][: -len(one_model_key)]
         return {
-            key[len(prefix):]: value
+            key[len(prefix) :]: value
             for key, value in state_dict.items()
             if isinstance(key, str) and key.startswith(prefix)
         }
@@ -72,11 +79,10 @@ def _load_model_checkpoint(model, checkpoint_path, strict=True, name="model", al
 
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
-        print(f"[OnlineTeacherTSE] {name} checkpoint {checkpoint_path}: missing={len(missing)}, unexpected={len(unexpected)}")
-    disallowed_missing = [
-        key for key in missing
-        if not key.startswith(tuple(allowed_missing_prefixes))
-    ]
+        print(
+            f"[OnlineTeacherTSE] {name} checkpoint {checkpoint_path}: missing={len(missing)}, unexpected={len(unexpected)}"
+        )
+    disallowed_missing = [key for key in missing if not key.startswith(tuple(allowed_missing_prefixes))]
     if disallowed_missing or unexpected:
         raise RuntimeError(
             f"{name} checkpoint/config mismatch: missing={disallowed_missing[:20]}, unexpected={unexpected[:20]}"
@@ -251,11 +257,15 @@ class OnlineTeacherTSELightning(pl.LightningModule):
         device = enrollment.device
         dtype = enrollment.dtype
 
-        condition_keys = (self.query_condition_key,) if self.query_condition_key else (
-            "tse_condition",
-            "query_condition",
-            "bridge_condition",
-            "proposal_condition",
+        condition_keys = (
+            (self.query_condition_key,)
+            if self.query_condition_key
+            else (
+                "tse_condition",
+                "query_condition",
+                "bridge_condition",
+                "proposal_condition",
+            )
         )
         for key in condition_keys:
             if key and key in uss_out:
@@ -265,7 +275,9 @@ class OnlineTeacherTSELightning(pl.LightningModule):
         if "class_logits" in uss_out:
             parts.append(self._match_condition_slots(uss_out["class_logits"].softmax(dim=-1), n_sources, device, dtype))
         if "silence_logits" in uss_out:
-            parts.append(self._match_condition_slots(uss_out["silence_logits"].sigmoid().unsqueeze(-1), n_sources, device, dtype))
+            parts.append(
+                self._match_condition_slots(uss_out["silence_logits"].sigmoid().unsqueeze(-1), n_sources, device, dtype)
+            )
         if "count_logits" in uss_out:
             count_prob = uss_out["count_logits"].softmax(dim=-1).to(device=device, dtype=dtype)
             parts.append(count_prob.unsqueeze(1).expand(-1, n_sources, -1))
@@ -280,6 +292,29 @@ class OnlineTeacherTSELightning(pl.LightningModule):
         slot_rms = enrollment[:, :, 0].float().pow(2).mean(dim=-1).sqrt().to(dtype=dtype).unsqueeze(-1)
         parts.append(slot_rms)
         return torch.cat(parts, dim=-1)
+
+    def _build_tse_extra_conditions(self, uss_out, enrollment):
+        """Forward optional mixture-derived USS hints to robust TSE variants.
+
+        These tensors are not required by baseline TSE models, but robust
+        variants such as TwoStageRobustSpatialBridgeTSE use them for
+        confidence-aware gates and gated spatial FiLM.  Only prediction-derived
+        USS outputs are forwarded; oracle-like ``used_spatial_vector`` is
+        intentionally excluded to avoid train/eval leakage ambiguity.
+        """
+
+        n_sources = enrollment.shape[1]
+        device = enrollment.device
+        dtype = enrollment.dtype
+        out = {}
+        for key in _TSE_EXTRA_CONDITION_KEYS:
+            if key not in uss_out:
+                continue
+            value = uss_out[key]
+            if not torch.is_tensor(value):
+                continue
+            out[key] = self._match_condition_slots(value, n_sources, device, dtype).detach()
+        return out
 
     def _normalize_temporal_conditioning(self, condition, n_sources=None):
         if condition is None:
@@ -367,6 +402,9 @@ class OnlineTeacherTSELightning(pl.LightningModule):
         }
         if "query_condition" in first_input:
             input_dict["query_condition"] = first_input["query_condition"].detach()
+        for key in _TSE_EXTRA_CONDITION_KEYS:
+            if key in first_input:
+                input_dict[key] = first_input[key].detach()
 
         temporal_parts = []
         temporal_conditioning_source = getattr(self, "temporal_conditioning_source", "auto")
@@ -420,7 +458,9 @@ class OnlineTeacherTSELightning(pl.LightningModule):
     def _align_oracle_to_estimate_slots(self, enrollment, target):
         ref = target["waveform"].to(device=enrollment.device, dtype=enrollment.dtype)
         label = target["label_vector"].to(device=enrollment.device, dtype=enrollment.dtype)
-        active = target.get("active_mask", infer_active_mask_from_label(label)).to(device=enrollment.device, dtype=torch.bool)
+        active = target.get("active_mask", infer_active_mask_from_label(label)).to(
+            device=enrollment.device, dtype=torch.bool
+        )
         span_sec = target.get("span_sec")
         if span_sec is not None:
             span_sec = span_sec.to(device=enrollment.device, dtype=enrollment.dtype)
@@ -529,6 +569,7 @@ class OnlineTeacherTSELightning(pl.LightningModule):
         }
         if query_condition is not None:
             input_dict["query_condition"] = query_condition.detach()
+        input_dict.update(self._build_tse_extra_conditions(uss_out, enrollment))
 
         temporal_conditioning = None
         if self.temporal_conditioning_source in {"auto", "sc"} and "activity_probabilities" in sc_out:
@@ -582,8 +623,7 @@ class OnlineTeacherTSELightning(pl.LightningModule):
             for key, value in second_loss_dict.items():
                 loss_dict[f"second_pass_{key}"] = value
             loss_dict["loss"] = (
-                loss_dict["loss"]
-                + getattr(self, "second_pass_loss_weight", 1.0) * second_loss_dict["loss"]
+                loss_dict["loss"] + getattr(self, "second_pass_loss_weight", 1.0) * second_loss_dict["loss"]
             )
             diagnostics = {
                 **diagnostics,

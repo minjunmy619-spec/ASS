@@ -1,0 +1,139 @@
+task_name: modified_deft_tse_lite_6s_online_teacher_two_stage_spatial_uss_sc
+description: >
+    Dynamic synthesized TSE training with frozen online UnifiedModifiedDeFTUSS and
+    SC teachers, using the two-stage robust spatial TSE. This config follows the
+    pipeline-finetune configs by referencing the USS/SC model recipes through
+    from_training_config. The dataset emits only mixture plus oracle targets;
+    frozen USS creates estimated enrollments, query/temporal/spatial hints and
+    confidence signals, and frozen SC creates TSE query labels on the fly.
+    Optional USS hints are progressively exposed via condition dropout/noise
+    curriculum to improve robustness to under-trained auxiliary heads.
+
+deterministic: true
+manual_seed: 0
+
+datamodule:
+    from_training_config: modified_deft_tse_lite_6s_online_teacher_uss_sc.yaml
+    key: datamodule
+
+lightning_module:
+    module: src.training.lightningmodule.online_teacher_tse
+    main: OnlineTeacherTSELightning
+    args:
+        uss_pretrained_ckpt: checkpoint/modified_deft_uss_lite_6s_unified_all_features.ckpt
+        sc_pretrained_ckpt: checkpoint/m2d_sc_stage3_estimated_pretrainedsed_fusion.ckpt
+        pretrained_model_ckpt:
+        pretrained_model_strict: false
+        uss_pretrained_strict: true
+        sc_pretrained_strict: true
+        match_metric: sa_sdr
+        min_match_score: -20.0
+        min_estimate_energy_db: -80.0
+        require_sc_active_for_loss: true
+        require_sc_class_match_for_loss: false
+        label_source: sc
+        query_condition_enabled: true
+        temporal_conditioning_source: auto
+        tse_refinement_passes: 1
+        uss_model:
+            from_training_config: modified_deft_sc_primary_frozenuss_pretrainedsed_fusion.yaml
+            key: lightning_module.args.uss_model
+        sc_model:
+            from_training_config: ../label/m2d_sc_stage3_estimated_pretrainedsed_fusion.yaml
+            key: lightning_module.args.model
+        model:
+            module: src.models.deft.two_stage_tse
+            main: TwoStageRobustSpatialBridgeTSE
+            args:
+                mixture_channels: 4
+                enrollment_channels: 1
+                output_channels: 1
+                hidden_channels: 96
+                scene_blocks: 3
+                query_blocks: 3
+                n_heads: 4
+                label_dim: 18
+                window_size: 1024
+                hop_size: 320
+                time_window_size: 128
+                freq_group_size: 64
+                shift_windows: true
+                sample_rate: 32000
+                inference_chunk_seconds: 10.0
+                inference_chunk_hop_seconds: 8.0
+                enable_foa_spatial_features: true
+                include_logmag: true
+                include_aiv: true
+                include_ipd: true
+                spatial_feature_eps: 0.00000001
+                query_condition_dim: 256
+                query_condition_hidden_dim: 256
+                spatial_condition_dim: 3
+                spatial_condition_hidden_dim: 64
+                temporal_conditioning_enabled: true
+                auxiliary_gate_init: -3.0
+                use_confidence_gates: true
+                confidence_gate_hidden_dim: 32
+                condition_dropout: 0.8
+                temporal_condition_dropout: 0.8
+                spatial_condition_dropout: 1.0
+                condition_noise_std: 0.05
+                spatial_condition_noise_std: 0.10
+                enable_reference_fallback: true
+                spatial_output_gate_init: -3.0
+        loss:
+            from_training_config: modified_deft_tse_lite_6s_temporal.yaml
+            key: lightning_module.args.loss
+        optimizer:
+            from_training_config: modified_deft_tse_lite_6s_temporal.yaml
+            key: lightning_module.args.optimizer
+            overrides:
+                args:
+                    lr: 0.0001
+        is_validation: true
+
+train:
+    from_training_config: modified_deft_tse_lite_6s_online_teacher_uss_sc.yaml
+    key: train
+    overrides:
+        callbacks:
+            - name: checkpoint
+              module: lightning.pytorch.callbacks
+              main: ModelCheckpoint
+              args:
+                  every_n_epochs: 1
+                  filename: "{epoch}"
+                  save_top_k: 1
+                  save_last: true
+                  monitor: epoch_val/loss
+                  mode: min
+                  verbose: false
+                  dirpath:
+            - name: tqdm
+              module: lightning.pytorch.callbacks
+              main: TQDMProgressBar
+              args:
+                  refresh_rate: 60
+                  process_position: 0
+            - name: robust_tse_condition_curriculum
+              module: src.training.callbacks.robust_tse_condition_curriculum
+              main: RobustTSEConditionCurriculum
+              args:
+                  model_attr: model
+                  warmup_epochs: 5
+                  ramp_epochs: 25
+                  start_condition_dropout: 0.8
+                  end_condition_dropout: 0.3
+                  start_temporal_condition_dropout: 0.8
+                  end_temporal_condition_dropout: 0.4
+                  start_spatial_condition_dropout: 1.0
+                  end_spatial_condition_dropout: 0.5
+                  start_condition_noise_std: 0.05
+                  end_condition_noise_std: 0.02
+                  start_spatial_condition_noise_std: 0.10
+                  end_spatial_condition_noise_std: 0.05
+                  strict: true
+        trainer:
+            args:
+                max_epochs: 60
+                gradient_clip_val: 0.5

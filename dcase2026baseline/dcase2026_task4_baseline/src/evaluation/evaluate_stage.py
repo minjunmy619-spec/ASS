@@ -1,19 +1,20 @@
 import argparse
 import copy
+from itertools import combinations, permutations
 import json
 import os
-from itertools import combinations, permutations
 
-import soundfile as sf
 import torch
-import yaml
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from src.utils import initialize_config
+from tqdm import tqdm
+import yaml
+
+import soundfile as sf
+
 from .metrics import label_metric, s5capi_metric
 from .metrics.s5_validation_breakdown import S5ValidationBreakdownMetric
-
 
 _TSE_CONDITION_KEYS = (
     "query_condition",
@@ -21,6 +22,13 @@ _TSE_CONDITION_KEYS = (
     "bridge_condition",
     "proposal_condition",
     "temporal_conditioning",
+    "foreground_activity_logits",
+    "class_logits",
+    "silence_logits",
+    "pred_doa_vector",
+    "doa_vector",
+    "spatial_condition",
+    "spatial_embedding",
 )
 
 
@@ -68,7 +76,9 @@ def _resolve_config_references(obj, base_dir=None):
         overrides = obj.get("overrides", obj.get("override", None))
         if overrides:
             if not isinstance(value, dict) or not isinstance(overrides, dict):
-                raise TypeError("override(s) can only be applied when both referenced value and override are dictionaries")
+                raise TypeError(
+                    "override(s) can only be applied when both referenced value and override are dictionaries"
+                )
             value = _deep_update(value, overrides)
         return value
     return {k: _resolve_config_references(v, base_dir=base_dir) for k, v in obj.items()}
@@ -95,20 +105,16 @@ def _select_model_state_dict(state_dict, model_state, preferred_prefixes=()):
     if set(state_dict.keys()) == set(model_state.keys()):
         return state_dict
     for prefix in preferred_prefixes:
-        stripped = {
-            k[len(prefix):]: v
-            for k, v in state_dict.items()
-            if isinstance(k, str) and k.startswith(prefix)
-        }
+        stripped = {k[len(prefix) :]: v for k, v in state_dict.items() if isinstance(k, str) and k.startswith(prefix)}
         if stripped and any(k in model_state for k in stripped):
             return stripped
     one_model_key = next(iter(model_state.keys()))
     suffix_matches = [k for k in state_dict if isinstance(k, str) and k.endswith(one_model_key)]
     if suffix_matches:
-        prefix = suffix_matches[0][:-len(one_model_key)]
-        return {k[len(prefix):]: v for k, v in state_dict.items() if isinstance(k, str) and k.startswith(prefix)}
+        prefix = suffix_matches[0][: -len(one_model_key)]
+        return {k[len(prefix) :]: v for k, v in state_dict.items() if isinstance(k, str) and k.startswith(prefix)}
     for prefix in ("model.", "module.", "net."):
-        stripped = {k[len(prefix):]: v for k, v in state_dict.items() if isinstance(k, str) and k.startswith(prefix)}
+        stripped = {k[len(prefix) :]: v for k, v in state_dict.items() if isinstance(k, str) and k.startswith(prefix)}
         if stripped and any(k in model_state for k in stripped):
             return stripped
     return state_dict
@@ -119,6 +125,7 @@ def _stage_checkpoint_prefixes(stage):
         "uss": ("uss_model.", "model.", "module.", "net."),
         "sc": ("sc_model.", "model.", "module.", "net."),
         "tse": ("tse_model.", "model.", "module.", "net."),
+        "s5": ("model.", "module.", "net."),
     }.get(stage, ("model.", "module.", "net."))
 
 
@@ -313,7 +320,9 @@ class StageEvaluator:
         self.config_path = config_path
         self.config_dir = os.path.dirname(os.path.abspath(config_path))
         raw_config, resolved_config_path = _load_yaml(config_path)
-        self.config = _resolve_config_references(raw_config, base_dir=os.path.dirname(os.path.abspath(resolved_config_path)))
+        self.config = _resolve_config_references(
+            raw_config, base_dir=os.path.dirname(os.path.abspath(resolved_config_path))
+        )
         self.stage = stage
         self.filename = os.path.basename(config_path)[:-5]
         self.batch_size = batch_size
@@ -322,7 +331,9 @@ class StageEvaluator:
         self.sc_prediction_mode = sc_prediction_mode
         self.compare_assignment = bool(compare_assignment)
         self.validation_breakdown = bool(validation_breakdown)
-        self.waveform_output_dir = os.path.join(waveform_output_dir, self.filename, stage) if waveform_output_dir else waveform_output_dir
+        self.waveform_output_dir = (
+            os.path.join(waveform_output_dir, self.filename, stage) if waveform_output_dir else waveform_output_dir
+        )
         self.device = torch.device("cpu" if use_cpu or not torch.cuda.is_available() else "cuda")
         if self.waveform_output_dir:
             os.makedirs(self.waveform_output_dir, exist_ok=True)
@@ -352,9 +363,13 @@ class StageEvaluator:
         _load_checkpoint(self.model, checkpoint, preferred_prefixes=_stage_checkpoint_prefixes(stage))
         self.model.eval()
         self.model.to(self.device)
+        tse_model = getattr(self.model, "tse", self.model)
         self.tse_conditioning_configured = bool(
-            getattr(self.model, "query_conditioner", None) is not None
-            or getattr(self.model, "bridge_to_label", None) is not None
+            getattr(tse_model, "query_conditioner", None) is not None
+            or getattr(tse_model, "bridge_to_label", None) is not None
+            or getattr(tse_model, "spatial_conditioner", None) is not None
+            or getattr(tse_model, "temporal_conditioner", None) is not None
+            or getattr(tse_model, "confidence_gate", None) is not None
         )
         self.tse_condition_keys_seen = set()
 
@@ -416,7 +431,16 @@ class StageEvaluator:
 
     def _evaluate_tse_batch(self, batch):
         mixture = batch["mixture"].to(self.device)
-        enrollment = batch["enrollment"] if "enrollment" in batch else batch["dry_sources"]
+        if "enrollment" in batch:
+            enrollment = batch["enrollment"]
+        elif "dry_sources" in batch:
+            enrollment = batch["dry_sources"]
+        else:
+            raise KeyError(
+                "TSE stage evaluation requires batch['enrollment'] or batch['dry_sources']. "
+                "Use a TSE/estimated-enrollment dataset for standalone TSE, or --stage s5 "
+                "for live mixture-only USS->SC->TSE evaluation."
+            )
         enrollment = enrollment.to(self.device)
         label_vector = batch["label_vector"].to(self.device)
         label_dim = getattr(self.model, "label_dim", None)
@@ -436,6 +460,20 @@ class StageEvaluator:
         est_waveforms = output["waveform"][:, :, 0, :].detach().cpu()
         probabilities = torch.ones(est_waveforms.shape[:2], dtype=torch.float32)
         return batch["label"], est_waveforms, probabilities, batch["label"]
+
+    def _evaluate_s5_batch(self, batch):
+        mixture = batch["mixture"].to(self.device)
+        with torch.no_grad():
+            output = self.model.predict_label_separate(mixture)
+        est_waveforms = output["waveform"][:, :, 0, :].detach().cpu()
+        probabilities = output.get("probabilities")
+        if probabilities is None:
+            probabilities = torch.ones(est_waveforms.shape[:2], dtype=torch.float32)
+        else:
+            probabilities = probabilities.detach().cpu()
+        if "query_condition" in output:
+            self.tse_condition_keys_seen.add("query_condition")
+        return output["label"], est_waveforms, probabilities, batch["label"]
 
     def evaluate(self):
         results = []
@@ -458,6 +496,8 @@ class StageEvaluator:
                 est_labels, est_waveforms, probabilities, ref_labels = self._evaluate_sc_batch(batch)
             elif self.stage == "tse":
                 est_labels, est_waveforms, probabilities, ref_labels = self._evaluate_tse_batch(batch)
+            elif self.stage == "s5":
+                est_labels, est_waveforms, probabilities, ref_labels = self._evaluate_s5_batch(batch)
             else:
                 raise ValueError(f"Unsupported stage: {self.stage}")
 
@@ -469,11 +509,13 @@ class StageEvaluator:
             for metric_func in metric_funcs:
                 kwargs = {"batch_est_labels": est_labels, "batch_ref_labels": ref_labels}
                 if metric_func in separation_metrics:
-                    kwargs.update({
-                        "batch_est_waveforms": est_waveforms,
-                        "batch_ref_waveforms": ref_waveforms[:, :, 0, :],
-                        "batch_mixture": mixture[:, 0, :],
-                    })
+                    kwargs.update(
+                        {
+                            "batch_est_waveforms": est_waveforms,
+                            "batch_ref_waveforms": ref_waveforms[:, :, 0, :],
+                            "batch_mixture": mixture[:, 0, :],
+                        }
+                    )
                 metric_values.append(metric_func.update(**kwargs))
 
             if est_waveforms is not None:
@@ -498,16 +540,20 @@ class StageEvaluator:
 
         summary = {}
         for metric_func in metric_funcs:
-            summary[getattr(metric_func, "metric_name", metric_func.__class__.__name__)] = _compute_metric(metric_func, is_print=True)
+            summary[getattr(metric_func, "metric_name", metric_func.__class__.__name__)] = _compute_metric(
+                metric_func, is_print=True
+            )
         if self.stage == "sc":
             summary["sc_prediction_mode"] = self.sc_prediction_mode
             summary["source_classification"] = _classification_counts(all_est_labels, all_ref_labels)
             print(f"SC prediction mode: {self.sc_prediction_mode}")
             print("Source top-1 accuracy: %.3f" % summary["source_classification"]["source_top1_accuracy"])
-            print("Active source top-1 accuracy: %.3f" % summary["source_classification"]["active_source_top1_accuracy"])
+            print(
+                "Active source top-1 accuracy: %.3f" % summary["source_classification"]["active_source_top1_accuracy"]
+            )
             print("Silence accuracy: %.3f" % summary["source_classification"]["silence_accuracy"])
             print("Source F1: %.3f" % summary["source_classification"]["source_f1"])
-        if self.stage == "tse":
+        if self.stage in {"tse", "s5"}:
             summary["tse_conditioning_configured"] = self.tse_conditioning_configured
             summary["tse_condition_keys_seen"] = sorted(self.tse_condition_keys_seen)
             if self.tse_conditioning_configured and not self.tse_condition_keys_seen:
@@ -552,7 +598,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", "-c", type=str, required=True)
-    parser.add_argument("--stage", choices=["uss", "sc", "tse"], required=True)
+    parser.add_argument("--stage", choices=["uss", "sc", "tse", "s5"], required=True)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--split", choices=["train", "val"], default="val")
     parser.add_argument("--waveform_output_dir", type=str, default="")
@@ -560,9 +606,22 @@ if __name__ == "__main__":
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--batchsize", "-b", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=None)
-    parser.add_argument("--sc_prediction_mode", choices=["raw", "gated"], default="gated", help="For --stage sc: gated matches final S5 predict() energy/silence thresholds; raw reports plain-logit top-1 diagnostics.")
-    parser.add_argument("--compare_assignment", action="store_true", help="For --stage uss/tse: also log official raw-SDR assignment vs paper SDRi-assignment CAPI-SDRi diagnostics.")
-    parser.add_argument("--validation_breakdown", action="store_true", help="For --stage uss/tse: also log CAPI-SDRi, zero-target FP, silence, leakage, and scene-bucket diagnostics.")
+    parser.add_argument(
+        "--sc_prediction_mode",
+        choices=["raw", "gated"],
+        default="gated",
+        help="For --stage sc: gated matches final S5 predict() energy/silence thresholds; raw reports plain-logit top-1 diagnostics.",
+    )
+    parser.add_argument(
+        "--compare_assignment",
+        action="store_true",
+        help="For --stage uss/tse: also log official raw-SDR assignment vs paper SDRi-assignment CAPI-SDRi diagnostics.",
+    )
+    parser.add_argument(
+        "--validation_breakdown",
+        action="store_true",
+        help="For --stage uss/tse: also log CAPI-SDRi, zero-target FP, silence, leakage, and scene-bucket diagnostics.",
+    )
     parser.add_argument(
         "--uss_oracle_labels",
         action="store_true",

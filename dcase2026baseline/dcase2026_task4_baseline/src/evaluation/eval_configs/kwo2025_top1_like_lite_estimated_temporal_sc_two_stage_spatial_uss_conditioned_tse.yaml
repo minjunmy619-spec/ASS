@@ -1,0 +1,136 @@
+dataset:
+    module: src.datamodules.dataset
+    main: DatasetS3
+    args:
+        config:
+            mode: waveform
+            soundscape_dir: data/dev_set/synthesized/test/soundscape
+            oracle_target_dir: data/dev_set/synthesized/test/oracle_target
+            sr: 32000
+        n_sources: 3
+        label_set: dcase2026t4
+        return_source: true
+        label_vector_mode: stack
+        silence_label_mode: onehot
+        return_meta: false
+model:
+    module: src.models.s5.kwo2025_temporal
+    main: Kwon2025TemporalS5
+    args:
+        label_set: dcase2026t4
+        uss_ckpt: checkpoint/modified_deft_uss_lite_6s_unified_all_features.ckpt
+        sc_ckpt: checkpoint/m2d_sc_stage3_estimated_pretrainedsed_fusion.ckpt
+        tse_ckpt: checkpoint/modified_deft_tse_lite_6s_two_stage_spatial_uss_sc.ckpt
+        activity_threshold: 0.5
+        temporal_conditioning_enabled: true
+        activity_gating_enabled: true
+        tse_uss_conditioning_enabled: true
+        tse_refinement_passes: 1
+        uss_config:
+            module: src.models.deft.unified_uss
+            main: UnifiedModifiedDeFTUSS
+            args:
+                input_channels: 4
+                output_channels: 1
+                hidden_channels: 96
+                n_deft_blocks: 6
+                n_heads: 4
+                n_foreground: 3
+                n_interference: 2
+                n_classes: 18
+                window_size: 1024
+                hop_size: 320
+                time_window_size: 128
+                freq_group_size: 64
+                shift_windows: true
+                sample_rate: 32000
+                inference_chunk_seconds: 10.0
+                inference_chunk_hop_seconds: 8.0
+                enable_foa_spatial_features: true
+                include_logmag: true
+                include_aiv: true
+                include_ipd: true
+                spatial_feature_eps: 0.00000001
+                enable_temporal_activity: true
+                enable_count_head: true
+                count_hidden_dim: 64
+                max_count: 3
+                enable_spatial_head: true
+                spatial_embedding_dim: 16
+                enable_residual_slots: true
+                n_residual: 1
+                enable_semantic_bridge: true
+                embedding_dim: 256
+                prototype_scale: 10.0
+                use_audio_embedding: true
+                use_doa_head: true
+                use_spatial_conditioning: true
+                predicted_spatial_prob: 0.25
+                spatial_mix_fallback_prob: 0.05
+                tse_condition_dim: 256
+        sc_config:
+            module: src.models.m2dat.m2d_sc
+            main: M2DPretrainedSEDFusionClassifier
+            args:
+                weight_file: checkpoint/m2d_as_vit_base-80x1001p16x16p32k-240413_AS-FT_enconly/weights_ep69it3124-0.47998.pth
+                num_classes: 18
+                embedding_dim: 512
+                m2d_embedding_dim: 512
+                pooling_hidden_dim: 512
+                projection_hidden_dim: 1024
+                dropout: 0.2
+                finetuning_layers: 2_blocks
+                energy_thresholds:
+                    default: -3.5
+                pretrainedsed_repo_root: external/PretrainedSED
+                pretrainedsed_checkpoint_dir: checkpoint/pretrainedsed
+                pretrainedsed_models: [BEATs, ATST-F, fpasst]
+                pretrainedsed_checkpoint_variant: strong_1
+                pretrainedsed_pooling: mean
+                pretrainedsed_seq_len: 250
+                pretrainedsed_embed_dim: 768
+                pretrainedsed_download_if_missing: true
+                freeze_pretrainedsed: true
+                fusion_strategy: weighted_avg
+                fusion_hidden_dim: 1024
+                input_sample_rate: 32000
+        tse_config:
+            module: src.models.deft.two_stage_tse
+            main: TwoStageRobustSpatialBridgeTSE
+            args:
+                mixture_channels: 4
+                enrollment_channels: 1
+                output_channels: 1
+                hidden_channels: 96
+                scene_blocks: 3
+                query_blocks: 3
+                n_heads: 4
+                label_dim: 18
+                window_size: 1024
+                hop_size: 320
+                time_window_size: 128
+                freq_group_size: 64
+                shift_windows: true
+                sample_rate: 32000
+                inference_chunk_seconds: 10.0
+                inference_chunk_hop_seconds: 8.0
+                enable_foa_spatial_features: true
+                include_logmag: true
+                include_aiv: true
+                include_ipd: true
+                spatial_feature_eps: 0.00000001
+                query_condition_dim: 256
+                query_condition_hidden_dim: 256
+                spatial_condition_dim: 3
+                spatial_condition_hidden_dim: 64
+                temporal_conditioning_enabled: true
+                auxiliary_gate_init: -3.0
+                use_confidence_gates: true
+                confidence_gate_hidden_dim: 32
+                condition_dropout: 0.0
+                temporal_condition_dropout: 0.0
+                spatial_condition_dropout: 0.0
+                condition_noise_std: 0.0
+                spatial_condition_noise_std: 0.0
+                enable_reference_fallback: true
+                spatial_output_gate_init: -3.0
