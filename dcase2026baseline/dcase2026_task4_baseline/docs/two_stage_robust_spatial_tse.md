@@ -273,6 +273,16 @@ self.out_conv = nn.Conv2d(mixture_channels, output_channels, kernel_size=1, bias
 
 Waveforms are stitched with overlap-add. Activity logits are now also stitched onto the full utterance frame timeline instead of concatenating overlapping chunk logits.
 
+### BF16-mixed training support
+
+`TwoStageRobustSpatialBridgeTSE` keeps numerically sensitive spectral operations in FP32 during autocast:
+
+- STFT / ISTFT
+- complex phase normalization for spatial masks
+- reference-fallback complex reconstruction
+
+This follows the same safety principle as the existing BF16-safe DeFT USS wrappers. The model is intended to work with Lightning `bf16-mixed` precision on CUDA-capable training hardware. A CPU BF16 forward smoke test is supported, but this checkout's CPU backend does not support BF16 backward, so full mixed-precision train-step validation must be done on the target GPU machine.
+
 ---
 
 ## 4. Training config

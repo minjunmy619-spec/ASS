@@ -16,7 +16,6 @@ from src.models.deft.modified_deft import (
     _stack_complex,
     _temporal_film_from_conditioning,
 )
-from torchlibrosa.stft import magphase
 
 torch: Any = _torch
 
@@ -36,6 +35,17 @@ def _zero_init_last_linear(module: nn.Module) -> None:
             nn.init.zeros_(child.weight)
             nn.init.zeros_(child.bias)
             return
+
+
+def _safe_magphase(real: Tensor, imag: Tensor, eps: float = 1e-8) -> tuple[Tensor, Tensor, Tensor]:
+    """Numerically stable magnitude/unit-phase calculation for bf16-mixed runs."""
+
+    real = real.float()
+    imag = imag.float()
+    mag = torch.sqrt(real.square() + imag.square() + eps)
+    cos = real / mag
+    sin = imag / mag
+    return mag, cos, sin
 
 
 class _PlainComplexEncoder(nn.Module):
@@ -218,6 +228,17 @@ class TwoStageRobustSpatialBridgeTSE(_BaseSpectralModel):
             self.spatial_output_gate_logit = None
 
         self.activity_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+
+    def waveform_to_complex(self, waveform: Tensor) -> tuple[Tensor, Tensor]:
+        device_type = waveform.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            real, imag = self.stft(waveform.float())
+        return real, imag
+
+    def complex_to_waveform(self, real: Tensor, imag: Tensor, length: int) -> Tensor:
+        device_type = real.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            return self.istft(real.float(), imag.float(), length)
 
     def _make_block(self, hidden_channels: int, n_heads: int, block_idx: int) -> MemoryEfficientDeFTBlock:
         use_shift = self.shift_windows and block_idx % 2 == 1
@@ -454,27 +475,30 @@ class TwoStageRobustSpatialBridgeTSE(_BaseSpectralModel):
         samples: int,
     ) -> Tensor:
         _, _, time_steps, freq_bins = x.shape
-        mask = self.spatial_mask_head(x).view(
-            batch_size,
-            n_queries,
-            self.mixture_channels,
-            self.spatial_mask_components,
-            time_steps,
-            freq_bins,
-        )
-        mask_mag = torch.sigmoid(mask[:, :, :, 0])
-        mask_real = torch.tanh(mask[:, :, :, 1])
-        mask_imag = torch.tanh(mask[:, :, :, 2])
-        _, mask_cos, mask_sin = magphase(mask_real, mask_imag)
+        mask = self.spatial_mask_head(x)
+        device_type = mask.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            mask = mask.float().view(
+                batch_size,
+                n_queries,
+                self.mixture_channels,
+                self.spatial_mask_components,
+                time_steps,
+                freq_bins,
+            )
+            mask_mag = torch.sigmoid(mask[:, :, :, 0])
+            mask_real = torch.tanh(mask[:, :, :, 1])
+            mask_imag = torch.tanh(mask[:, :, :, 2])
+            _, mask_cos, mask_sin = _safe_magphase(mask_real, mask_imag)
 
-        mixture_mag, mixture_cos, mixture_sin = magphase(mixture_real, mixture_imag)
-        out_mag = F.relu(mixture_mag[:, None] * mask_mag)
-        out_cos = mixture_cos[:, None] * mask_cos - mixture_sin[:, None] * mask_sin
-        out_sin = mixture_sin[:, None] * mask_cos + mixture_cos[:, None] * mask_sin
-        est_real = (out_mag * out_cos).reshape(batch_size * n_queries, self.mixture_channels, time_steps, freq_bins)
-        est_imag = (out_mag * out_sin).reshape(batch_size * n_queries, self.mixture_channels, time_steps, freq_bins)
-        est_real = self.out_conv(est_real)
-        est_imag = self.out_conv(est_imag)
+            mixture_mag, mixture_cos, mixture_sin = _safe_magphase(mixture_real, mixture_imag)
+            out_mag = F.relu(mixture_mag[:, None] * mask_mag)
+            out_cos = mixture_cos[:, None] * mask_cos - mixture_sin[:, None] * mask_sin
+            out_sin = mixture_sin[:, None] * mask_cos + mixture_cos[:, None] * mask_sin
+            est_real = (out_mag * out_cos).reshape(batch_size * n_queries, self.mixture_channels, time_steps, freq_bins)
+            est_imag = (out_mag * out_sin).reshape(batch_size * n_queries, self.mixture_channels, time_steps, freq_bins)
+            est_real = self.out_conv(est_real)
+            est_imag = self.out_conv(est_imag)
         waveform = self.complex_to_waveform(
             est_real.reshape(batch_size * n_queries * self.output_channels, 1, time_steps, freq_bins),
             est_imag.reshape(batch_size * n_queries * self.output_channels, 1, time_steps, freq_bins),
@@ -494,19 +518,22 @@ class TwoStageRobustSpatialBridgeTSE(_BaseSpectralModel):
         if self.reference_mask_head is None:
             raise RuntimeError("reference fallback is disabled")
         _, _, time_steps, freq_bins = x.shape
-        mask = torch.tanh(self.reference_mask_head(x))
-        mix_ref_real = (
-            mixture_real[:, None, 0]
-            .expand(-1, n_queries, -1, -1)
-            .reshape(batch_size * n_queries, 1, time_steps, freq_bins)
-        )
-        mix_ref_imag = (
-            mixture_imag[:, None, 0]
-            .expand(-1, n_queries, -1, -1)
-            .reshape(batch_size * n_queries, 1, time_steps, freq_bins)
-        )
-        est_real = mask[:, 0:1] * mix_ref_real - mask[:, 1:2] * mix_ref_imag
-        est_imag = mask[:, 0:1] * mix_ref_imag + mask[:, 1:2] * mix_ref_real
+        mask = self.reference_mask_head(x)
+        device_type = mask.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            mask = torch.tanh(mask.float())
+            mix_ref_real = (
+                mixture_real.float()[:, None, 0]
+                .expand(-1, n_queries, -1, -1)
+                .reshape(batch_size * n_queries, 1, time_steps, freq_bins)
+            )
+            mix_ref_imag = (
+                mixture_imag.float()[:, None, 0]
+                .expand(-1, n_queries, -1, -1)
+                .reshape(batch_size * n_queries, 1, time_steps, freq_bins)
+            )
+            est_real = mask[:, 0:1] * mix_ref_real - mask[:, 1:2] * mix_ref_imag
+            est_imag = mask[:, 0:1] * mix_ref_imag + mask[:, 1:2] * mix_ref_real
         waveform = self.complex_to_waveform(est_real, est_imag, samples)
         return waveform.view(batch_size, n_queries, 1, samples)
 
