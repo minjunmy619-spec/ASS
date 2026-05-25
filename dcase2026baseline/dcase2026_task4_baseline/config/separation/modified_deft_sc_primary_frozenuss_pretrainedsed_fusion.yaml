@@ -124,6 +124,30 @@ lightning_module:
     uncertain_weight: 0.35
     use_uncertain_matches: true
     bad_match_silence_weight: 0.05
+    # Treat unmatched energetic USS slots as weak silence/reject negatives.
+    # max_match_score protects duplicate/over-separated target-like slots from being
+    # forced to silence; only unmatched slots whose best active-reference score is
+    # <= this value become silence negatives. Set weight to 0.0 to disable.
+    unmatched_estimated_silence_weight: 0.10
+    unmatched_estimated_min_energy_db: -60.0
+    unmatched_estimated_max_match_score: -10.0
+    # --- Optional USS estimate cache export for offline SC fine-tuning/debugging ---
+    # When enabled, writes:
+    #   <export_uss_cache_dir>/<split>/soundscape/*.wav
+    #   <export_uss_cache_dir>/<split>/oracle_target/*.wav
+    #   <export_uss_cache_dir>/<split>/estimate_all/<soundscape>_<slot>.wav
+    #   <export_uss_cache_dir>/<split>/estimate_target/<soundscape>_<slot>_<label>.wav
+    #   <export_uss_cache_dir>/<split>/manifest.csv
+    # The estimate_target layout is directly usable by EstimatedSourceClassifierDataset;
+    # estimate_all keeps every USS foreground slot for diagnostics/custom datasets.
+    export_uss_cache: false
+    export_uss_cache_dir: workspace/sc_online_uss_cache_pretrainedsed_fusion
+    export_uss_cache_splits: [train, val]
+    export_uss_cache_overwrite: false
+    export_uss_cache_once_per_soundscape: true
+    export_uss_cache_save_soundscape: true
+    export_uss_cache_save_oracle: true
+    export_uss_cache_save_all_estimates: true
     # --- Waveform detach: not strictly needed since USS is frozen (outputs
     #     already detached), but set true for clarity ---
     detach_waveform_for_sc: true
@@ -191,6 +215,14 @@ lightning_module:
         finetuning_layers: 2_blocks
         eval_crop_seconds: 5.0
         eval_crop_hop_seconds: 2.5
+        # Bounded SC input loudness normalization for USS/TSE estimated sources.
+        # Very quiet rows are left unchanged to avoid amplifying silence/leakage.
+        input_rms_norm: true
+        input_target_rms_db: -28.0
+        input_min_rms_db: -55.0
+        input_max_gain_db: 15.0
+        input_min_gain_db: -12.0
+        input_peak_limit: 0.98
         energy_thresholds:
           default: -3.5
         pretrainedsed_repo_root: external/PretrainedSED

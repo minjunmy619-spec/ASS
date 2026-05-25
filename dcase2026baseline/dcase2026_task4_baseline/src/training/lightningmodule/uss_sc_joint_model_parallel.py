@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-import itertools
 from typing import Dict, Optional
 
-import lightning.pytorch as pl
+import csv
+import itertools
+import os
+
 import torch
 import torch.nn.functional as F
+
+import lightning.pytorch as pl
 
 from src.temporal import SILENCE_SPAN_SEC
 from src.tools.estimated_source_matching import (
@@ -16,12 +20,65 @@ from src.tools.estimated_source_matching import (
 )
 from src.utils import initialize_config
 
+_EXPORT_MANIFEST_FIELDS = [
+    "split",
+    "epoch",
+    "global_step",
+    "batch_idx",
+    "soundscape",
+    "estimate_slot",
+    "oracle_slot",
+    "label",
+    "saved_estimate",
+    "is_silence_target",
+    "sample_weight",
+    "quality_group",
+    "match_metric",
+    "match_score",
+    "second_best_score",
+    "match_margin",
+    "energy_db",
+    "all_estimate_path",
+    "estimate_path",
+    "oracle_path",
+]
+
+
+def _as_audio_array(waveform):
+    waveform = waveform.detach().float().cpu()
+    if waveform.dim() == 1:
+        return waveform.numpy()
+    if waveform.dim() == 2:
+        return waveform.transpose(0, 1).numpy()
+    raise ValueError(f"Expected audio tensor [T] or [C,T], got {tuple(waveform.shape)}")
+
+
+def _write_wav(path, waveform, sample_rate, overwrite=False):
+    if os.path.exists(path) and not overwrite:
+        return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    import soundfile as sf
+
+    sf.write(path, _as_audio_array(waveform), int(sample_rate))
+    return True
+
+
+def _quality_name(code):
+    return {0: "unmatched", 1: "clean", 2: "uncertain", 3: "bad", 4: "unmatched_silence"}.get(int(code), "unknown")
+
+
+def _safe_float(value):
+    if torch.is_tensor(value):
+        value = value.item()
+    value = float(value)
+    return "" if value != value else value
+
 
 def _strip_lightning_prefix(state_dict):
     out = {}
     for key, value in state_dict.items():
         if isinstance(key, str) and key.startswith("model."):
-            key = key[len("model."):]
+            key = key[len("model.") :]
         out[key] = value
     return out
 
@@ -56,6 +113,8 @@ def _best_assignment(scores, active_refs, n_est):
         if best_score is None or score > best_score:
             best_score = score
             best_perm = perm
+    if best_perm is None:
+        return {}
     return {int(est_idx): int(ref_idx) for ref_idx, est_idx in zip(refs, best_perm)}
 
 
@@ -109,12 +168,23 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         uncertain_weight: float = 0.35,
         use_uncertain_matches: bool = False,
         bad_match_silence_weight: float = 0.0,
+        unmatched_estimated_silence_weight: float = 0.0,
+        unmatched_estimated_min_energy_db: Optional[float] = None,
+        unmatched_estimated_max_match_score: Optional[float] = None,
         sc_update_every: int = 1,
         detach_waveform_for_sc: bool = False,
         clean_source_mix_prob: float = 0.0,
         clean_source_mix_weight: float = 1.0,
         clean_silence_mix_prob: float = 0.0,
         clean_silence_mix_weight: float = 1.0,
+        export_uss_cache: bool = False,
+        export_uss_cache_dir: Optional[str] = None,
+        export_uss_cache_splits: tuple[str, ...] = ("train", "val"),
+        export_uss_cache_overwrite: bool = False,
+        export_uss_cache_once_per_soundscape: bool = True,
+        export_uss_cache_save_soundscape: bool = True,
+        export_uss_cache_save_oracle: bool = True,
+        export_uss_cache_save_all_estimates: bool = True,
         is_validation: bool = True,
     ):
         super().__init__()
@@ -150,20 +220,39 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         self.uncertain_weight = float(uncertain_weight)
         self.use_uncertain_matches = bool(use_uncertain_matches)
         self.bad_match_silence_weight = max(0.0, float(bad_match_silence_weight))
+        self.unmatched_estimated_silence_weight = max(0.0, float(unmatched_estimated_silence_weight))
+        self.unmatched_estimated_min_energy_db = (
+            self.min_energy_db
+            if unmatched_estimated_min_energy_db is None
+            else float(unmatched_estimated_min_energy_db)
+        )
+        self.unmatched_estimated_max_match_score = (
+            None if unmatched_estimated_max_match_score is None else float(unmatched_estimated_max_match_score)
+        )
         self.sc_update_every = max(1, int(sc_update_every))
         self.detach_waveform_for_sc = bool(detach_waveform_for_sc)
         self.clean_source_mix_prob = min(1.0, max(0.0, float(clean_source_mix_prob)))
         self.clean_source_mix_weight = max(0.0, float(clean_source_mix_weight))
         self.clean_silence_mix_prob = min(1.0, max(0.0, float(clean_silence_mix_prob)))
         self.clean_silence_mix_weight = max(0.0, float(clean_silence_mix_weight))
+        self.export_uss_cache = bool(export_uss_cache)
+        self.export_uss_cache_dir = export_uss_cache_dir
+        self.export_uss_cache_splits = set(export_uss_cache_splits or ())
+        self.export_uss_cache_overwrite = bool(export_uss_cache_overwrite)
+        self.export_uss_cache_once_per_soundscape = bool(export_uss_cache_once_per_soundscape)
+        self.export_uss_cache_save_soundscape = bool(export_uss_cache_save_soundscape)
+        self.export_uss_cache_save_oracle = bool(export_uss_cache_save_oracle)
+        self.export_uss_cache_save_all_estimates = bool(export_uss_cache_save_all_estimates)
+        self._exported_soundscapes: set[tuple[str, str]] = set()
+        self._export_manifest_initialized: set[str] = set()
         self.is_validation = bool(is_validation)
+
+        if self.export_uss_cache and not self.export_uss_cache_dir:
+            raise ValueError("export_uss_cache=True requires export_uss_cache_dir to be set.")
 
         # Sanity check: cannot freeze both models
         if self.freeze_uss and self.freeze_sc:
-            raise ValueError(
-                "Both freeze_uss and freeze_sc are True. At least one model "
-                "must be trainable."
-            )
+            raise ValueError("Both freeze_uss and freeze_sc are True. At least one model must be trainable.")
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
         # Device placement is manual because USS and SC live on different GPUs.
@@ -176,8 +265,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
             raise RuntimeError("CUDA is required for uss_device")
         if self.sc_device.type == "cuda" and torch.cuda.device_count() <= self.sc_device.index:
             raise RuntimeError(
-                f"Requested sc_device={self.sc_device}, but only "
-                f"{torch.cuda.device_count()} CUDA devices are visible"
+                f"Requested sc_device={self.sc_device}, but only {torch.cuda.device_count()} CUDA devices are visible"
             )
         self.uss_model.to(self.uss_device)
         self.sc_model.to(self.sc_device)
@@ -242,7 +330,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         target["current_epoch"] = self.current_epoch
         return target
 
-    def _build_slot_targets(self, sep, batch, return_ref_index: bool = False):
+    def _build_slot_targets(self, sep, batch, return_ref_index: bool = False, return_match_info: bool = False):
         """Assign oracle class/span labels to predicted USS foreground slots."""
         ref = self._to_uss(batch["foreground_waveform"])
         class_index_ref = self._to_uss(batch["class_index"])
@@ -255,20 +343,45 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         sample_weight = torch.zeros(bsz, n_est, dtype=sep.dtype, device=self.uss_device)
         quality_code = torch.zeros(bsz, n_est, dtype=torch.long, device=self.uss_device)
         ref_index = torch.full((bsz, n_est), -1, dtype=torch.long, device=self.uss_device)
+        use_unmatched_silence = self.unmatched_estimated_silence_weight > 0.0
+        match_score = second_best_score = match_margin = energy_db = None
+        if return_match_info:
+            nan = float("nan")
+            match_score = torch.full((bsz, n_est), nan, dtype=sep.dtype, device=self.uss_device)
+            second_best_score = torch.full((bsz, n_est), nan, dtype=sep.dtype, device=self.uss_device)
+            match_margin = torch.full((bsz, n_est), nan, dtype=sep.dtype, device=self.uss_device)
+        if return_match_info or use_unmatched_silence:
+            energy_db = torch.zeros(bsz, n_est, dtype=sep.dtype, device=self.uss_device)
         span_sec = None
         if span_ref is not None:
-            span_sec = torch.tensor(SILENCE_SPAN_SEC, dtype=sep.dtype, device=self.uss_device).view(1, 1, 2).expand(bsz, n_est, 2).clone()
+            span_sec = (
+                torch.tensor(SILENCE_SPAN_SEC, dtype=sep.dtype, device=self.uss_device)
+                .view(1, 1, 2)
+                .expand(bsz, n_est, 2)
+                .clone()
+            )
 
         with torch.no_grad():
             scores = pairwise_match_score(sep.detach(), ref.detach(), metric=self.match_metric).to(self.uss_device)
             for b in range(bsz):
+                if (return_match_info or use_unmatched_silence) and energy_db is not None:
+                    for est_idx in range(n_est):
+                        energy_db[b, est_idx] = source_energy_db(sep[b, est_idx].detach().cpu())
                 active_refs = _active_indices(is_silence_ref[b])
                 est_to_ref = _best_assignment(scores[b], active_refs, n_est)
+                matched_est = set(est_to_ref.keys())
                 for est_idx, ref_idx in est_to_ref.items():
                     ref_index[b, est_idx] = int(ref_idx)
                     score = float(scores[b, ref_idx, est_idx].item())
-                    _, margin = second_best_and_margin(scores[b], ref_idx, est_idx)
-                    energy = source_energy_db(sep[b, est_idx].detach().cpu())
+                    second, margin = second_best_and_margin(scores[b], ref_idx, est_idx)
+                    if return_match_info and energy_db is not None:
+                        energy = float(energy_db[b, est_idx].item())
+                    else:
+                        energy = source_energy_db(sep[b, est_idx].detach().cpu())
+                    if return_match_info:
+                        match_score[b, est_idx] = score
+                        second_best_score[b, est_idx] = second
+                        match_margin[b, est_idx] = margin
                     quality, weight, valid = quality_and_weight(
                         score=score,
                         margin=margin,
@@ -293,11 +406,41 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
                     class_idx[b, est_idx] = class_index_ref[b, ref_idx]
                     is_silence[b, est_idx] = False
                     sample_weight[b, est_idx] = float(weight)
-                    if span_sec is not None:
+                    if span_ref is not None and span_sec is not None:
                         span_sec[b, est_idx] = span_ref[b, ref_idx]
+                if use_unmatched_silence:
+                    for est_idx in range(n_est):
+                        if est_idx in matched_est:
+                            continue
+                        energy = (
+                            float(energy_db[b, est_idx].item())
+                            if energy_db is not None
+                            else source_energy_db(sep[b, est_idx].detach().cpu())
+                        )
+                        if energy < self.unmatched_estimated_min_energy_db:
+                            continue
+                        if active_refs and self.unmatched_estimated_max_match_score is not None:
+                            active_ref_tensor = torch.tensor(active_refs, dtype=torch.long, device=self.uss_device)
+                            best_active_score = float(scores[b, active_ref_tensor, est_idx].max().item())
+                            if best_active_score > self.unmatched_estimated_max_match_score:
+                                continue
+                        sample_weight[b, est_idx] = max(
+                            float(sample_weight[b, est_idx].item()),
+                            self.unmatched_estimated_silence_weight,
+                        )
+                        quality_code[b, est_idx] = 4
+        outputs = [class_idx, is_silence, sample_weight, span_sec, quality_code]
         if return_ref_index:
-            return class_idx, is_silence, sample_weight, span_sec, quality_code, ref_index
-        return class_idx, is_silence, sample_weight, span_sec, quality_code
+            outputs.append(ref_index)
+        if return_match_info:
+            match_info = {
+                "match_score": match_score,
+                "second_best_score": second_best_score,
+                "match_margin": match_margin,
+                "energy_db": energy_db,
+            }
+            outputs.append(match_info)
+        return tuple(outputs)
 
     def _maybe_mix_clean_sources(
         self,
@@ -402,7 +545,9 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
             candidate_est = candidate_est[gate]
             if candidate_est.numel() == 0:
                 continue
-            ref_for_est = silence_refs[torch.arange(candidate_est.numel(), device=self.uss_device) % silence_refs.numel()]
+            ref_for_est = silence_refs[
+                torch.arange(candidate_est.numel(), device=self.uss_device) % silence_refs.numel()
+            ]
             selected_batch.append(torch.full_like(candidate_est, b))
             selected_est.append(candidate_est)
             selected_ref.append(ref_for_est)
@@ -435,18 +580,189 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
 
         return sep, class_idx, is_silence, sample_weight, span_sec, clean_silence_mask
 
-    def _sc_forward_and_loss(self, uss_out, batch, is_training: bool):
+    def _soundscape_ids(self, batch, split: str, batch_idx: int | None, batch_size: int):
+        if "soundscape" in batch:
+            return [str(x) for x in batch["soundscape"]]
+        step = int(self.global_step)
+        batch_idx = 0 if batch_idx is None else int(batch_idx)
+        return [
+            f"{split}_epoch{int(self.current_epoch):04d}_batch{batch_idx:06d}_item{i:03d}_step{step:08d}"
+            for i in range(batch_size)
+        ]
+
+    def _append_export_manifest(self, manifest_path, rows):
+        if not rows:
+            return
+        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+        first_write = manifest_path not in self._export_manifest_initialized
+        write_header = first_write and (self.export_uss_cache_overwrite or not os.path.exists(manifest_path))
+        mode = "w" if first_write and self.export_uss_cache_overwrite else "a"
+        with open(manifest_path, mode, newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_EXPORT_MANIFEST_FIELDS)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+        self._export_manifest_initialized.add(manifest_path)
+
+    def _export_uss_cache(
+        self,
+        uss_out,
+        batch,
+        split: str,
+        batch_idx: int | None,
+        class_idx,
+        is_silence,
+        sample_weight,
+        quality_code,
+        ref_index,
+        match_info,
+    ):
+        if not self.export_uss_cache or split not in self.export_uss_cache_splits:
+            return
+        trainer = getattr(self, "_trainer", None)
+        if trainer is not None and not trainer.is_global_zero:
+            return
+
+        sep = uss_out["foreground_waveform"].detach().cpu()
+        mixture = batch.get("mixture")
+        ref = batch.get("foreground_waveform")
+        labels = batch.get("label")
+        batch_size, n_slots = sep.shape[:2]
+        sample_rate = int(getattr(self.uss_model, "sample_rate", 32000))
+        split_dir = os.path.join(str(self.export_uss_cache_dir), split)
+        soundscape_dir = os.path.join(split_dir, "soundscape")
+        oracle_dir = os.path.join(split_dir, "oracle_target")
+        estimate_dir = os.path.join(split_dir, "estimate_target")
+        estimate_all_dir = os.path.join(split_dir, "estimate_all")
+        manifest_path = os.path.join(split_dir, "manifest.csv")
+        soundscapes = self._soundscape_ids(batch, split, batch_idx, batch_size)
+
+        class_idx_cpu = class_idx.detach().cpu()
+        is_silence_cpu = is_silence.detach().cpu().bool()
+        sample_weight_cpu = sample_weight.detach().cpu()
+        quality_cpu = quality_code.detach().cpu()
+        ref_index_cpu = ref_index.detach().cpu()
+        match_cpu = {key: value.detach().cpu() for key, value in match_info.items()}
+
+        rows = []
+        for b, soundscape in enumerate(soundscapes):
+            export_key = (split, soundscape)
+            if self.export_uss_cache_once_per_soundscape and export_key in self._exported_soundscapes:
+                continue
+            self._exported_soundscapes.add(export_key)
+
+            if self.export_uss_cache_save_soundscape and mixture is not None:
+                _write_wav(
+                    os.path.join(soundscape_dir, f"{soundscape}.wav"),
+                    mixture[b].detach().cpu(),
+                    sample_rate,
+                    overwrite=self.export_uss_cache_overwrite,
+                )
+
+            oracle_paths = {}
+            if self.export_uss_cache_save_oracle and ref is not None and labels is not None:
+                for ref_slot, label in enumerate(labels[b]):
+                    if label == "silence":
+                        continue
+                    oracle_path = os.path.join(oracle_dir, f"{soundscape}_{ref_slot}_{label}.wav")
+                    _write_wav(
+                        oracle_path,
+                        ref[b, ref_slot, 0].detach().cpu(),
+                        sample_rate,
+                        overwrite=self.export_uss_cache_overwrite,
+                    )
+                    oracle_paths[int(ref_slot)] = oracle_path
+
+            for est_slot in range(n_slots):
+                ref_slot = int(ref_index_cpu[b, est_slot].item())
+                target_is_silence = bool(is_silence_cpu[b, est_slot].item())
+                target_weight = float(sample_weight_cpu[b, est_slot].item())
+                label = "silence"
+                if not target_is_silence and labels is not None and ref_slot >= 0:
+                    label = str(labels[b][ref_slot])
+                elif not target_is_silence:
+                    label = str(int(class_idx_cpu[b, est_slot].item()))
+
+                all_estimate_path = ""
+                if self.export_uss_cache_save_all_estimates:
+                    all_estimate_path = os.path.join(estimate_all_dir, f"{soundscape}_{est_slot}.wav")
+                    _write_wav(
+                        all_estimate_path,
+                        sep[b, est_slot, 0],
+                        sample_rate,
+                        overwrite=self.export_uss_cache_overwrite,
+                    )
+
+                estimate_path = ""
+                saved_estimate = False
+                if (not target_is_silence) and target_weight > 0.0 and label != "silence":
+                    estimate_path = os.path.join(estimate_dir, f"{soundscape}_{est_slot}_{label}.wav")
+                    saved_estimate = _write_wav(
+                        estimate_path,
+                        sep[b, est_slot, 0],
+                        sample_rate,
+                        overwrite=self.export_uss_cache_overwrite,
+                    ) or os.path.exists(estimate_path)
+
+                rows.append(
+                    {
+                        "split": split,
+                        "epoch": int(self.current_epoch),
+                        "global_step": int(self.global_step),
+                        "batch_idx": "" if batch_idx is None else int(batch_idx),
+                        "soundscape": soundscape,
+                        "estimate_slot": est_slot,
+                        "oracle_slot": ref_slot,
+                        "label": label,
+                        "saved_estimate": bool(saved_estimate),
+                        "is_silence_target": target_is_silence,
+                        "sample_weight": target_weight,
+                        "quality_group": _quality_name(int(quality_cpu[b, est_slot].item())),
+                        "match_metric": self.match_metric,
+                        "match_score": _safe_float(match_cpu["match_score"][b, est_slot]),
+                        "second_best_score": _safe_float(match_cpu["second_best_score"][b, est_slot]),
+                        "match_margin": _safe_float(match_cpu["match_margin"][b, est_slot]),
+                        "energy_db": _safe_float(match_cpu["energy_db"][b, est_slot]),
+                        "all_estimate_path": all_estimate_path,
+                        "estimate_path": estimate_path,
+                        "oracle_path": oracle_paths.get(ref_slot, ""),
+                    }
+                )
+
+        self._append_export_manifest(manifest_path, rows)
+
+    def _sc_forward_and_loss(
+        self, uss_out, batch, is_training: bool, split: str = "train", batch_idx: int | None = None
+    ):
         sep = uss_out["foreground_waveform"]
         # When USS is frozen, waveforms are already detached (produced under
         # no_grad). When USS is trainable but we don't want SC gradients to
         # flow back into USS, detach explicitly.
         if self.detach_waveform_for_sc:
             sep = sep.detach()
-        class_idx, is_silence, sample_weight, span_sec, quality_code, ref_index = self._build_slot_targets(
+        should_export = self.export_uss_cache and split in self.export_uss_cache_splits
+        slot_targets = self._build_slot_targets(
             sep,
             batch,
             return_ref_index=True,
+            return_match_info=should_export,
         )
+        if should_export:
+            class_idx, is_silence, sample_weight, span_sec, quality_code, ref_index, match_info = slot_targets
+            self._export_uss_cache(
+                uss_out,
+                batch,
+                split,
+                batch_idx,
+                class_idx,
+                is_silence,
+                sample_weight,
+                quality_code,
+                ref_index,
+                match_info,
+            )
+        else:
+            class_idx, is_silence, sample_weight, span_sec, quality_code, ref_index = slot_targets
         sep, class_idx, is_silence, sample_weight, span_sec, clean_source_mask = self._maybe_mix_clean_sources(
             sep,
             batch,
@@ -505,6 +821,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         out["sc_clean_match_count"] = (quality_flat == 1).to(dtype=logits.dtype).sum()
         out["sc_uncertain_match_count"] = (quality_flat == 2).to(dtype=logits.dtype).sum()
         out["sc_bad_match_count"] = (quality_flat == 3).to(dtype=logits.dtype).sum()
+        out["sc_unmatched_silence_count"] = (quality_flat == 4).to(dtype=logits.dtype).sum()
         out["sc_used_match_count"] = weight_flat.gt(0).to(dtype=logits.dtype).sum()
         clean_source_flat = clean_source_mask.reshape(bsz * n_slots).to(self.sc_device)
         out["sc_clean_source_mix_count"] = clean_source_flat.to(dtype=logits.dtype).sum()
@@ -576,10 +893,7 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
             with torch.no_grad():
                 uss_out = self.uss_model(self._uss_input(batch))
             # Detach all tensor outputs so no graph is attached
-            uss_out = {
-                k: v.detach() if torch.is_tensor(v) else v
-                for k, v in uss_out.items()
-            }
+            uss_out = {k: v.detach() if torch.is_tensor(v) else v for k, v in uss_out.items()}
         else:
             uss_out = self.uss_model(self._uss_input(batch))
 
@@ -591,17 +905,16 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
             uss_loss_dict = self.uss_loss_func(uss_out, self._uss_target(batch))
 
         # --- SC forward + loss ---
-        sc_loss_dict = self._sc_forward_and_loss(uss_out, batch, is_training=True)
+        sc_loss_dict = self._sc_forward_and_loss(uss_out, batch, is_training=True, split="train", batch_idx=batch_idx)
 
         # --- Compute total loss ---
         # When USS is frozen, uss_loss has no grad — use lambda_uss=0 or just
         # skip it. We still log it for monitoring.
         if self.freeze_uss:
             # SC loss is the primary training signal
-            loss = (
-                self.lambda_sc * sc_loss_dict["loss_sc"].to(self.sc_device)
-                + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.sc_device)
-            )
+            loss = self.lambda_sc * sc_loss_dict["loss_sc"].to(self.sc_device) + self.lambda_consistency * sc_loss_dict[
+                "loss_consistency"
+            ].to(self.sc_device)
             loss_for_log = loss.detach().to(self.uss_device)
         else:
             # Original: USS loss is primary, SC is auxiliary
@@ -623,21 +936,34 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
         # --- Logging ---
         batchsize = batch["mixture"].shape[0]
         log_dict = {"step_train/loss": loss_for_log}
-        log_dict.update({
-            f"step_train/uss_{k}": v.detach().to(self.uss_device)
-            for k, v in uss_loss_dict.items() if torch.is_tensor(v)
-        })
-        log_dict.update({
-            f"step_train/{k}": v.detach().to(self.uss_device)
-            for k, v in sc_loss_dict.items() if torch.is_tensor(v)
-        })
+        log_dict.update(
+            {
+                f"step_train/uss_{k}": v.detach().to(self.uss_device)
+                for k, v in uss_loss_dict.items()
+                if torch.is_tensor(v)
+            }
+        )
+        log_dict.update(
+            {f"step_train/{k}": v.detach().to(self.uss_device) for k, v in sc_loss_dict.items() if torch.is_tensor(v)}
+        )
         self.log_dict(
-            log_dict, prog_bar=False, logger=True,
-            on_step=True, on_epoch=False, batch_size=batchsize, sync_dist=False,
+            log_dict,
+            prog_bar=False,
+            logger=True,
+            on_step=True,
+            on_epoch=False,
+            batch_size=batchsize,
+            sync_dist=False,
         )
         self.log(
-            "epoch_train/loss", loss_for_log, prog_bar=True, logger=True,
-            on_step=False, on_epoch=True, batch_size=batchsize, sync_dist=False,
+            "epoch_train/loss",
+            loss_for_log,
+            prog_bar=True,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            batch_size=batchsize,
+            sync_dist=False,
         )
         return loss_for_log
 
@@ -648,12 +974,13 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
             uss_out = self.uss_model(self._uss_input(batch))
             uss_loss_dict = self.uss_loss_func(uss_out, self._uss_target(batch))
         with torch.no_grad():
-            sc_loss_dict = self._sc_forward_and_loss(uss_out, batch, is_training=False)
+            sc_loss_dict = self._sc_forward_and_loss(
+                uss_out, batch, is_training=False, split="val", batch_idx=batch_idx
+            )
             if self.freeze_uss:
-                loss = (
-                    self.lambda_sc * sc_loss_dict["loss_sc"].to(self.uss_device)
-                    + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.uss_device)
-                )
+                loss = self.lambda_sc * sc_loss_dict["loss_sc"].to(
+                    self.uss_device
+                ) + self.lambda_consistency * sc_loss_dict["loss_consistency"].to(self.uss_device)
             else:
                 loss = (
                     self.lambda_uss * uss_loss_dict["loss"]
@@ -662,21 +989,34 @@ class USSCSJointModelParallelLightning(pl.LightningModule):
                 )
         batchsize = batch["mixture"].shape[0]
         log_dict = {"step_val/loss": loss.detach().to(self.uss_device)}
-        log_dict.update({
-            f"step_val/uss_{k}": v.detach().to(self.uss_device)
-            for k, v in uss_loss_dict.items() if torch.is_tensor(v)
-        })
-        log_dict.update({
-            f"step_val/{k}": v.detach().to(self.uss_device)
-            for k, v in sc_loss_dict.items() if torch.is_tensor(v)
-        })
+        log_dict.update(
+            {
+                f"step_val/uss_{k}": v.detach().to(self.uss_device)
+                for k, v in uss_loss_dict.items()
+                if torch.is_tensor(v)
+            }
+        )
+        log_dict.update(
+            {f"step_val/{k}": v.detach().to(self.uss_device) for k, v in sc_loss_dict.items() if torch.is_tensor(v)}
+        )
         self.log_dict(
-            log_dict, prog_bar=False, logger=True,
-            on_step=True, on_epoch=False, batch_size=batchsize, sync_dist=False,
+            log_dict,
+            prog_bar=False,
+            logger=True,
+            on_step=True,
+            on_epoch=False,
+            batch_size=batchsize,
+            sync_dist=False,
         )
         self.log(
-            "epoch_val/loss", loss.detach(), prog_bar=True, logger=True,
-            on_step=False, on_epoch=True, batch_size=batchsize, sync_dist=False,
+            "epoch_val/loss",
+            loss.detach(),
+            prog_bar=True,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            batch_size=batchsize,
+            sync_dist=False,
         )
         return loss.detach()
 

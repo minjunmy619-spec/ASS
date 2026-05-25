@@ -73,6 +73,38 @@ def _resample_waveform(waveform, input_sample_rate, target_sample_rate):
         ).squeeze(1)
 
 
+def _bounded_rms_normalize(
+    waveform,
+    target_rms_db=-28.0,
+    min_rms_db=-55.0,
+    max_gain_db=15.0,
+    min_gain_db=-12.0,
+    peak_limit=0.98,
+    eps=1e-8,
+):
+    """Normalize waveform RMS with silence protection and bounded gain.
+
+    waveform is expected to be [B,T]. Rows quieter than
+    min_rms_db are left unchanged to avoid amplifying residual silence or
+    separator leakage into foreground-like audio.
+    """
+    if waveform.numel() == 0:
+        return waveform
+    rms = waveform.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(float(eps))
+    rms_db = 20.0 * torch.log10(rms)
+    target = waveform.new_tensor(float(target_rms_db))
+    gain_db = target - rms_db
+    gain_db = torch.where(rms_db < float(min_rms_db), torch.zeros_like(gain_db), gain_db)
+    gain_db = gain_db.clamp(float(min_gain_db), float(max_gain_db))
+    gain = torch.pow(waveform.new_tensor(10.0), gain_db / 20.0)
+
+    if peak_limit is not None and float(peak_limit) > 0.0:
+        peak = waveform.detach().abs().amax(dim=-1, keepdim=True).clamp_min(float(eps))
+        peak_gain = waveform.new_tensor(float(peak_limit)) / peak
+        gain = torch.minimum(gain, peak_gain)
+    return waveform * gain
+
+
 _PRETRAINEDSED_RELEASE_URL = "https://github.com/fschmid56/PretrainedSED/releases/download/v0.0.1"
 _PRETRAINEDSED_ASSETS = {
     "BEATs_strong_1": f"{_PRETRAINEDSED_RELEASE_URL}/BEATs_strong_1.pt",
@@ -841,6 +873,12 @@ class M2DSingleClassifierStrong(PortableM2D):
         ref_channel=None,
         eval_crop_seconds=None,
         eval_crop_hop_seconds=None,
+        input_rms_norm=False,
+        input_target_rms_db=-28.0,
+        input_min_rms_db=-55.0,
+        input_max_gain_db=15.0,
+        input_min_gain_db=-12.0,
+        input_peak_limit=0.98,
     ):
         super().__init__(weight_file, num_classes=None, freeze_embed=False, flat_features=None)
         self.num_classes = num_classes
@@ -848,6 +886,12 @@ class M2DSingleClassifierStrong(PortableM2D):
         self.energy_thresholds = energy_thresholds or {}
         self.eval_crop_seconds = eval_crop_seconds
         self.eval_crop_hop_seconds = eval_crop_hop_seconds
+        self.input_rms_norm = bool(input_rms_norm)
+        self.input_target_rms_db = float(input_target_rms_db)
+        self.input_min_rms_db = float(input_min_rms_db)
+        self.input_max_gain_db = float(input_max_gain_db)
+        self.input_min_gain_db = float(input_min_gain_db)
+        self.input_peak_limit = None if input_peak_limit is None else float(input_peak_limit)
 
         self.pool = AttentiveStatsPool(
             self.cfg.feature_d,
@@ -907,7 +951,17 @@ class M2DSingleClassifierStrong(PortableM2D):
             else:
                 assert self.ref_channel is not None
                 waveform = waveform[:, self.ref_channel]
-        return waveform.float()
+        waveform = waveform.float()
+        if self.input_rms_norm:
+            waveform = _bounded_rms_normalize(
+                waveform,
+                target_rms_db=self.input_target_rms_db,
+                min_rms_db=self.input_min_rms_db,
+                max_gain_db=self.input_max_gain_db,
+                min_gain_db=self.input_min_gain_db,
+                peak_limit=-1.0 if self.input_peak_limit is None else self.input_peak_limit,
+            )
+        return waveform
 
     def _embed_waveform(self, waveform):
         features = self.encode(waveform, average_per_time_frame=False)
@@ -1013,6 +1067,12 @@ class M2DSingleClassifierTemporalStrong(M2DSingleClassifierStrong):
         ref_channel=None,
         eval_crop_seconds=None,
         eval_crop_hop_seconds=None,
+        input_rms_norm=False,
+        input_target_rms_db=-28.0,
+        input_min_rms_db=-55.0,
+        input_max_gain_db=15.0,
+        input_min_gain_db=-12.0,
+        input_peak_limit=0.98,
         activity_hidden_dim=256,
         activity_temperature=1.0,
     ):
@@ -1028,6 +1088,12 @@ class M2DSingleClassifierTemporalStrong(M2DSingleClassifierStrong):
             ref_channel=ref_channel,
             eval_crop_seconds=eval_crop_seconds,
             eval_crop_hop_seconds=eval_crop_hop_seconds,
+            input_rms_norm=input_rms_norm,
+            input_target_rms_db=input_target_rms_db,
+            input_min_rms_db=input_min_rms_db,
+            input_max_gain_db=input_max_gain_db,
+            input_min_gain_db=input_min_gain_db,
+            input_peak_limit=input_peak_limit,
         )
         self.activity_head = nn.Sequential(
             nn.LayerNorm(self.cfg.feature_d),
@@ -1183,6 +1249,12 @@ class M2DPretrainedFusionClassifier(M2DSingleClassifierStrong):
         ref_channel=None,
         eval_crop_seconds=None,
         eval_crop_hop_seconds=None,
+        input_rms_norm=False,
+        input_target_rms_db=-28.0,
+        input_min_rms_db=-55.0,
+        input_max_gain_db=15.0,
+        input_min_gain_db=-12.0,
+        input_peak_limit=0.98,
         aux_model="beats",
         aux_weight=None,
         aux_backend="auto",
@@ -1218,6 +1290,12 @@ class M2DPretrainedFusionClassifier(M2DSingleClassifierStrong):
             ref_channel=ref_channel,
             eval_crop_seconds=eval_crop_seconds,
             eval_crop_hop_seconds=eval_crop_hop_seconds,
+            input_rms_norm=input_rms_norm,
+            input_target_rms_db=input_target_rms_db,
+            input_min_rms_db=input_min_rms_db,
+            input_max_gain_db=input_max_gain_db,
+            input_min_gain_db=input_min_gain_db,
+            input_peak_limit=input_peak_limit,
         )
         self.aux_encoder = FrozenPretrainedAudioEncoder(
             aux_model=aux_model,
@@ -1278,6 +1356,12 @@ class M2DPretrainedSEDFusionClassifier(M2DSingleClassifierStrong):
         ref_channel=None,
         eval_crop_seconds=None,
         eval_crop_hop_seconds=None,
+        input_rms_norm=False,
+        input_target_rms_db=-28.0,
+        input_min_rms_db=-55.0,
+        input_max_gain_db=15.0,
+        input_min_gain_db=-12.0,
+        input_peak_limit=0.98,
         pretrainedsed_repo_root=None,
         pretrainedsed_checkpoint_dir="checkpoint/pretrainedsed",
         pretrainedsed_models=("BEATs", "ATST-F", "fpasst"),
@@ -1304,6 +1388,12 @@ class M2DPretrainedSEDFusionClassifier(M2DSingleClassifierStrong):
             ref_channel=ref_channel,
             eval_crop_seconds=eval_crop_seconds,
             eval_crop_hop_seconds=eval_crop_hop_seconds,
+            input_rms_norm=input_rms_norm,
+            input_target_rms_db=input_target_rms_db,
+            input_min_rms_db=input_min_rms_db,
+            input_max_gain_db=input_max_gain_db,
+            input_min_gain_db=input_min_gain_db,
+            input_peak_limit=input_peak_limit,
         )
 
         if pretrainedsed_repo_root is None:
