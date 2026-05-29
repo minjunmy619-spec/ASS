@@ -1,0 +1,42 @@
+_base_: ../edge-fusion-npu.large-fp256.v2-hybrid-5m.rt192k/config.yaml
+
+# Proposal E: strict EdgeFusion-SFC distilled fallback.
+# Set teacher_checkpoint_path to a trained SFC-Locoformer or BandSFC RT+ model.
+teacher_checkpoint_path: null
+
+task:
+  _target_: spectral_feature_compression.core.tasks.distillation_task.TeacherStudentDistillationTask
+  fs: ${sr}
+  require_teacher_checkpoint: true
+  teacher_checkpoint_path: ${teacher_checkpoint_path}
+  teacher_loss_weight: 0.3
+  mixture_consistency_weight: 0.1
+  low_frequency_weight: 0.2
+  low_frequency_hz: 300.0
+  silent_source_weight: 0.05
+  silent_source_db: -60.0
+  complex_ri_weight: 0.5
+  log_magnitude_weight: 0.2
+  multi_resolution_stft_weight: 0.3
+  multi_resolution_stft_resolutions:
+    - [512, 128]
+    - [1024, 256]
+    - [2048, 512]
+  transient_weight: 0.05
+  teacher_model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_sfc_locoformer_lite_plus_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    n_bands: 64
+    d_inner: 64
+    d_model: 96
+    n_layers: 4
+    n_heads: 4
+    attention_dim: 96
+    scaling: true
+    css_segment_size: 12
+    css_shift_size: 6
+    css_batch_size: 1

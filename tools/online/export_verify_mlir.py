@@ -2,34 +2,32 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from argparse import ArgumentParser
 from collections import Counter
 from datetime import datetime
 import json
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
-from typing import Any
 
 import onnx
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.online.audit_onnx_model import get_allowed_ops
-from tools.online.measure_npu_model_stats import (
+from tools.online.audit_onnx_model import audit_npu_risks, get_allowed_ops  # noqa: E402
+from tools.online.measure_npu_model_stats import (  # noqa: E402
     BUILDERS,
     count_mlir_ops,
     export_to_onnx,
     onnx_stats,
     resolve_onnx_mlir,
     sanitize_filename,
-)
-
+)  # noqa: E402
 
 MLIR_FAIL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bonnx\.If\b"), "onnx.If (dynamic branch)"),
@@ -112,7 +110,8 @@ def run_compile_shared_lib(onnx_path: Path, stub: Path, tool: Path, timeout: int
     print(f"[mlir] compile shared library -> {stub}.so")
     proc = run_command([str(tool), str(onnx_path), "-o", str(stub)], timeout)
     if proc.returncode != 0:
-        raise RuntimeError(f"onnx-mlir shared-library compile failed:\n{((proc.stderr or '') + (proc.stdout or ''))[-3000:]}")
+        tail = ((proc.stderr or "") + (proc.stdout or ""))[-3000:]
+        raise RuntimeError(f"onnx-mlir shared-library compile failed:\n{tail}")
 
     blob = (proc.stdout or "") + "\n" + (proc.stderr or "")
     generated: Path | None = None
@@ -213,6 +212,16 @@ def audit_onnx(onnx_path: Path, args: Any) -> dict[str, Any]:
             "control_flow_ops": control_flow_ops,
         }
     )
+    if args.risk_profile != "none":
+        risk_payload = audit_npu_risks(model, transpose_threshold=args.transpose_threshold)
+        stats["npu_risk_profile"] = risk_payload
+        print(f"[onnx] risk profile: {risk_payload['risk_profile']}")
+        for key, value in risk_payload["risk_counts"].items():
+            if value:
+                print(f"[onnx] risk {key}: {value}")
+        if args.fail_on_risk and risk_payload["has_strict_edge_risks"]:
+            risky = [key for key, value in risk_payload["risk_counts"].items() if value]
+            raise RuntimeError(f"ONNX graph has strict-edge risk patterns: {', '.join(risky)}")
     if disallowed:
         print(f"[onnx] disallowed ops: {', '.join(disallowed)}")
     else:
@@ -274,6 +283,9 @@ def parse_args() -> Any:
     parser.add_argument("--fail-on-disallowed-ops", action="store_true")
     parser.add_argument("--fail-on-control-flow", action="store_true", default=True)
     parser.add_argument("--allow-control-flow", action="store_false", dest="fail_on_control_flow")
+    parser.add_argument("--risk-profile", choices=["none", "tiger_one_strict_edge"], default="tiger_one_strict_edge")
+    parser.add_argument("--transpose-threshold", type=int, default=500)
+    parser.add_argument("--fail-on-risk", action="store_true")
     parser.add_argument("--onnx-mlir", type=Path, help="Path to onnx-mlir binary.")
     parser.add_argument("--skip-emit-mlir", action="store_true")
     parser.add_argument("--compile-shared-lib", action="store_true", help="Also run onnx-mlir without --EmitMLIR.")

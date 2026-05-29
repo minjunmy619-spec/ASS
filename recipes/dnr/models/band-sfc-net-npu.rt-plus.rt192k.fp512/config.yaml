@@ -1,0 +1,6 @@
+_base_: ../band-sfc-net-npu.quality.rt192k.fp512/config.yaml
+
+# Proposal B: BandSFCNet-RT+.
+# This keeps the validated quality preset shape and adds the opt-in complex
+# residual correction head from the 2026 edge-separation proposal notes.
+band_sfc_preset: rt_plus

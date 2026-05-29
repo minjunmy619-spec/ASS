@@ -120,6 +120,24 @@ Temporary quantization unblock (layer granularity retry):
 ./.venv/bin/python tools/online/verify_npu_variants.py --mode all --quantize-layer-fallback
 ```
 
+Run the standalone ONNX risk audit learned from the TIGER/ONE failures:
+
+```bash
+./.venv/bin/python tools/online/audit_onnx_model.py path/to/model.onnx \
+  --risk-profile tiger_one_strict_edge \
+  --fail-on-risk \
+  --risk-json-out path/to/npu_risk_audit.json
+```
+
+The MLIR verifier also records this profile in its manifest:
+
+```bash
+./.venv/bin/python tools/online/export_verify_mlir.py \
+  --onnx-in path/to/model.onnx \
+  --skip-emit-mlir \
+  --fail-on-risk
+```
+
 Custom output run folder:
 
 ```bash
@@ -194,6 +212,25 @@ Until then, use `--quantize-layer-fallback` only as a temporary unblock for bloc
 ---
 
 ## 8) Troubleshooting
+
+### TIGER-derived strict-edge checklist
+
+Before long training or ONE compile loops, audit the exported ONNX for patterns
+that previously broke ONE import, optimization, or `record-minmax`:
+
+- Dynamic `Slice` starts/ends, especially when non-sliced dimensions are dynamic.
+- `Tile`, `ConstantOfShape`, and `Expand` shape-materialization patterns.
+- `PRelu` in strict NPU recipes.
+- Scalar `Gather` from head/frame indexing.
+- Rank-3 activation `MatMul` attention paths that may lower to unsupported
+  non-constant `FULLY_CONNECTED`.
+- Tensors with rank greater than 4.
+- High `Transpose` counts.
+
+The preferred repair pattern is the TIGER edge-v2 style: fixed deployment
+shapes, static Q/K/V `view` plus fixed slice bounds, no scalar indexing in the
+export path, no `Tile`-based resize, and rank-4 batched matmul for activation
+attention.
 
 ### A) Export failure
 

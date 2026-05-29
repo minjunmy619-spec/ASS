@@ -1,0 +1,7 @@
+_base_: ../dolphin-sfc-npu.slim-6m.distill.rt192k.fp512keep475/config.yaml
+
+# Larger DolphinSFCNPU distillation probe.  Use only if slim_6m shows useful
+# quality and the fp16 state/GMAC budget remains acceptable.
+task:
+  model:
+    preset: slim_8m

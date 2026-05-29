@@ -398,7 +398,16 @@ class MultiHeadSelfAttention(nn.Module):
         query, key, value = self.get_qkv(input)
 
         # pytorch 2.0 flash attn: q, k, v, mask, dropout, softmax_scale
-        with sdpa_kernel(self.sdpa_kernel):
+        if query.is_cuda:
+            with sdpa_kernel(self.sdpa_kernel):
+                output = F.scaled_dot_product_attention(
+                    query=query,
+                    key=key,
+                    value=value,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0.0,
+                )  # (batch, head, seq_len, -1)
+        else:
             output = F.scaled_dot_product_attention(
                 query=query,
                 key=key,

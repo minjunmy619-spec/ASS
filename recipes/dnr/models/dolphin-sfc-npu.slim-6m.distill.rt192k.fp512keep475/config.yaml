@@ -1,0 +1,110 @@
+_base_: ../dolphin-sfc-npu.large-6m.fp512keep475/config.yaml
+
+# DolphinSFCNPU distilled candidate.  This is the medium-capacity multi-scale
+# NPU student proposed as the second deployable candidate after BandSFC RT+.
+teacher_checkpoint_path: null
+teacher_n_fft: ${n_fft}
+teacher_hop_length: ${hop_length}
+
+datamodule:
+  remix_sources: true
+  normalize_sources: true
+  source_gain_db_min: -12.0
+  source_gain_db_max: 12.0
+  crop_retry: 24
+  source_activity_threshold: 1.0e-4
+  min_active_sources: 1
+  p_source_dropout: 0.08
+  train_augmentations:
+    p_gain: 0.45
+    gain_db_min: -3.0
+    gain_db_max: 3.0
+    p_polarity: 0.2
+    p_channel_swap: 0.2
+    p_time_shift: 0.2
+    max_time_shift_samples: 2048
+    p_pitch_time: 0.1
+    pitch_time_scale_min: 0.99
+    pitch_time_scale_max: 1.01
+    p_random_eq: 0.3
+    eq_bands: 8
+    eq_gain_db_min: -2.0
+    eq_gain_db_max: 2.0
+    p_band_dropout: 0.08
+    band_dropout_width: 0.04
+
+task:
+  _target_: spectral_feature_compression.core.tasks.distillation_task.TeacherStudentDistillationTask
+  fs: ${sr}
+  require_teacher_checkpoint: true
+  teacher_checkpoint_path: ${teacher_checkpoint_path}
+  teacher_loss_weight: 0.3
+  mixture_consistency_weight: 0.1
+  low_frequency_weight: 0.2
+  low_frequency_hz: 300.0
+  silent_source_weight: 0.05
+  silent_source_db: -60.0
+  complex_ri_weight: 0.5
+  log_magnitude_weight: 0.2
+  multi_resolution_stft_weight: 0.3
+  multi_resolution_stft_resolutions:
+    - [512, 128]
+    - [1024, 256]
+    - [2048, 512]
+  transient_weight: 0.05
+  teacher_model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_sfc_locoformer_lite_plus_system
+    n_fft: ${teacher_n_fft}
+    hop_length: ${teacher_hop_length}
+    fs: ${sr}
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    n_bands: 64
+    d_inner: 64
+    d_model: 96
+    n_layers: 4
+    n_heads: 4
+    attention_dim: 96
+    scaling: true
+    css_segment_size: 12
+    css_shift_size: 6
+    css_batch_size: 1
+  model:
+    _target_: DolphinSFCNPU.training_wrapper.build_dolphin_sfc_npu_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    scaling: false
+    css_segment_size: 12
+    css_shift_size: 6
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    preset: slim_6m
+    band_config: musical
+    freq_preprocess_enabled: ${freq_preprocess_enabled}
+    freq_preprocess_keep_bins: ${freq_preprocess_keep_bins}
+    freq_preprocess_target_bins: ${freq_preprocess_target_bins}
+    freq_preprocess_mode: ${freq_preprocess_mode}
+  loss:
+    _target_: spectral_feature_compression.core.loss.snr.ThresSNRLossWithInactiveSource
+    solve_perm: false
+    n_src: ${n_src}
+    zeroref_weight: 0.1
+    only_denominator: false
+  optimizer_config:
+    _target_: aiaccel.torch.lightning.OptimizerConfig
+    optimizer_generator:
+      _partial_: True
+      _target_: torch.optim.AdamW
+      lr: 1.e-3
+      weight_decay: 1.e-2
+      betas: [0.9, 0.999]
+    scheduler_generator:
+      _partial_: True
+      _target_: spectral_feature_compression.common.lr_schedulers.warmup.WarmUpStepLR
+      warmup_steps: 5000
+      decay_start_step: 150000
+      decay_stop_step: 220000
+      step_size: 1354
+      decay: 0.98
+    scheduler_interval: step

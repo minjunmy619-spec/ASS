@@ -1,0 +1,37 @@
+_base_: ../band-sfc-net-npu.rt-plus.distill.rt192k.fp512/config.yaml
+
+# Stage 2 student: teacher-guided chunk-causal distillation.  Set
+# teacher_checkpoint_path before launch.
+datamodule:
+  duration: 6
+  remix_sources: true
+  normalize_sources: true
+  source_gain_db_min: -12.0
+  source_gain_db_max: 12.0
+  crop_retry: 24
+  source_activity_threshold: 1.0e-4
+  min_active_sources: 1
+  p_source_dropout: 0.08
+  train_augmentations:
+    p_gain: 0.45
+    gain_db_min: -3.0
+    gain_db_max: 3.0
+    p_polarity: 0.2
+    p_channel_swap: 0.2
+    p_time_shift: 0.2
+    max_time_shift_samples: 2048
+    p_pitch_time: 0.1
+    pitch_time_scale_min: 0.99
+    pitch_time_scale_max: 1.01
+    p_random_eq: 0.3
+    eq_bands: 8
+    eq_gain_db_min: -2.0
+    eq_gain_db_max: 2.0
+    p_band_dropout: 0.08
+    band_dropout_width: 0.04
+
+task:
+  model:
+    css_segment_size: 6
+    css_shift_size: 3
+    css_batch_size: 1

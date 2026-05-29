@@ -1,0 +1,2 @@
+listening_sheet,run_id,date,evaluator,clip_id,clip_source,model,variant,checkpoint,bass_preservation_1_5,drum_transient_1_5,speech_intelligibility_1_5,speech_leakage_1_5,music_leakage_1_5,effects_leakage_1_5,musical_noise_1_5,preecho_smearing_1_5,chunk_boundary_artifacts_1_5,overall_quality_1_5,notes
+example_sheet,example_run,2026-05-29,,clip_001,,BandSFCNet-RT+,rt_plus,,,,,,,,,,,,,"Use 1=bad/high artifact, 5=good/low artifact; explain failures in notes"

@@ -239,7 +239,16 @@ class MultiHeadCrossAttention(nn.Module):
 
         pos_bias = self.pos_bias(dtype=k.dtype) if self.pos_bias is not None else None
 
-        with sdpa_kernel(self.sdpa_kernel):
+        if q.is_cuda:
+            with sdpa_kernel(self.sdpa_kernel):
+                output = F.scaled_dot_product_attention(
+                    query=q,
+                    key=k,
+                    value=v,
+                    attn_mask=pos_bias,
+                    dropout_p=self.dropout if self.training else 0.0,
+                )  # (batch, head, seq_len, -1)
+        else:
             output = F.scaled_dot_product_attention(
                 query=q,
                 key=k,

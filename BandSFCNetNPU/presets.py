@@ -86,10 +86,40 @@ def quality6m(
     )
 
 
+def rt_plus(
+    n_freq: int,
+    *,
+    n_src: int = 3,
+    n_chan: int = 1,
+    masking: bool = True,
+) -> BandSFCNetNPU:
+    """Research proposal B: quality preset plus complex residual correction."""
+    return BandSFCNetNPU(
+        n_freq=n_freq,
+        n_bands=64,
+        n_src=n_src,
+        n_chan=n_chan,
+        channels=32,
+        num_stages=5,
+        time_kernel=3,
+        freq_kernel=3,
+        dilation_cycle=(1, 1, 2, 4, 6),
+        transport="crossattn",
+        use_attn=True,
+        attn_window=16,
+        num_heads=4,
+        head_dim=8,
+        pooled_mixer_hidden=4096,
+        masking=masking,
+        residual_head=True,
+    )
+
+
 _PRESETS = {
     "safe": safe,
     "quality": quality,
     "quality6m": quality6m,
+    "rt_plus": rt_plus,
 }
 
 

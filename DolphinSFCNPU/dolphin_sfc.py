@@ -873,17 +873,20 @@ _PRESETS: dict[str, dict[str, object]] = {
         time_kernels=(3, 3, 3),
         freq_kernels=(3, 3, 3),
     ),
-    # ~7.7M params, ~186 KiB fp16 state at n_freq=257.
+    # ~6.5M params, ~174 KiB fp16 state at n_freq=257.
     "slim_8m": dict(
         n_bands=48,
         d_model=128,
         num_scales=3,
-        widths=(128, 256, 448),
+        widths=(128, 240, 384),
         blocks_per_scale=(1, 2, 1),
         time_kernels=(3, 3, 3),
         freq_kernels=(3, 3, 3),
     ),
 }
+
+_PRESETS["large_6m"] = dict(_PRESETS["slim_6m"])
+_PRESETS["large_8m"] = dict(_PRESETS["slim_8m"])
 
 
 def build_dolphin_sfc_npu_preset(

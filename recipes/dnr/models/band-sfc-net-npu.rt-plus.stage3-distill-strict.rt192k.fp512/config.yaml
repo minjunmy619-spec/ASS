@@ -1,0 +1,38 @@
+_base_: ../band-sfc-net-npu.rt-plus.distill.rt192k.fp512/config.yaml
+
+# Stage 3 student: strict short-chunk/streaming fine-tune after Stage 2.  Set
+# teacher_checkpoint_path and pretrained_model_path before launch.
+datamodule:
+  duration: 2
+  remix_sources: true
+  normalize_sources: true
+  source_gain_db_min: -10.0
+  source_gain_db_max: 10.0
+  crop_retry: 32
+  source_activity_threshold: 1.0e-4
+  min_active_sources: 1
+  p_source_dropout: 0.1
+  train_augmentations:
+    p_gain: 0.35
+    gain_db_min: -2.0
+    gain_db_max: 2.0
+    p_polarity: 0.15
+    p_channel_swap: 0.15
+    p_time_shift: 0.15
+    max_time_shift_samples: 1024
+    p_pitch_time: 0.05
+    pitch_time_scale_min: 0.995
+    pitch_time_scale_max: 1.005
+    p_random_eq: 0.2
+    eq_bands: 8
+    eq_gain_db_min: -1.5
+    eq_gain_db_max: 1.5
+    p_band_dropout: 0.05
+    band_dropout_width: 0.03
+
+task:
+  pretrained_model_path: null
+  model:
+    css_segment_size: 2
+    css_shift_size: 2
+    css_batch_size: 1

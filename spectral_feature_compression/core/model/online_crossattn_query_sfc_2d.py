@@ -108,9 +108,8 @@ class NPUSafeCrossAttnEncoder2d(nn.Module):
     def _pool_query_tokens(self, emb: torch.Tensor) -> torch.Tensor:
         batch, channels, n_frames, n_freq = emb.shape
         emb_btfc = emb.permute(0, 2, 3, 1).reshape(batch * n_frames, n_freq, channels)
-        basis = self.query_basis.expand(batch, -1, n_frames, -1)
-        basis_btkf = basis.permute(0, 2, 1, 3).reshape(batch * n_frames, self.n_bands, n_freq)
-        pooled = torch.bmm(basis_btkf, emb_btfc)
+        basis_kf = self.query_basis.reshape(self.n_bands, n_freq).to(dtype=emb.dtype)
+        pooled = torch.matmul(basis_kf, emb_btfc)
         return pooled.reshape(batch, n_frames, self.n_bands, channels).permute(0, 3, 1, 2)
 
     def _prepare_query(self, emb: torch.Tensor) -> torch.Tensor:
@@ -130,10 +129,10 @@ class NPUSafeCrossAttnEncoder2d(nn.Module):
 
         scores = torch.bmm(q, k.transpose(1, 2))
         scores = scores * self.score_scale.to(dtype=scores.dtype)
-        bias = self.routing_bias.expand(batch, -1, n_frames, -1).permute(0, 2, 1, 3).reshape(
-            batch * n_frames, self.n_bands, n_freq
-        )
-        scores = scores + bias.to(dtype=scores.dtype) * self.prior_scale.to(dtype=scores.dtype)
+        scores = scores.reshape(batch, n_frames, self.n_bands, n_freq)
+        bias = self.routing_bias.permute(0, 2, 1, 3).to(dtype=scores.dtype)
+        scores = scores + bias * self.prior_scale.to(dtype=scores.dtype)
+        scores = scores.reshape(batch * n_frames, self.n_bands, n_freq)
         weights = normalize_band_scores(scores, mode=self.routing_normalization)
         attended = torch.bmm(weights, v)
         attended = attended.reshape(batch, n_frames, self.n_bands, channels).permute(0, 3, 1, 2)
@@ -252,11 +251,12 @@ class NPUSafeCrossAttnDecoder2d(nn.Module):
 
         scores = torch.bmm(q, k.transpose(1, 2))
         scores = scores * self.score_scale.to(dtype=scores.dtype)
-        bias = self.expansion_basis.squeeze(0).squeeze(1).transpose(0, 1)
-        bias = bias.unsqueeze(0).unsqueeze(0).expand(batch, n_frames, self.n_freq, self.n_bands).reshape(
-            batch * n_frames, self.n_freq, self.n_bands
+        scores = scores.reshape(batch, n_frames, self.n_freq, self.n_bands)
+        bias = self.expansion_basis.squeeze(0).squeeze(1).transpose(0, 1).reshape(
+            1, 1, self.n_freq, self.n_bands
         )
         scores = scores + bias.to(dtype=scores.dtype) * self.prior_scale.to(dtype=scores.dtype)
+        scores = scores.reshape(batch * n_frames, self.n_freq, self.n_bands)
         weights = normalize_band_scores(scores, mode=self.routing_normalization)
 
         attended = torch.bmm(weights, v)

@@ -300,6 +300,7 @@ class BandSFCNetNPU(nn.Module):
         pooled_mixer_hidden: int = 0,
         causal: bool = True,
         masking: bool = True,
+        residual_head: bool = False,
     ):
         super().__init__()
         if transport not in {"soft", "crossattn"}:
@@ -308,6 +309,8 @@ class BandSFCNetNPU(nn.Module):
             raise ValueError("BandSFCNetNPU currently targets causal online deployment only")
         if channels % 2 != 0:
             raise ValueError(f"channels must be even, got {channels}")
+        if residual_head and not masking:
+            raise ValueError("residual_head requires masking=True so mask and residual estimates can be fused")
 
         self.n_freq = n_freq
         self.n_bands = n_bands
@@ -318,6 +321,7 @@ class BandSFCNetNPU(nn.Module):
         self.transport = transport
         self.causal = causal
         self.masking = masking
+        self.residual_head = residual_head
         self.dilation_schedule = _normalize_dilation_schedule(num_stages, dilation_cycle)
 
         in_ch = 2 * n_chan
@@ -375,7 +379,7 @@ class BandSFCNetNPU(nn.Module):
                 for dilation in self.dilation_schedule
             ]
         )
-        self.out_proj = nn.Conv2d(channels, out_ch, kernel_size=1, bias=True)
+        self.out_proj = nn.Conv2d(channels, out_ch * (2 if residual_head else 1), kernel_size=1, bias=True)
 
     def _encode(self, x: torch.Tensor):
         if self.transport == "soft":
@@ -397,6 +401,21 @@ class BandSFCNetNPU(nn.Module):
             raise RuntimeError("crossattn transport requires a decoder side path")
         return self.decoder(z, side)
 
+    def _project_output(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        y = self.out_proj(h)
+        if not self.masking:
+            return y
+        if self.residual_head:
+            mask, residual = y.chunk(2, dim=1)
+            masked = _apply_packed_complex_mask_no_repeat(
+                x=x,
+                y=mask,
+                n_src=self.n_src,
+                n_chan=self.n_chan,
+            )
+            return masked + residual
+        return _apply_packed_complex_mask_no_repeat(x=x, y=y, n_src=self.n_src, n_chan=self.n_chan)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _runtime_assert(x.ndim == 4, f"Expected 4D input (B,C,T,F), got {tuple(x.shape)}")
         _runtime_assert(x.shape[1] == 2 * self.n_chan, f"{x.shape[1]} vs {2 * self.n_chan}")
@@ -407,10 +426,7 @@ class BandSFCNetNPU(nn.Module):
         for stage in self.stages:
             z = stage(z)
         h = self._decode(z, side)
-        y = self.out_proj(h)
-        if self.masking:
-            return _apply_packed_complex_mask_no_repeat(x=x, y=y, n_src=self.n_src, n_chan=self.n_chan)
-        return y
+        return self._project_output(x, h)
 
     def stream_context_frames(self) -> int:
         return self.encoder.stream_context_frames() + sum(stage.stream_context_frames() for stage in self.stages)
@@ -446,9 +462,7 @@ class BandSFCNetNPU(nn.Module):
             z, new_stage_state = stage.forward_stream(z, stage_state)
             new_sep_states.append(new_stage_state)
         h = self._decode(z, side)
-        y = self.out_proj(h)
-        if self.masking:
-            y = _apply_packed_complex_mask_no_repeat(x=x, y=y, n_src=self.n_src, n_chan=self.n_chan)
+        y = self._project_output(x, h)
         return y, (new_enc_state, *new_sep_states)
 
     def layer_cache_numel(self, batch_size: int = 1) -> int:
