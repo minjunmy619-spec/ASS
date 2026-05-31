@@ -1,0 +1,13 @@
+_base_: ../locoformer-small.enc-mamba32dim.dec-mamba32dim.musical64.learnable-query/config.yaml
+
+# Band mapping ablation: existing SFC-Mamba teacher branch.
+# Keep this outside strict NPU export until mamba_ssm support is proven.
+task:
+  model:
+    model:
+      encoder:
+        n_bands: 64
+        band_config: musical
+      decoder:
+        n_bands: 64
+        band_config: musical

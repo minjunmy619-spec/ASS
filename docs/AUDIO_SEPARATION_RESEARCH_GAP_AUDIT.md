@@ -18,13 +18,20 @@ The current repo now has the main deployable skeleton recommended by the
 research notes:
 
 - `BandSFCNet-RT+` as an opt-in preset through `band_sfc_preset: rt_plus`.
+- `BandSFCNet-RT+` 2-mask residual-SFX ablation, where the core predicts Speech
+  and Music and the wrapper reconstructs Effects as `mixture - speech - music`.
 - Proposal builders for:
   - `SFC-Locoformer-Lite+`
   - `BandSFCNet-RT+`
   - `Hierarchical-SFC-FFI-Lite`
+  - `Sparse U-Net Mel-SFC`
+  - `SFC-SepReformer-MultiStem`
+  - `SFC-Residual-Refinement`
+  - `Adaptive-Mel-SFC`
   - `EdgeFusion-SFC-Distilled`
 - Teacher-student training plumbing through `TeacherStudentDistillationTask`.
 - DnR and MUSDB sibling recipes for the RT+ student path.
+- Opt-in DnR wrapper ablations for PCEN, DC-bypass, and 2-mask residual-SFX.
 - DnR distillation recipes for BandSFC RT+ and EdgeFusion-SFC.
 - Streaming ONNX export validation for RT+ with no `Tile`, `Expand`, or
   `ConstantOfShape` in the exported graph.
@@ -58,6 +65,9 @@ Current gap:
 - No trained or downloaded `SFC-Locoformer-Lite+` checkpoint is wired as the
   actual teacher.
 - `BandSFCNet-RT+` has runnable recipes but no trained metric table.
+- The 2-mask residual-SFX BandSFC RT+ ablation has ONNX/ONE validation but no
+  trained per-stem evidence yet; SFX must be checked carefully because it is the
+  residual error bucket.
 - `EdgeFusion-SFC-Distilled` has a distillation recipe but no trained student.
 - No MUSDB/DnR SDR, SNR, SI-SDR, cSDR, or uSDR results are reported for the new
   proposal variants.
@@ -66,12 +76,14 @@ Required next work:
 
 - Train or import a small SFC-Locoformer teacher.
 - Train BandSFC RT+ with and without distillation.
+- Train the 2-mask residual-SFX ablation only as a controlled comparison against
+  the normal 3-mask RT+ recipe.
 - Train EdgeFusion-SFC only after the BandSFC student is useful.
 - Add a results table for quality, state, compute, and export status.
 
 ### 2. Full Loss Stack Is Not Implemented
 
-Status: Partial
+Status: Implemented for loss plumbing; pending trained/tuned weights
 
 Implemented:
 
@@ -84,22 +96,26 @@ Implemented:
 - Log-magnitude consistency loss.
 - Multi-resolution complex STFT loss.
 - Transient waveform-difference loss.
+- Teacher spectral mask distillation.
+- Teacher spectral logit distillation.
+- Latent/intermediate feature distillation through aux outputs or forward hooks.
+- Source-activity-aware waveform loss weighting.
 
 Missing:
 
-- Latent/intermediate SFC-band distillation.
-- Teacher mask or logit distillation.
-- Source-activity-aware loss weighting.
+- Trained evidence for the full loss stack.
+- Chosen latent hook pairs for each final teacher/student architecture.
+- Tuned loss weights per dataset and model family.
 
 Required next work:
 
-- Add optional latent hooks in teacher and student models.
-- Add teacher mask/logit outputs where the teacher exposes them cleanly.
-- Add source-activity-aware weighting beyond silent-source penalties.
+- Run ablations for mask/logit/source-activity terms.
+- Enable non-zero latent distillation only after matching teacher/student feature
+  hooks are selected and shape-compatible.
 
-### 3. True Sparse U-Net Mel-SFC Is Not Implemented
+### 3. True Sparse U-Net Mel-SFC
 
-Status: Missing
+Status: Implemented; DnR ONNX/ONE validated; pending training and MUSDB export
 
 The notes propose `Sparse U-Net Mel-SFC` as a music-first fallback with:
 
@@ -109,18 +125,40 @@ The notes propose `Sparse U-Net Mel-SFC` as a music-first fallback with:
 - Lightweight TF-Locoformer or local/global bottleneck blocks.
 - Shared complex mask head.
 
-Current repo state:
+Implemented:
 
-- `Hierarchical-SFC-FFI-Lite` is exposed as a related middle-tier direction.
-- It is not the same as the proposed sparse asymmetric U-Net.
+- Added `SparseBandUNetEncoder` and `SparseBandUNetDecoder` in
+  `spectral_feature_compression/core/model/sparse_unet_mel_sfc_2d.py`.
+- Added branch-local sparse low/mid/high overlapped mel routing through
+  `RegionalMelBandSpec2d`.
+- Added asymmetric encoder/downsample/bottleneck/decoder branch processing with
+  U-Net skip paths.
+- Used lightweight causal ConvNeXt-style 2D blocks as the bottleneck option, so
+  tensors remain 4D and the operator set stays close to the online SFC variants.
+- Added a shared packed-complex mask head and online waveform builder through
+  `build_sparse_unet_mel_sfc_music_system`.
+- Added MUSDB-first and DnR sibling recipes:
+  - `recipes/musdb18hq/models/sparse-unet-mel-sfc.music.rt192k.fp512keep475/config.yaml`
+  - `recipes/dnr/models/sparse-unet-mel-sfc.rt192k.fp512keep475/config.yaml`
+- Added a smoke test covering waveform builder output shape, packed-core
+  streaming shape, and a tiny fp16 state budget.
+
+Current caveats:
+
+- This is still a quality/ablation fallback, not a validated replacement for
+  the strict RT+ NPU student.
+- No trained MUSDB or DnR metrics exist yet.
+- DnR packed-core export now passes ONNX export, ONE import, ONE optimize,
+  ONE quantize, and `circle-verify`; the simplified ONNX graph has `555` nodes.
+- No trained MUSDB or DnR metrics, MUSDB export result, or GMAC/s table exists
+  yet for this variant.
 
 Required next work:
 
-- Add `SparseBandUNetEncoder`.
-- Add `SparseBandUNetDecoder`.
-- Add sparse band routing for low/mid/high frequency regions.
-- Add a bottleneck option using Lite-Locoformer or CNB blocks.
-- Add MUSDB-first configs and smoke tests.
+- Train the MUSDB recipe first and compare against existing soft-band SFC
+  recipes.
+- Run the DnR sibling only if the music-first probe is useful.
+- Run the MUSDB sibling export if the music-first probe becomes useful.
 
 ### 4. Prompted Asymmetric SFC Is Not Implemented
 
@@ -149,35 +187,54 @@ Required next work:
 - Add datamodule support for prompt batches.
 - Add category-aware PIT only where multiple same-class outputs exist.
 
-### 5. SepReformer-Style Early Source Split Is Missing
+### 5. SepReformer-Style Early Source Split
 
-Status: Missing
+Status: Implemented; DnR ONNX/ONE validated; pending training and MUSDB export
 
 The notes recommend testing early source disentanglement at compressed SFC token
 level.
 
-Missing:
+Implemented:
 
-- Source split module after SFC compression.
-- Shared source refiner.
-- Weight-shared reconstruction decoder.
-- Cross-source reconstruction logic.
+- Added `spectral_feature_compression/core/model/source_split_sfc_2d.py`.
+- Added `SourceTokenSplitter2d` immediately after SFC soft-band query
+  compression.
+- Added `SharedSourceRefiner2d`, which applies the same causal 2D refiner blocks
+  to each source token stream.
+- Added `SourceSharedReconstructionDecoder2d`, which reuses one SFC query
+  expander and one mask head across all sources.
+- Added `CrossSourceReconstructionMixer2d`, which mixes each source token with
+  other-source mean context and mixture-token context before reconstruction.
+- Kept runtime tensors 4D by packing the fixed source axis into channels
+  instead of using the conceptual `[B, N, D, T, K]` tensor from the research
+  sketch.
+- Exposed the proposal through `build_sfc_sepreformer_multistem_system`.
+- Added sibling recipes:
+  - `recipes/dnr/models/sfc-sepreformer-multistem.rt192k.fp512keep475/config.yaml`
+  - `recipes/musdb18hq/models/sfc-sepreformer-multistem.rt192k.fp512keep475/config.yaml`
+- Added a smoke test covering waveform builder output shape, source-split token
+  shape, packed-core streaming shape, and a tiny fp16 state budget.
 
-Current repo state:
+Current caveats:
 
-- Current implementations mostly use shared latent processing and late output
-  heads.
-- RT+ adds a residual correction head, but this is not early source splitting.
+- This is a source-disentanglement ablation/middle-tier candidate, not a proven
+  strict NPU student.
+- Static per-source loops export and compile for the DnR packed-core recipe; the
+  simplified ONNX graph has `375` nodes and the quantized Circle passes
+  `circle-verify`.
+- No trained DnR or MUSDB results exist yet.
 
 Required next work:
 
-- Add a source-token split option to the SFC teacher or middle-tier model.
-- Evaluate it first in non-strict or middle-tier mode before making an NPU
-  student.
+- Train the DnR recipe first because the source split should help the three-stem
+  universal task most.
+- Compare against `online-soft-band-query-sfc2d` with the same preprocessing and
+  loss stack.
+- Run the MUSDB sibling export if the DnR ablation is worth continuing.
 
-### 6. Mamba2 Or Residual Refinement Branch Is Missing
+### 6. Mamba2 Or Residual Refinement Branch
 
-Status: Missing
+Status: Implemented; DnR ONNX/ONE validated; pending training and MUSDB export
 
 The notes do not recommend replacing SFC-CA with Mamba by default. They do
 recommend testing Mamba/Mamba2 selectively in:
@@ -186,42 +243,92 @@ recommend testing Mamba/Mamba2 selectively in:
 - A second-stage residual correction/refinement branch.
 - TS-BSMamba2-style correction.
 
-Current repo state:
+Implemented:
 
-- SFC-Mamba encoder/decoder code exists.
-- The targeted Mamba2 residual/refinement branch is not implemented.
+- Added `spectral_feature_compression/core/model/residual_refinement_sfc_2d.py`.
+- Added `Mamba2LiteTemporalBranch2d`, a causal dilated latent-band branch after
+  SFC compression. It targets the long-context ablation role of Mamba2 without
+  importing unsupported Mamba2 kernels into the strict path.
+- Added `ResidualCorrectionHead2d`, a second-stage full-band correction head that
+  consumes the mixture, first estimate, and refined SFC token context.
+- Added `OnlineResidualRefinementSFC2D` and wrapper/builder plumbing through
+  `build_sfc_residual_refinement_system`.
+- The branch predicts a packed complex residual added to the primary masked
+  estimate, making it directly comparable with the existing BandSFC RT+
+  residual head.
+- Added recipes:
+  - `recipes/dnr/models/sfc-residual-refinement.rt192k.fp512keep475/config.yaml`
+  - `recipes/musdb18hq/models/sfc-residual-refinement.rt192k.fp512keep475/config.yaml`
+- Added a smoke test covering waveform builder output shape, packed-core
+  streaming shape, and trainable correction/long-branch scales.
+
+Current caveats:
+
+- This is not a real Mamba2 kernel implementation. Actual Mamba2 should remain a
+  teacher/middle-tier ablation until export and runtime support are known.
+- The default uses causal dilated 2D blocks so tensors stay 4D and the state is
+  budgetable; at `512` preprocessed bins the default fp16 layer cache is about
+  `144 KiB`.
+- No trained metric comparison against BandSFC RT+ exists yet.
+- DnR packed-core export now passes ONNX export, ONE import, ONE optimize,
+  ONE quantize, and `circle-verify`; the simplified ONNX graph has `222` nodes.
 
 Required next work:
 
-- Add a second-stage residual refinement module behind an explicit config flag.
-- Keep it outside the strict NPU path until exportability is proven.
-- Compare against the existing RT+ residual head.
+- Train the DnR residual-refinement recipe and compare against BandSFC RT+ and
+  online soft-band query SFC with the same data/loss stack.
+- Run the MUSDB sibling export if the DnR ablation is worth continuing.
+- Only add true Mamba2 after a non-strict teacher/middle-tier experiment proves
+  quality benefit worth the export risk.
 
-### 7. Adaptive Mel / Overlapped Perceptual Band Mapping Is Incomplete
+### 7. Adaptive Mel / Overlapped Perceptual Band Mapping
 
-Status: Partial
+Status: Implemented; DnR ONNX/ONE validated for fixed80 and mel-overlap80; pending trained ablation results
 
 Implemented:
 
-- SFC cross-attention compression.
-- `band_config: musical` in existing SFC-style recipes.
-- Frequency preprocessing such as `fp512keep475`.
+- Existing SFC cross-attention compression remains available.
+- Existing `band_config: musical` recipes remain unchanged.
+- Frequency preprocessing such as `fp512keep475` remains available.
+- Added `spectral_feature_compression/core/model/adaptive_mel_sfc_2d.py`.
+- Added `AdaptiveMelBandSpec2d`, an explicit overlapped mel basis with default
+  `80` bands.
+- Added low-frequency controls for bass/music preservation:
+  - `low_freq_hz`
+  - `low_freq_band_fraction`
+  - `overlap_factor`
+  - `low_freq_overlap_factor`
+- Added `fixed` / `linear` / `uniform` band modes to `SoftBandSpec2d` so fixed
+  linear bands can be compared directly against mel-overlap bands.
+- Added `OnlineAdaptiveMelSFC2D` and proposal builder
+  `build_adaptive_mel_sfc_ablation_system`.
+- Added sibling band-mapping ablation recipes:
+  - `recipes/dnr/models/bandmap-ablation.fixed80.rt192k.fp512keep475/config.yaml`
+  - `recipes/musdb18hq/models/bandmap-ablation.fixed80.rt192k.fp512keep475/config.yaml`
+  - `recipes/dnr/models/bandmap-ablation.mel-overlap80.rt192k.fp512keep475/config.yaml`
+  - `recipes/musdb18hq/models/bandmap-ablation.mel-overlap80.rt192k.fp512keep475/config.yaml`
+  - `recipes/dnr/models/bandmap-ablation.sfc-ca80.teacher/config.yaml`
+  - `recipes/musdb18hq/models/bandmap-ablation.sfc-ca80.teacher/config.yaml`
+  - `recipes/musdb18hq/models/bandmap-ablation.sfc-mamba64.teacher/config.yaml`
+- Added a smoke test checking the explicit mel basis, low-frequency overlap
+  control, waveform builder output, and packed-core streaming shape.
 
-Missing:
+Current caveats:
 
-- Explicit 80-band overlapped mel-style front-end.
-- Direct ablation between:
-  - fixed bands,
-  - mel-overlap bands,
-  - SFC-CA,
-  - SFC-Mamba.
-- Low-frequency overlap controls for bass/music preservation.
+- SFC-Mamba remains a non-strict teacher/offline ablation because it depends on
+  `mamba_ssm` and is not an NPU-safe runtime path.
+- No trained direct comparison exists yet for fixed80 vs mel-overlap80 vs SFC-CA
+  vs SFC-Mamba.
+- DnR fixed80 and mel-overlap80 packed-core exports both pass ONNX export,
+  ONE import, ONE optimize, ONE quantize, and `circle-verify`; both simplified
+  ONNX graphs have `208` nodes.
 
 Required next work:
 
-- Add a mel-overlap band spec or config mode.
-- Add sibling configs that differ only by band mapping.
-- Report quality and deployment metrics for each.
+- Train the fixed80 and mel-overlap80 DnR recipes under the same loss stack.
+- Compare against the SFC-CA teacher and the existing SFC-Mamba teacher branch
+  where dependencies are available.
+- Fill the result manifest with quality, state, node-count, and export metrics.
 
 ### 8. Full Deployment Validation Is Not Complete
 
@@ -233,12 +340,25 @@ Done:
 - ONNX checker.
 - Forbidden-op audit for `Tile`, `Expand`, and `ConstantOfShape`.
 - RT+ fp512 state check around `186 KiB` fp16 layer-cache.
+- Full ONE import/optimize/quantize/`circle-verify` for RT+.
+- DnR ONNX/ONE validation for new proposal candidates:
+  - `band-sfc-net-npu.rt-plus.2mask-residual-sfx.rt192k.fp512`: `444`
+    simplified ONNX nodes, `core_n_src=2`, wrapper output `n_src=3`.
+  - `sparse-unet-mel-sfc.rt192k.fp512keep475`: `555` simplified ONNX nodes.
+  - `sfc-sepreformer-multistem.rt192k.fp512keep475`: `375` simplified ONNX nodes.
+  - `sfc-residual-refinement.rt192k.fp512keep475`: `222` simplified ONNX nodes.
+  - `bandmap-ablation.fixed80.rt192k.fp512keep475`: `208` simplified ONNX nodes.
+  - `bandmap-ablation.mel-overlap80.rt192k.fp512keep475`: `208` simplified ONNX nodes.
+- DnR ONNX/ONE validation for remaining deployable candidates:
+  - `dolphin-sfc-npu.large-6m.fp512keep475`: `314` simplified ONNX nodes.
+  - `dolphin-sfc-npu.slim-6m.distill.rt192k.fp512keep475`: `314` simplified ONNX nodes.
+  - `edge-fusion-sfc-distilled.rt192k`: `168` simplified ONNX nodes.
+  - `online-hierarchical-soft-band-parallel-ffi-sfc2d.rt192k.speech-lowfreq-narrow.causal20dim.0-1-1l.128-96-48b`:
+    `252` simplified ONNX nodes.
 
 Missing:
 
-- Full ONE import/optimize/quantize/`circle-verify` for RT+.
 - GMAC/s measurement for RT+.
-- ONNX node count table across new proposal variants.
 - MLIR op count table.
 - Runtime latency measurement.
 - Listening notes for bass, drums/transients, vocals/speech leakage, and
@@ -248,7 +368,8 @@ Required next work:
 
 - Run `tools/online/measure_npu_model_stats.py`.
 - Run `tools/online/export_verify_mlir.py` without `--skip-emit-mlir`.
-- Add RT+ to the verification matrix.
+- Extend the same validation to MUSDB sibling configs if the DnR probes justify
+  continuing them.
 
 ### 9. Quantization-Aware Training Is Missing
 
@@ -290,6 +411,8 @@ Implemented:
 - Staged DnR configs for:
   - augmented SFC-Locoformer teacher training,
   - supervised RT+ student warm start,
+  - supervised RT+ PCEN and DC-bypass wrapper ablations,
+  - supervised RT+ 2-mask residual-SFX ablation,
   - chunk-causal RT+ distillation,
   - strict short-chunk RT+ distillation fine-tuning.
 - `docs/AUDIO_SEPARATION_TRAINING_RECIPE.md` with stage order and launch
@@ -303,12 +426,21 @@ Required next work:
 
 ### 11. Ablation Matrix Is Missing
 
-Status: Missing
+Status: Partial
 
 The notes request architecture-level ablations, not random hyperparameter
 sweeps.
 
-Missing ablations:
+Implemented ablation rows now include:
+
+- BandSFC RT+ 2-mask residual-SFX, with Speech/Music predicted explicitly and
+  Effects reconstructed wrapper-side as the residual.
+- Wrapper-side PCEN and DC-bypass for BandSFC RT+.
+- Fixed80 vs mel-overlap80 band mapping.
+- Sparse U-Net Mel-SFC, source-split SFC, and residual-refinement SFC proposal
+  probes.
+
+Still missing or pending-trained-evidence ablations:
 
 - Fixed bands vs mel-overlap vs SFC-CA vs SFC-Mamba.
 - CNB blocks vs Lite-Locoformer vs sparse U-Net bottleneck.
@@ -318,11 +450,12 @@ Missing ablations:
 - With and without teacher distillation.
 - With and without low-frequency loss.
 - With and without residual correction head.
+- With and without 2-mask residual-SFX, measured per stem.
 
 Required next work:
 
 - Create sibling config groups for each ablation.
-- Add a results manifest schema.
+- Train/evaluate the sibling config groups already added.
 - Include quality, state, GMAC/s, ONNX ops, MLIR ops, and ONE verification.
 
 ### 12. DolphinSFCNPU Distillation Is Missing
@@ -435,6 +568,8 @@ Current gap:
 - The primary three-stem benchmark contract is now pinned in
   `docs/AUDIO_SEPARATION_BENCHMARK_CONTRACT.md`.
 - Result and listening-note CSV templates now exist under `docs/templates/`.
+- Residual-source ablations are still scored as fixed DnR three-stem outputs;
+  result rows should keep `n_src=3` and record `core_n_src=2` in notes.
 - The teacher path is discussed for both MUSDB and DnR, but the exact checkpoint
   selection and conversion from four-stem music training to three-stem TV/CASS
   deployment is not defined.
@@ -458,7 +593,8 @@ Required next work:
 4. Train `BandSFCNet-RT+` with and without distillation.
 5. Run full stats and ONE verification for RT+.
 6. Fill the benchmark and listening templates from local evaluation runs.
-7. Add the ablation matrix around band mapping, residual head, and distillation.
+7. Train the ablation matrix around band mapping, residual head, residual-SFX,
+   and distillation.
 8. Add true `Sparse U-Net Mel-SFC` if RT+ quality still leaves a large gap.
 9. Add DolphinSFCNPU distillation as a second deployable candidate.
 10. Only then invest in Prompted Asymmetric SFC unless unified prompted
@@ -472,9 +608,8 @@ plumbing. The remaining work is mostly in four buckets:
 
 1. Real training evidence and benchmark tables.
 2. Completing the proposed loss, augmentation, ablation, and deployment
-   validation workflow.
-3. Implementing the larger missing architecture families: true Sparse U-Net
-   Mel-SFC, Prompted Asymmetric SFC, early source-split SepReformer-style
-   refinement, and targeted Mamba2 residual refinement.
+   validation workflow with trained metrics.
+3. Filling empirical evidence for the implemented architecture probes; prompted
+   asymmetric SFC and true Mamba2 kernels remain future work.
 4. Turning the TIGER/ONE failure lessons and the three-stem product target into
    reusable regression checks and result manifests.

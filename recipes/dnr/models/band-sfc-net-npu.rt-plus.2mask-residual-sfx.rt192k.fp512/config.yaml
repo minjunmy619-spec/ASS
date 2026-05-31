@@ -1,0 +1,11 @@
+_base_: ../band-sfc-net-npu.rt-plus.stage1-supervised-aug.rt192k.fp512/config.yaml
+
+# Opt-in 2-mask DnR ablation.  The BandSFCNetNPU core predicts only Speech and
+# Music masks; SFX is reconstructed wrapper-side as mixture - speech - music.
+# The external task/loss contract remains the standard 3-stem DnR order:
+# Speech, Music, SFX.
+task:
+  model:
+    core_n_src: 2
+    residual_source_enabled: true
+    residual_source_index: 2

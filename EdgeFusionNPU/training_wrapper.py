@@ -13,6 +13,7 @@ import torch.nn as nn
 from spectral_feature_compression.core.model.frequency_preprocessing import (
     FrequencyPreprocessedOnlineModel,
     build_frequency_preprocessor,
+    build_pcen_preprocessor,
     resolve_preprocessed_n_freq,
 )
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
@@ -87,7 +88,11 @@ class EdgeFusionNPUOnlineModel(nn.Module):
                 if tuple(initial_state.shape) != expected_state:
                     raise ValueError(f"expected initial_state shape {expected_state}, got {tuple(initial_state.shape)}")
 
-        state = self.init_state(x) if initial_state is None else initial_state.to(device=x.real.device, dtype=x.real.dtype)
+        state = (
+            self.init_state(x)
+            if initial_state is None
+            else initial_state.to(device=x.real.device, dtype=x.real.dtype)
+        )
         if detach_state:
             state = state.detach()
 
@@ -125,6 +130,7 @@ class EdgeFusionNPU2DPackedCoreAdapter(nn.Module):
         self.n_src = n_src
         self.n_chan = n_chan
         self.n_freq = core.n_freq
+        self.masking = True
         if chunk_frames is not None and chunk_frames <= 0:
             raise ValueError(f"chunk_frames must be positive or None, got {chunk_frames}")
         self.chunk_frames = chunk_frames
@@ -143,9 +149,11 @@ class EdgeFusionNPU2DPackedCoreAdapter(nn.Module):
         if n_freq != self.n_freq:
             raise ValueError(f"expected {self.n_freq} frequency bins, got {n_freq}")
 
-        x_complex = unpack_2d_to_complex_stft(x2d, n_src=1, n_chan=self.n_chan).squeeze(1)
         packed = x2d.permute(0, 1, 3, 2).contiguous()
         mask, new_state = self.core(packed, state)
+        if not self.masking:
+            return mask.permute(0, 1, 3, 2).contiguous(), new_state
+        x_complex = unpack_2d_to_complex_stft(x2d, n_src=1, n_chan=self.n_chan).squeeze(1)
         mask = mask.reshape(batch, self.n_src, self.n_chan, n_freq, frames)
         est = x_complex.unsqueeze(1) * mask
         return pack_complex_stft_as_2d(est.reshape(batch, self.n_src * self.n_chan, n_freq, frames)), new_state
@@ -186,6 +194,16 @@ def build_edge_fusion_npu_system(
     freq_preprocess_keep_bins: int | None = None,
     freq_preprocess_target_bins: int | None = None,
     freq_preprocess_mode: str = "triangular",
+    dc_bypass_enabled: bool = False,
+    dc_policy: str = "zero",
+    pcen_preprocess_enabled: bool = False,
+    pcen_smooth_coef: float = 0.98,
+    pcen_alpha: float = 0.5,
+    pcen_delta: float = 2.0,
+    pcen_root: float = 0.5,
+    pcen_eps: float = 1e-6,
+    pcen_gain_floor: float = 0.05,
+    pcen_gain_ceiling: float = 20.0,
     chunk_frames: int | None = None,
     detach_state_between_chunks: bool = False,
     css_segment_size: int = 12,
@@ -198,6 +216,7 @@ def build_edge_fusion_npu_system(
         enabled=freq_preprocess_enabled,
         keep_bins=freq_preprocess_keep_bins,
         target_bins=freq_preprocess_target_bins,
+        dc_bypass_enabled=dc_bypass_enabled,
     )
     freq_preprocessor = build_frequency_preprocessor(
         full_n_freq,
@@ -205,9 +224,21 @@ def build_edge_fusion_npu_system(
         keep_bins=freq_preprocess_keep_bins,
         target_bins=freq_preprocess_target_bins,
         mode=freq_preprocess_mode,
+        dc_bypass_enabled=dc_bypass_enabled,
+    )
+    pcen_preprocessor = build_pcen_preprocessor(
+        n_chan=n_chan,
+        enabled=pcen_preprocess_enabled,
+        smooth_coef=pcen_smooth_coef,
+        alpha=pcen_alpha,
+        delta=pcen_delta,
+        root=pcen_root,
+        eps=pcen_eps,
+        gain_floor=pcen_gain_floor,
+        gain_ceiling=pcen_gain_ceiling,
     )
     core = build_edge_fusion_npu_preset(preset, n_freq=core_n_freq, n_src=n_src, n_chan=n_chan)
-    if freq_preprocessor is None:
+    if freq_preprocessor is None and pcen_preprocessor is None and not dc_bypass_enabled:
         model = EdgeFusionNPUOnlineModel(
             core=core,
             n_src=n_src,
@@ -227,6 +258,9 @@ def build_edge_fusion_npu_system(
             n_src=n_src,
             n_chan=n_chan,
             freq_preprocessor=freq_preprocessor,
+            pcen_preprocessor=pcen_preprocessor,
+            dc_bypass_enabled=dc_bypass_enabled,
+            dc_policy=dc_policy,
         )
     return OnlineModelWrapper(
         model=model,

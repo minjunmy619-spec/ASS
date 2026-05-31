@@ -13,18 +13,24 @@ import torch.nn as nn
 from spectral_feature_compression.core.model.frequency_preprocessing import (
     FrequencyPreprocessedOnlineModel,
     build_frequency_preprocessor,
+    build_pcen_preprocessor,
     resolve_preprocessed_n_freq,
 )
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
-from spectral_feature_compression.core.model.online_sfc_2d import RMSNorm2d, _runtime_assert
-from spectral_feature_compression.core.model.online_sfc_2d import _validate_npu_kernel_dilation_limit
-from spectral_feature_compression.core.model.online_sfc_2d import apply_packed_complex_mask
-from spectral_feature_compression.core.model.online_sfc_2d import pack_complex_stft_as_2d
-from spectral_feature_compression.core.model.online_sfc_2d import unpack_2d_to_complex_stft
-from spectral_feature_compression.core.model.online_soft_band_sfc_2d import CausalConv2d
-from spectral_feature_compression.core.model.online_soft_band_sfc_2d import SoftBandCompressor2d
-from spectral_feature_compression.core.model.online_soft_band_sfc_2d import SoftBandExpander2d
-from spectral_feature_compression.core.model.online_soft_band_sfc_2d import SoftBandSpec2d
+from spectral_feature_compression.core.model.online_sfc_2d import (
+    RMSNorm2d,
+    _runtime_assert,
+    _validate_npu_kernel_dilation_limit,
+    apply_packed_complex_mask,
+    pack_complex_stft_as_2d,
+    unpack_2d_to_complex_stft,
+)
+from spectral_feature_compression.core.model.online_soft_band_sfc_2d import (
+    CausalConv2d,
+    SoftBandCompressor2d,
+    SoftBandExpander2d,
+    SoftBandSpec2d,
+)
 
 
 class ConvGRUBandCell2d(nn.Module):
@@ -93,7 +99,9 @@ class ConvGRUBandCell2d(nn.Module):
 class ConvGRUSeparator2d(nn.Module):
     def __init__(self, channels: int, n_layers: int, band_kernel_size: int = 3):
         super().__init__()
-        self.layers = nn.ModuleList([ConvGRUBandCell2d(channels, band_kernel_size=band_kernel_size) for _ in range(n_layers)])
+        self.layers = nn.ModuleList(
+            [ConvGRUBandCell2d(channels, band_kernel_size=band_kernel_size) for _ in range(n_layers)]
+        )
         self.channels = channels
 
     def init_stream_state(
@@ -379,6 +387,16 @@ def build_online_soft_band_gru_sfc_system(
     freq_preprocess_keep_bins: int | None = None,
     freq_preprocess_target_bins: int | None = None,
     freq_preprocess_mode: str = "triangular",
+    dc_bypass_enabled: bool = False,
+    dc_policy: str = "zero",
+    pcen_preprocess_enabled: bool = False,
+    pcen_smooth_coef: float = 0.98,
+    pcen_alpha: float = 0.5,
+    pcen_delta: float = 2.0,
+    pcen_root: float = 0.5,
+    pcen_eps: float = 1e-6,
+    pcen_gain_floor: float = 0.05,
+    pcen_gain_ceiling: float = 20.0,
     scaling: bool = False,
     css_segment_size: int = 6,
     css_shift_size: int = 6,
@@ -390,18 +408,32 @@ def build_online_soft_band_gru_sfc_system(
         enabled=freq_preprocess_enabled,
         keep_bins=freq_preprocess_keep_bins,
         target_bins=freq_preprocess_target_bins,
+        dc_bypass_enabled=dc_bypass_enabled,
     )
+    core_n_fft = 2 * (core_n_freq - 1)
     freq_preprocessor = build_frequency_preprocessor(
         full_n_freq,
         enabled=freq_preprocess_enabled,
         keep_bins=freq_preprocess_keep_bins,
         target_bins=freq_preprocess_target_bins,
         mode=freq_preprocess_mode,
+        dc_bypass_enabled=dc_bypass_enabled,
+    )
+    pcen_preprocessor = build_pcen_preprocessor(
+        n_chan=n_chan,
+        enabled=pcen_preprocess_enabled,
+        smooth_coef=pcen_smooth_coef,
+        alpha=pcen_alpha,
+        delta=pcen_delta,
+        root=pcen_root,
+        eps=pcen_eps,
+        gain_floor=pcen_gain_floor,
+        gain_ceiling=pcen_gain_ceiling,
     )
     core = OnlineSoftBandGRUSFC2D(
         n_freq=core_n_freq,
         n_bands=n_bands,
-        n_fft=n_fft,
+        n_fft=core_n_fft,
         sample_rate=fs,
         band_config=band_config,
         n_src=n_src,
@@ -419,6 +451,9 @@ def build_online_soft_band_gru_sfc_system(
         n_src=n_src,
         n_chan=n_chan,
         freq_preprocessor=freq_preprocessor,
+        pcen_preprocessor=pcen_preprocessor,
+        dc_bypass_enabled=dc_bypass_enabled,
+        dc_policy=dc_policy,
     )
     return OnlineModelWrapper(
         model=model,

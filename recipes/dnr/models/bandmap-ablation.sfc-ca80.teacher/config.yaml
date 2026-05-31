@@ -1,0 +1,12 @@
+_base_: ../locoformer-small.enc-crossattn64dim.dec-crossattn64dim.musical64.learnable-query/config.yaml
+
+# Band mapping ablation: SFC-CA teacher with 80 mel bands.
+task:
+  model:
+    model:
+      encoder:
+        n_bands: 80
+        band_config: mel
+      decoder:
+        n_bands: 80
+        band_config: mel

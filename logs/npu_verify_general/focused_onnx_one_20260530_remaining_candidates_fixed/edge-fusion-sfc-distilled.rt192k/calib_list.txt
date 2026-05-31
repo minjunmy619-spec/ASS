@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/focused_onnx_one_20260530_remaining_candidates_fixed/edge-fusion-sfc-distilled.rt192k/calib_sample000_input00.npy

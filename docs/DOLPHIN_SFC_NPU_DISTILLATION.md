@@ -27,7 +27,8 @@ Both recipes:
 - use an SFC-Locoformer-Lite+ teacher builder by default;
 - enable teacher output loss, mixture consistency, low-frequency loss,
   silent-source penalty, complex RI loss, log-magnitude loss,
-  multi-resolution STFT loss, and transient loss;
+  multi-resolution STFT loss, transient loss, teacher spectral mask/logit
+  distillation, and source-activity-aware waveform loss;
 - use the same training augmentation stack as the BandSFC RT+ staged recipes;
 - use `fp512keep475` preprocessing for the DolphinSFCNPU core.
 
@@ -89,3 +90,13 @@ After training, compare against BandSFC RT+ under the same manifest fields:
 - ONE import / optimize / quantize / `circle-verify` status.
 - Listening notes for bass, speech leakage, effects leakage, musical noise, and
   chunk-boundary artifacts.
+
+## Export Status
+
+- `dolphin-sfc-npu.large-6m.fp512keep475` and
+  `dolphin-sfc-npu.slim-6m.distill.rt192k.fp512keep475` both pass ONNX export,
+  ONE import, ONE optimize, ONE quantize, and `circle-verify` in the focused
+  2026-05-30 validation run.
+- Both simplified ONNX graphs have `314` nodes and remaining conservative audit
+  flags `activation_matmul_rank_le3=2` and `transpose=7`.
+- Trained quality metrics are still missing.

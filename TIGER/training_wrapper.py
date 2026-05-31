@@ -7,17 +7,23 @@ the exportable streaming models.
 """
 from __future__ import annotations
 
-import math
-from contextlib import nullcontext
 from typing import Any
 
+from contextlib import nullcontext
+import math
+
 import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from spectral_feature_compression.core.model.frequency_preprocessing import (
+    HybridFrequencyProjector2d,
+    PCENGainNormalizer2d,
     build_frequency_preprocessor,
+    build_pcen_preprocessor,
+    resolve_frequency_input_n_freq,
     resolve_preprocessed_n_freq,
 )
 from spectral_feature_compression.core.model.online_sfc_2d import (
@@ -25,8 +31,8 @@ from spectral_feature_compression.core.model.online_sfc_2d import (
     unpack_2d_to_complex_stft,
 )
 
-from .streaming_io import build_causal_ri_sequence, invert_causal_ri_sequence
 from .npu_edge_utils import sanitize_for_npu_edge
+from .streaming_io import build_causal_ri_sequence, invert_causal_ri_sequence
 from .tiger_npu_edge import TIGERNPUEdgeV1
 from .tiger_npu_edge_v2 import TIGERNPUEdgeV2
 from .tiger_online import (
@@ -135,8 +141,8 @@ def _import_tiger_edge_mlp():
     ``TF-MLPNet/`` cannot be imported as a top-level Python module because of
     the hyphen, so we add the directory to ``sys.path`` on first use.
     """
-    import sys as _sys
     from pathlib import Path as _Path
+    import sys as _sys
 
     _tf_root = _Path(__file__).resolve().parent.parent / "TF-MLPNet"
     if _tf_root.is_dir() and str(_tf_root) not in _sys.path:
@@ -253,7 +259,10 @@ class TIGERWaveformSeparator(nn.Module):
         hop: int = 512,
         startup_packet: int = 256,
         analysis_window: str = "sqrt_hann",
-        freq_preprocessor: nn.Module | None = None,
+        freq_preprocessor: HybridFrequencyProjector2d | None = None,
+        pcen_preprocessor: PCENGainNormalizer2d | None = None,
+        dc_bypass_enabled: bool = False,
+        dc_policy: str = "zero",
         detach_state: bool = False,
         chunk_size: int = 8,
         css_segment_size: int = 12,
@@ -272,6 +281,17 @@ class TIGERWaveformSeparator(nn.Module):
         self.startup_packet = startup_packet
         self.detach_state = detach_state
         self.freq_preprocessor = freq_preprocessor
+        self.pcen_preprocessor = pcen_preprocessor
+        self.dc_bypass_enabled = bool(dc_bypass_enabled)
+        if dc_policy not in {"zero", "mixture_equal"}:
+            raise ValueError(f"Unsupported dc_policy={dc_policy!r}; expected 'zero' or 'mixture_equal'.")
+        self.dc_policy = dc_policy
+        self.input_n_freq = (win // 2) + 1
+        self.body_input_n_freq = resolve_frequency_input_n_freq(
+            self.input_n_freq,
+            dc_bypass_enabled=self.dc_bypass_enabled,
+        )
+        self.core_n_freq = freq_preprocessor.n_freq_out if freq_preprocessor is not None else self.body_input_n_freq
         self.chunk_size = chunk_size
         self.css_segment_size = css_segment_size
         self.css_shift_size = css_shift_size
@@ -344,19 +364,54 @@ class TIGERWaveformSeparator(nn.Module):
         flat = complex_stft.reshape(batch, n_src_out * n_chan_out, freq, frames)
         return torch.cat([flat.real, flat.imag], dim=2)
 
-    def _preprocess_ri_sequence(self, x_ri: torch.Tensor) -> torch.Tensor:
-        if self.freq_preprocessor is None:
-            return x_ri
-        x2d = self._ri_sequence_to_2d(x_ri)
-        reduced = self.freq_preprocessor.analysis(x2d)
-        return self._two_d_to_ri_sequence(reduced, n_src=1, n_chan=self.n_chan)
+    def _split_dc_2d(self, x2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not self.dc_bypass_enabled:
+            return x2d, None
+        if x2d.shape[-1] != self.input_n_freq:
+            raise ValueError(f"Expected {self.input_n_freq} TIGER input bins with DC bypass, got {x2d.shape[-1]}")
+        return x2d[..., 1:], x2d[..., :1]
 
-    def _postprocess_ri_sequence(self, y_ri: torch.Tensor) -> torch.Tensor:
-        if self.freq_preprocessor is None:
-            return y_ri
+    def _restore_dc_2d(self, y2d: torch.Tensor, dc2d: torch.Tensor | None) -> torch.Tensor:
+        if not self.dc_bypass_enabled:
+            return y2d
+        if dc2d is None:
+            raise ValueError("dc2d must be provided when TIGER DC bypass is enabled.")
+        batch, channels, frames, _ = y2d.shape
+        expected_channels = 2 * self.n_src * self.n_chan
+        if channels != expected_channels:
+            raise ValueError(f"Expected {expected_channels} TIGER output channels, got {channels}")
+
+        if self.dc_policy == "zero":
+            dc_out = y2d.new_zeros(batch, channels, frames, 1)
+        else:
+            dc = dc2d.reshape(batch, self.n_chan, 2, frames, 1)
+            dc = dc.unsqueeze(1).expand(batch, self.n_src, self.n_chan, 2, frames, 1)
+            dc_out = dc.reshape(batch, channels, frames, 1) / float(self.n_src)
+        return torch.cat([dc_out, y2d], dim=-1)
+
+    def _preprocess_ri_sequence(self, x_ri: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor | None]]:
+        x2d = self._ri_sequence_to_2d(x_ri)
+        x2d, dc2d = self._split_dc_2d(x2d)
+        if self.freq_preprocessor is not None:
+            x2d = self.freq_preprocessor.analysis(x2d)
+        gain = None
+        if self.pcen_preprocessor is not None:
+            x2d, gain, _state = self.pcen_preprocessor.forward_with_gain(x2d)
+        return self._two_d_to_ri_sequence(x2d, n_src=1, n_chan=self.n_chan), {"dc2d": dc2d, "gain": gain}
+
+    def _postprocess_ri_sequence(
+        self,
+        y_ri: torch.Tensor,
+        context: dict[str, torch.Tensor | None],
+    ) -> torch.Tensor:
         y2d = self._ri_sequence_to_2d(y_ri)
-        full = self.freq_preprocessor.synthesis(y2d)
-        return self._two_d_to_ri_sequence(full, n_src=self.n_src, n_chan=self.n_chan)
+        gain = context.get("gain")
+        if self.pcen_preprocessor is not None and gain is not None:
+            y2d = self.pcen_preprocessor.invert_output_gain(y2d, gain, n_src=self.n_src)
+        if self.freq_preprocessor is not None:
+            y2d = self.freq_preprocessor.synthesis(y2d)
+        y2d = self._restore_dc_2d(y2d, context.get("dc2d"))
+        return self._two_d_to_ri_sequence(y2d, n_src=self.n_src, n_chan=self.n_chan)
 
     def forward(self, wav: torch.Tensor, **kwargs) -> torch.Tensor:
         if wav.dim() == 2:
@@ -374,14 +429,14 @@ class TIGERWaveformSeparator(nn.Module):
                 startup_packet=self.startup_packet,
                 analysis_window=window,
             )
-        subband_ri_core = self._preprocess_ri_sequence(subband_ri)
+        subband_ri_core, preprocess_context = self._preprocess_ri_sequence(subband_ri)
         mask_logits = self.core.forward_sequence(
             subband_ri_core,
             detach_state=self.detach_state,
             chunk_size=self.chunk_size,
         )[0]
         est_ri = self._apply_masks(mask_logits, subband_ri_core)
-        est_ri = self._postprocess_ri_sequence(est_ri)
+        est_ri = self._postprocess_ri_sequence(est_ri, preprocess_context)
         with self._no_autocast(est_ri):
             est_wav = invert_causal_ri_sequence(
                 est_ri.float(),
@@ -448,6 +503,26 @@ class TIGERWaveformSeparator(nn.Module):
             waves = torch.cat([waves, tail], dim=-1)
         return waves[..., :speech_length]
 
+    def frequency_preprocess_manifest(self) -> dict[str, object] | None:
+        if self.freq_preprocessor is None:
+            return None
+        return self.freq_preprocessor.manifest()
+
+    def pcen_preprocess_manifest(self) -> dict[str, object] | None:
+        if self.pcen_preprocessor is None:
+            return None
+        return self.pcen_preprocessor.manifest()
+
+    def dc_bypass_manifest(self) -> dict[str, object] | None:
+        if not self.dc_bypass_enabled:
+            return None
+        return {
+            "enabled": True,
+            "policy": self.dc_policy,
+            "input_n_freq": self.input_n_freq,
+            "body_input_n_freq": self.body_input_n_freq,
+        }
+
 
 def build_tiger_system(
     *,
@@ -467,6 +542,16 @@ def build_tiger_system(
     freq_preprocess_keep_bins: int | None = None,
     freq_preprocess_target_bins: int | None = None,
     freq_preprocess_mode: str = "triangular",
+    dc_bypass_enabled: bool = False,
+    dc_policy: str = "zero",
+    pcen_preprocess_enabled: bool = False,
+    pcen_smooth_coef: float = 0.98,
+    pcen_alpha: float = 0.5,
+    pcen_delta: float = 2.0,
+    pcen_root: float = 0.5,
+    pcen_eps: float = 1e-6,
+    pcen_gain_floor: float = 0.05,
+    pcen_gain_ceiling: float = 20.0,
     css_segment_size: int = 12,
     css_shift_size: int = 6,
     css_batch_size: int = 1,
@@ -479,6 +564,7 @@ def build_tiger_system(
         enabled=freq_preprocess_enabled,
         keep_bins=freq_preprocess_keep_bins,
         target_bins=freq_preprocess_target_bins,
+        dc_bypass_enabled=dc_bypass_enabled,
     )
     core_n_fft = 2 * (core_n_freq - 1)
     freq_preprocessor = build_frequency_preprocessor(
@@ -487,6 +573,18 @@ def build_tiger_system(
         keep_bins=freq_preprocess_keep_bins,
         target_bins=freq_preprocess_target_bins,
         mode=freq_preprocess_mode,
+        dc_bypass_enabled=dc_bypass_enabled,
+    )
+    pcen_preprocessor = build_pcen_preprocessor(
+        n_chan=n_chan,
+        enabled=pcen_preprocess_enabled,
+        smooth_coef=pcen_smooth_coef,
+        alpha=pcen_alpha,
+        delta=pcen_delta,
+        root=pcen_root,
+        eps=pcen_eps,
+        gain_floor=pcen_gain_floor,
+        gain_ceiling=pcen_gain_ceiling,
     )
     core = build_tiger_core(
         variant=variant,
@@ -505,6 +603,9 @@ def build_tiger_system(
         startup_packet=startup_packet,
         analysis_window=analysis_window,
         freq_preprocessor=freq_preprocessor,
+        pcen_preprocessor=pcen_preprocessor,
+        dc_bypass_enabled=dc_bypass_enabled,
+        dc_policy=dc_policy,
         detach_state=detach_state,
         chunk_size=chunk_size,
         css_segment_size=css_segment_size,

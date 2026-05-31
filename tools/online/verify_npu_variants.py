@@ -1,22 +1,23 @@
 from __future__ import annotations
 
+from typing import Any
+
 import argparse
+from dataclasses import dataclass
+from datetime import datetime
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Any
 
 import numpy as np
-import onnx
-import torch
-from onnx import numpy_helper
-from onnx import TensorProto, helper
 
+import torch
+
+import onnx
+from onnx import TensorProto, helper
 
 ROOT = Path("/home/cmj/works/ASS")
 ONE_CMDS = Path("/home/cmj/works/ONE/build/compiler/one-cmds")
@@ -91,10 +92,30 @@ def first_error_stage(log_text: str) -> str:
     return "unknown"
 
 
+def get_concrete_base_path(path: Path) -> Path | None:
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line or raw_line.startswith(" ") or raw_line.startswith("\t"):
+            continue
+        if ":" not in raw_line:
+            continue
+        key, value = raw_line.split(":", 1)
+        if key.strip() != "_base_":
+            continue
+        base_value = value.strip().strip('"\'')
+        if base_value and "${" not in base_value:
+            base_path = (path.parent / base_value).resolve()
+            return base_path if base_path.exists() else None
+        return None
+    return None
+
+
 def infer_n_chan(recipe_cfg: Path) -> int:
     text = recipe_cfg.read_text(encoding="utf-8")
     m = re.search(r"(?m)^\s*n_chan:\s*(\d+)\s*$", text)
-    return int(m.group(1)) if m else 2
+    if m:
+        return int(m.group(1))
+    base_path = get_concrete_base_path(recipe_cfg)
+    return infer_n_chan(base_path) if base_path is not None else 2
 
 
 def discover_recipe_variants(recipe_root: Path, name_contains: str | None = None) -> list[Variant]:
@@ -168,7 +189,9 @@ def export_recipe_variant(
         f'--disable-masking --deploy-manifest-out "{manifest_path}"'
     )
     rc, out = sh(export_cmd, env=env)
-    mismatch = "expected input[1, 4" in out and "to have 2 channels" in out
+    mismatch = ("expected input[1, 4" in out and "to have 2 channels" in out) or (
+        "expected 2 packed channels, got 4" in out
+    ) or "Export n_chan mismatch" in out
     if rc != 0 and mismatch and n_chan != 1:
         retry_cmd = (
             f'"{py}" "{export_script}" "{variant.recipe_cfg}" '
@@ -612,7 +635,7 @@ def write_onecc_cfg(
             "[one-optimize]",
             f"input_path={circle_path}",
             f"output_path={opt_path}",
-            "replace_non_const_fc_with_batch_matmul=False",
+            "replace_non_const_fc_with_batch_matmul=True",
             "convert_nchw_to_nhwc=True",
             "",
             "[one-quantize]",

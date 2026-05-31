@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/focused_onnx_one_20260530/band-sfc-net-npu.rt-plus.rt192k.fp512/calib_sample000_input00.npy

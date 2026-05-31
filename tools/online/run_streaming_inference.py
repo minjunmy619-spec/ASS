@@ -2,27 +2,32 @@
 
 from __future__ import annotations
 
-import importlib
-import json
-import re
 from argparse import ArgumentParser
 from contextlib import nullcontext
+import importlib
+import json
 from pathlib import Path
+import re
 import sys
-from typing import Iterable
 
 from einops import rearrange
-import numpy as np
-import soundfile as sf
+
 import torch
 import torch.nn.functional as F
+
+import soundfile as sf
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+AIACCEL_ROOT = REPO_ROOT / "aiaccel"
+if str(AIACCEL_ROOT) not in sys.path:
+    sys.path.insert(0, str(AIACCEL_ROOT))
 
-from spectral_feature_compression.core.model.online_sfc_2d import pack_complex_stft_as_2d, unpack_2d_to_complex_stft
-
+from spectral_feature_compression.core.model.online_sfc_2d import (  # noqa: E402
+    pack_complex_stft_as_2d,
+    unpack_2d_to_complex_stft,
+)
 
 INTERPOLATION_RE = re.compile(r"^\$\{([^}]+)\}$")
 
@@ -149,6 +154,24 @@ def resolve_value(value, context: dict[str, object], *, stack: tuple[str, ...] =
 
 
 def build_model_system_from_recipe_config(config_path: Path):
+    try:
+        from hydra.utils import instantiate
+
+        from aiaccel.config import load_config, resolve_inherit
+
+        config = load_config(
+            config_path,
+            {
+                "config_path": str(config_path),
+                "working_directory": str(config_path.parent.resolve()),
+                "base_config_path": str(REPO_ROOT / "aiaccel" / "aiaccel" / "torch" / "apps" / "config"),
+            },
+        )
+        config = resolve_inherit(config)
+        return instantiate(config.task.model)
+    except Exception:
+        pass
+
     top_level = merge_top_level_scalars(config_path)
     model_cfg = merge_task_model_mapping(config_path)
     if "_target_" not in model_cfg:
@@ -169,8 +192,9 @@ def build_model_system_from_recipe_config(config_path: Path):
 
 
 def load_trained_task(model_path: Path, device: str):
-    from aiaccel.config import load_config
     from hydra.utils import instantiate
+
+    from aiaccel.config import load_config
 
     if model_path.is_dir():
         checkpoint_path = model_path / "checkpoints"
@@ -368,7 +392,9 @@ class StreamingISTFTWriter:
 
         frames = torch.fft.irfft(flat.to(torch.complex64), n=self.n_fft, dim=1)
         frames = frames.to(torch.float32) * self.window.view(1, self.n_fft, 1).to(flat.device)
-        window_sq_cols = self.window_sq.view(1, self.n_fft, 1).expand(flat.shape[0], self.n_fft, n_frames).to(flat.device)
+        window_sq_cols = (
+            self.window_sq.view(1, self.n_fft, 1).expand(flat.shape[0], self.n_fft, n_frames).to(flat.device)
+        )
         signal, envelope = self._fold_chunk(frames, window_sq_cols)
 
         if self.tail > 0:
@@ -443,6 +469,15 @@ def write_run_manifest(
     freq_preprocess = None
     if hasattr(online_model, "frequency_preprocess_manifest"):
         freq_preprocess = online_model.frequency_preprocess_manifest()
+    pcen_preprocess = None
+    if hasattr(online_model, "pcen_preprocess_manifest"):
+        pcen_preprocess = online_model.pcen_preprocess_manifest()
+    dc_bypass = None
+    if hasattr(online_model, "dc_bypass_manifest"):
+        dc_bypass = online_model.dc_bypass_manifest()
+    residual_source = None
+    if hasattr(online_model, "residual_source_manifest"):
+        residual_source = online_model.residual_source_manifest()
 
     manifest = {
         "model_path": str(model_path),
@@ -457,10 +492,13 @@ def write_run_manifest(
         "left_pad_samples": int(wrapper.wave_context_samples),
         "right_pad_samples": int(wrapper.wave_tail_pad_samples),
         "n_src": len(stem_names),
-        "n_chan": int(getattr(online_model, "n_chan")),
+        "n_chan": int(online_model.n_chan),
         "stem_names": stem_names,
         "stream_context_frames": int(online_model.stream_context_frames()),
         "frequency_preprocessing": freq_preprocess,
+        "pcen_preprocessing": pcen_preprocess,
+        "dc_bypass": dc_bypass,
+        "residual_source": residual_source,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -492,7 +530,7 @@ def run_streaming_file(
     wav = rearrange(torch.from_numpy(wav_np), "t m -> 1 m t").to(device=device, dtype=torch.float32)
     online_model = wrapper.model
     n_src = len(stem_names)
-    n_chan = int(getattr(online_model, "n_chan"))
+    n_chan = int(online_model.n_chan)
     if wav.shape[1] != n_chan:
         raise ValueError(f"{src_file} has {wav.shape[1]} channels, but model expects {n_chan}")
 
@@ -542,7 +580,15 @@ def run_streaming_file(
                 writer.push(y, final=True)
             else:
                 writer.push(
-                    torch.zeros(1, n_src, n_chan, wrapper.istft.n_fft // 2 + 1, 0, device=device, dtype=torch.complex64),
+                    torch.zeros(
+                        1,
+                        n_src,
+                        n_chan,
+                        wrapper.istft.n_fft // 2 + 1,
+                        0,
+                        device=device,
+                        dtype=torch.complex64,
+                    ),
                     final=True,
                 )
     finally:
@@ -590,9 +636,9 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    wrapper, top_level, source_mode = load_streaming_model(args.model_path, args.device)
+    wrapper, _top_level, source_mode = load_streaming_model(args.model_path, args.device)
     online_model = wrapper.model
-    n_src = int(getattr(online_model, "n_src"))
+    n_src = int(online_model.n_src)
     stem_names = args.stem_name or default_stem_names(n_src)
     if len(stem_names) != n_src:
         raise ValueError(f"Expected {n_src} stem names, got {len(stem_names)}")
@@ -629,12 +675,39 @@ def main() -> None:
     print(f"sample_rate: {wrapper.fs}")
     print(f"n_fft/hop: {wrapper.istft.n_fft}/{wrapper.hop_length}")
     print(f"stems: {stem_names}")
-    if top_level.get("online_freq_preprocess_enabled", False):
+    freq_manifest = (
+        online_model.frequency_preprocess_manifest()
+        if hasattr(online_model, "frequency_preprocess_manifest")
+        else None
+    )
+    pcen_manifest = (
+        online_model.pcen_preprocess_manifest()
+        if hasattr(online_model, "pcen_preprocess_manifest")
+        else None
+    )
+    dc_manifest = online_model.dc_bypass_manifest() if hasattr(online_model, "dc_bypass_manifest") else None
+    residual_manifest = (
+        online_model.residual_source_manifest()
+        if hasattr(online_model, "residual_source_manifest")
+        else None
+    )
+    if freq_manifest is not None:
         print(
             "frequency_preprocess: "
-            f"keep={top_level.get('online_freq_preprocess_keep_bins')} "
-            f"target={top_level.get('online_freq_preprocess_target_bins')} "
-            f"mode={top_level.get('online_freq_preprocess_mode', 'triangular')}"
+            f"keep={freq_manifest.get('keep_bins')} "
+            f"target={freq_manifest.get('n_freq_out')} "
+            f"mode={freq_manifest.get('mode')}"
+        )
+    if pcen_manifest is not None:
+        print(f"pcen_preprocess: smooth={pcen_manifest.get('smooth_coef')} alpha={pcen_manifest.get('alpha')}")
+    if dc_manifest is not None:
+        print(f"dc_bypass: policy={dc_manifest.get('policy')} body_bins={dc_manifest.get('body_input_n_freq')}")
+    if residual_manifest is not None:
+        print(
+            "residual_source: "
+            f"explicit={residual_manifest.get('explicit_n_src')} "
+            f"output={residual_manifest.get('output_n_src')} "
+            f"index={residual_manifest.get('residual_source_index')}"
         )
     print("=" * 48)
 

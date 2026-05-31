@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from spectral_feature_compression.core.model.frequency_preprocessing import (
     FrequencyPreprocessedOnlineModel,
     build_frequency_preprocessor,
+    build_pcen_preprocessor,
     resolve_preprocessed_n_freq,
 )
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
@@ -103,7 +104,11 @@ class SoftBandQueryCompressor2d(nn.Module):
             raise RuntimeError("Streaming state is only supported when causal=True.")
         return self.dw.init_stream_state(batch_size, freq_bins=freq_bins, device=device, dtype=dtype)
 
-    def forward_stream(self, x: torch.Tensor, state: torch.Tensor | None) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    def forward_stream(
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor | None,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         if not isinstance(self.dw, CausalConv2d):
             raise RuntimeError("forward_stream is only supported when causal=True.")
 
@@ -321,13 +326,23 @@ class OnlineSoftBandQuerySFC2D(nn.Module):
         )
 
     def layer_cache_numel(self, batch_size: int = 1) -> int:
-        states = self.init_stream_state(batch_size=batch_size, device=self.out_proj.weight.device, dtype=self.out_proj.weight.dtype)
+        states = self.init_stream_state(
+            batch_size=batch_size,
+            device=self.out_proj.weight.device,
+            dtype=self.out_proj.weight.dtype,
+        )
         return sum(int(s.numel()) for s in states)
 
     def input_history_numel(self, batch_size: int = 1) -> int:
         return batch_size * 2 * self.n_chan * self.stream_context_frames() * self.n_freq
 
-    def state_size_bytes(self, *, batch_size: int = 1, dtype: torch.dtype = torch.float16, mode: str = "layer_cache") -> int:
+    def state_size_bytes(
+        self,
+        *,
+        batch_size: int = 1,
+        dtype: torch.dtype = torch.float16,
+        mode: str = "layer_cache",
+    ) -> int:
         element_size = torch.tensor([], dtype=dtype).element_size()
         if mode == "layer_cache":
             return self.layer_cache_numel(batch_size=batch_size) * element_size
@@ -413,6 +428,16 @@ def build_online_soft_band_query_sfc_system(
     freq_preprocess_keep_bins: int | None = None,
     freq_preprocess_target_bins: int | None = None,
     freq_preprocess_mode: str = "triangular",
+    dc_bypass_enabled: bool = False,
+    dc_policy: str = "zero",
+    pcen_preprocess_enabled: bool = False,
+    pcen_smooth_coef: float = 0.98,
+    pcen_alpha: float = 0.5,
+    pcen_delta: float = 2.0,
+    pcen_root: float = 0.5,
+    pcen_eps: float = 1e-6,
+    pcen_gain_floor: float = 0.05,
+    pcen_gain_ceiling: float = 20.0,
     scaling: bool = False,
     css_segment_size: int = 6,
     css_shift_size: int = 6,
@@ -424,18 +449,32 @@ def build_online_soft_band_query_sfc_system(
         enabled=freq_preprocess_enabled,
         keep_bins=freq_preprocess_keep_bins,
         target_bins=freq_preprocess_target_bins,
+        dc_bypass_enabled=dc_bypass_enabled,
     )
+    core_n_fft = 2 * (core_n_freq - 1)
     freq_preprocessor = build_frequency_preprocessor(
         full_n_freq,
         enabled=freq_preprocess_enabled,
         keep_bins=freq_preprocess_keep_bins,
         target_bins=freq_preprocess_target_bins,
         mode=freq_preprocess_mode,
+        dc_bypass_enabled=dc_bypass_enabled,
+    )
+    pcen_preprocessor = build_pcen_preprocessor(
+        n_chan=n_chan,
+        enabled=pcen_preprocess_enabled,
+        smooth_coef=pcen_smooth_coef,
+        alpha=pcen_alpha,
+        delta=pcen_delta,
+        root=pcen_root,
+        eps=pcen_eps,
+        gain_floor=pcen_gain_floor,
+        gain_ceiling=pcen_gain_ceiling,
     )
     core = OnlineSoftBandQuerySFC2D(
         n_freq=core_n_freq,
         n_bands=n_bands,
-        n_fft=n_fft,
+        n_fft=core_n_fft,
         sample_rate=fs,
         band_config=band_config,
         n_src=n_src,
@@ -452,6 +491,9 @@ def build_online_soft_band_query_sfc_system(
         n_src=n_src,
         n_chan=n_chan,
         freq_preprocessor=freq_preprocessor,
+        pcen_preprocessor=pcen_preprocessor,
+        dc_bypass_enabled=dc_bypass_enabled,
+        dc_policy=dc_policy,
     )
     return OnlineModelWrapper(
         model=model,

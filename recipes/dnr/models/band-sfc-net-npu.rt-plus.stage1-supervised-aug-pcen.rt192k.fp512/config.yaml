@@ -1,0 +1,15 @@
+_base_: ../band-sfc-net-npu.rt-plus.stage1-supervised-aug.rt192k.fp512/config.yaml
+
+# Opt-in PCEN-style wrapper preprocessing ablation.  The exported packed core is
+# unchanged by default; the wrapper normalizes the complex input before the core
+# and inverts that gain on the output so masks remain tied to the original mix.
+task:
+  model:
+    pcen_preprocess_enabled: true
+    pcen_smooth_coef: 0.98
+    pcen_alpha: 0.5
+    pcen_delta: 2.0
+    pcen_root: 0.5
+    pcen_eps: 1.0e-6
+    pcen_gain_floor: 0.05
+    pcen_gain_ceiling: 20.0

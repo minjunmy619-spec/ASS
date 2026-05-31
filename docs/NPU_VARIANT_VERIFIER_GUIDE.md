@@ -27,6 +27,11 @@ For each variant, the verifier runs:
 
 A variant is only `PASS` if all required artifacts exist.
 
+Wrapper-side preprocessing or postprocessing is not folded into the exported NPU
+core.  For example, PCEN, DC-bypass, and 2-mask residual-SFX reconstruction are
+recorded in deploy manifests, while the verifier compiles the packed core graph
+that the NPU will run.
+
 ---
 
 ## 2) Supported Variant Sources

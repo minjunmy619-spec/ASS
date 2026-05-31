@@ -1,0 +1,5 @@
+_base_: ../online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml
+
+# Band mapping ablation: fixed linear 80-band soft SFC routing.
+online_n_bands: 80
+online_band_config: fixed

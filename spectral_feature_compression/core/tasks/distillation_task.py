@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from typing import Any
+
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 import sys
 
@@ -56,6 +58,59 @@ def _load_model_checkpoint(
     raise last_error
 
 
+def _first_tensor(value: Any) -> torch.Tensor | None:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, Mapping):
+        for item in value.values():
+            found = _first_tensor(item)
+            if found is not None:
+                return found
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            found = _first_tensor(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _split_model_output(output: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+    if isinstance(output, torch.Tensor):
+        return output, {}
+
+    if isinstance(output, Mapping):
+        aux = dict(output)
+        est = None
+        for key in ("estimate", "est", "waveform", "wav", "sources", "output", "y"):
+            value = output.get(key)
+            if isinstance(value, torch.Tensor):
+                est = value
+                aux.pop(key, None)
+                break
+        if est is None:
+            est = _first_tensor(output)
+        nested_aux = aux.pop("aux", None)
+        if isinstance(nested_aux, Mapping):
+            aux.update(nested_aux)
+        if est is None:
+            raise TypeError("Could not find tensor estimate in mapping model output")
+        return est, aux
+
+    if isinstance(output, (tuple, list)) and output:
+        est = _first_tensor(output[0])
+        if est is None:
+            raise TypeError("First tuple/list model output does not contain a tensor estimate")
+        aux: dict[str, Any] = {}
+        for idx, item in enumerate(output[1:], start=1):
+            if isinstance(item, Mapping):
+                aux.update(item)
+            else:
+                aux[f"aux_{idx}"] = item
+        return est, aux
+
+    raise TypeError(f"Unsupported model output type: {type(output).__name__}")
+
+
 class TeacherStudentDistillationTask(SupTask):
     """Supervised separation task with opt-in teacher distillation terms.
 
@@ -83,11 +138,25 @@ class TeacherStudentDistillationTask(SupTask):
         low_frequency_hz: float = 300.0,
         silent_source_weight: float = 0.0,
         silent_source_db: float = -60.0,
+        source_activity_loss_weight: float = 0.0,
+        source_activity_db: float = -50.0,
+        source_activity_active_weight: float = 1.0,
+        source_activity_inactive_weight: float = 0.25,
         complex_ri_weight: float = 0.0,
         log_magnitude_weight: float = 0.0,
         multi_resolution_stft_weight: float = 0.0,
         multi_resolution_stft_resolutions: Sequence[Sequence[int]] | None = None,
         transient_weight: float = 0.0,
+        teacher_mask_loss_weight: float = 0.0,
+        teacher_logit_loss_weight: float = 0.0,
+        mask_loss_eps: float = 1.0e-4,
+        mask_loss_max: float = 4.0,
+        latent_distillation_weight: float = 0.0,
+        latent_distillation_loss: str = "l2",
+        student_latent_modules: Sequence[str] | None = None,
+        teacher_latent_modules: Sequence[str] | None = None,
+        latent_allow_missing: bool = False,
+        latent_allow_shape_mismatch: bool = False,
         pretrained_model_path: str | None = None,
         css_validation: bool = False,
         teacher_css_validation: bool = False,
@@ -107,8 +176,12 @@ class TeacherStudentDistillationTask(SupTask):
         )
         if require_teacher_checkpoint and teacher_checkpoint_path is None:
             raise ValueError("require_teacher_checkpoint=True but teacher_checkpoint_path is not set")
-        if teacher_loss_weight > 0.0 and teacher_model is None:
-            raise ValueError("teacher_loss_weight requires teacher_model")
+        teacher_required_weight = teacher_loss_weight + teacher_mask_loss_weight + teacher_logit_loss_weight
+        teacher_required_weight += latent_distillation_weight
+        if teacher_required_weight > 0.0 and teacher_model is None:
+            raise ValueError("teacher distillation weights require teacher_model")
+        if latent_distillation_loss not in {"l1", "l2"}:
+            raise ValueError("latent_distillation_loss must be 'l1' or 'l2'")
 
         self.fs = fs
         self.n_fft = n_fft
@@ -120,7 +193,24 @@ class TeacherStudentDistillationTask(SupTask):
         self.low_frequency_hz = low_frequency_hz
         self.silent_source_weight = silent_source_weight
         self.silent_source_db = silent_source_db
+        self.source_activity_loss_weight = source_activity_loss_weight
+        self.source_activity_db = source_activity_db
+        self.source_activity_active_weight = source_activity_active_weight
+        self.source_activity_inactive_weight = source_activity_inactive_weight
+        self.teacher_mask_loss_weight = teacher_mask_loss_weight
+        self.teacher_logit_loss_weight = teacher_logit_loss_weight
+        self.mask_loss_eps = mask_loss_eps
+        self.mask_loss_max = mask_loss_max
+        self.latent_distillation_weight = latent_distillation_weight
+        self.latent_distillation_loss = latent_distillation_loss
+        self.student_latent_module_names = tuple(student_latent_modules or ())
+        self.teacher_latent_module_names = tuple(teacher_latent_modules or self.student_latent_module_names)
+        self.latent_allow_missing = latent_allow_missing
+        self.latent_allow_shape_mismatch = latent_allow_shape_mismatch
         self.teacher_css_validation = teacher_css_validation
+        self._student_latents: dict[str, torch.Tensor] = {}
+        self._teacher_latents: dict[str, torch.Tensor] = {}
+        self._latent_hook_handles: list[Any] = []
         self.composite_loss = CompositeSeparationSpectralLoss(
             n_fft=n_fft,
             hop_length=hop_length,
@@ -138,14 +228,83 @@ class TeacherStudentDistillationTask(SupTask):
             for parameter in self.teacher_model.parameters():
                 parameter.requires_grad_(False)
 
-    def _teacher_forward(self, wav: torch.Tensor, ref: torch.Tensor | None, log_prefix: str) -> torch.Tensor:
+        self._register_latent_hooks()
+
+    def _register_latent_hooks(self) -> None:
+        if self.latent_distillation_weight <= 0.0:
+            return
+        if not self.student_latent_module_names:
+            return
+        self._latent_hook_handles.extend(
+            self._register_hooks_for(self.model, self.student_latent_module_names, self._student_latents, "student")
+        )
+        if self.teacher_model is not None:
+            self._latent_hook_handles.extend(
+                self._register_hooks_for(
+                    self.teacher_model,
+                    self.teacher_latent_module_names,
+                    self._teacher_latents,
+                    "teacher",
+                )
+            )
+
+    def _register_hooks_for(
+        self,
+        root: nn.Module,
+        module_names: Sequence[str],
+        store: dict[str, torch.Tensor],
+        role: str,
+    ) -> list[Any]:
+        modules = dict(root.named_modules())
+        handles = []
+        for name in module_names:
+            if name not in modules:
+                if self.latent_allow_missing:
+                    continue
+                raise ValueError(f"{role} latent module not found: {name}")
+
+            def hook(_module, _inputs, output, *, capture_name=name):
+                tensor = _first_tensor(output)
+                if tensor is not None:
+                    store[capture_name] = tensor
+
+            handles.append(modules[name].register_forward_hook(hook))
+        return handles
+
+    def _forward_model(
+        self,
+        model: nn.Module,
+        wav: torch.Tensor,
+        ref: torch.Tensor | None,
+        log_prefix: str,
+        *,
+        css_validation: bool,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        output = model.css(wav, ref=ref) if log_prefix != "training" and css_validation else model(wav)
+        return _split_model_output(output)
+
+    def _teacher_forward(
+        self,
+        wav: torch.Tensor,
+        ref: torch.Tensor | None,
+        log_prefix: str,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.teacher_model is None:
             raise RuntimeError("teacher_model is not configured")
         self.teacher_model.eval()
+        self._teacher_latents.clear()
         with torch.no_grad():
-            if log_prefix != "training" and self.teacher_css_validation:
-                return self.teacher_model.css(wav, ref=ref)
-            return self.teacher_model(wav)
+            est, aux = self._forward_model(
+                self.teacher_model,
+                wav,
+                ref,
+                log_prefix,
+                css_validation=self.teacher_css_validation,
+            )
+        if self._teacher_latents:
+            aux = dict(aux)
+            aux["latents"] = dict(self._teacher_latents)
+        return est, aux
 
     def _low_frequency_l1(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         if self.fs is None:
@@ -164,9 +323,119 @@ class TeacherStudentDistillationTask(SupTask):
             return est.new_zeros(())
         return est_power[inactive].mean()
 
+    def _source_activity_l1(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        per_source_l1 = (est - ref).abs().mean(dim=(-1, -2))
+        ref_power = ref.float().square().mean(dim=(-1, -2))
+        active = ref_power > 10 ** (self.source_activity_db / 10.0)
+        active_weight = per_source_l1.new_tensor(self.source_activity_active_weight)
+        inactive_weight = per_source_l1.new_tensor(self.source_activity_inactive_weight)
+        weights = torch.where(active, active_weight, inactive_weight)
+        return (per_source_l1 * weights).sum() / weights.sum().clamp_min(1.0)
+
+    def _spectral_mask(self, est: torch.Tensor, wav: torch.Tensor) -> torch.Tensor:
+        est_spec = self.stft(est.float()).abs()
+        mix_spec = self.stft(wav.float()).abs().unsqueeze(1)
+        mask = est_spec / mix_spec.clamp_min(self.mask_loss_eps)
+        return mask.clamp(0.0, self.mask_loss_max)
+
+    def _aux_tensor(self, aux: Mapping[str, Any], keys: Sequence[str]) -> torch.Tensor | None:
+        for key in keys:
+            value = aux.get(key)
+            tensor = _first_tensor(value)
+            if tensor is not None:
+                return tensor
+        return None
+
+    def _mask_or_logit_loss(
+        self,
+        est: torch.Tensor,
+        teacher_est: torch.Tensor,
+        wav: torch.Tensor,
+        student_aux: Mapping[str, Any],
+        teacher_aux: Mapping[str, Any],
+        *,
+        logit: bool,
+    ) -> torch.Tensor:
+        if logit:
+            student_value = self._aux_tensor(student_aux, ("mask_logits", "logits"))
+            teacher_value = self._aux_tensor(teacher_aux, ("mask_logits", "logits"))
+            if student_value is None or teacher_value is None:
+                student_mask = self._spectral_mask(est, wav).clamp(self.mask_loss_eps, 1.0 - self.mask_loss_eps)
+                teacher_mask = self._spectral_mask(teacher_est, wav).clamp(self.mask_loss_eps, 1.0 - self.mask_loss_eps)
+                student_value = torch.logit(student_mask)
+                teacher_value = torch.logit(teacher_mask)
+        else:
+            student_value = self._aux_tensor(student_aux, ("mask", "masks"))
+            teacher_value = self._aux_tensor(teacher_aux, ("mask", "masks"))
+            if student_value is None or teacher_value is None:
+                student_value = self._spectral_mask(est, wav)
+                teacher_value = self._spectral_mask(teacher_est, wav)
+        if student_value.shape != teacher_value.shape:
+            raise ValueError(f"mask/logit distillation shape mismatch: {student_value.shape} vs {teacher_value.shape}")
+        return F.l1_loss(student_value.float(), teacher_value.detach().float())
+
+    def _latent_dict(self, aux: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+        raw = aux.get("latents")
+        if isinstance(raw, Mapping):
+            return {str(key): value for key, value in raw.items() if isinstance(value, torch.Tensor)}
+        out = {}
+        for key in ("latent", "features", "feature"):
+            tensor = _first_tensor(aux.get(key))
+            if tensor is not None:
+                out[key] = tensor
+        return out
+
+    def _latent_distillation_loss(self, student_aux: Mapping[str, Any], teacher_aux: Mapping[str, Any]) -> torch.Tensor:
+        student_latents = self._latent_dict(student_aux)
+        teacher_latents = self._latent_dict(teacher_aux)
+        if self.student_latent_module_names:
+            pairs = tuple(zip(self.student_latent_module_names, self.teacher_latent_module_names, strict=False))
+        else:
+            common = sorted(set(student_latents) & set(teacher_latents))
+            pairs = tuple((name, name) for name in common)
+
+        losses = []
+        for student_name, teacher_name in pairs:
+            student_value = student_latents.get(student_name)
+            teacher_value = teacher_latents.get(teacher_name)
+            if student_value is None or teacher_value is None:
+                if self.latent_allow_missing:
+                    continue
+                raise ValueError(f"Missing latent pair: student={student_name}, teacher={teacher_name}")
+            if student_value.shape != teacher_value.shape:
+                if self.latent_allow_shape_mismatch:
+                    continue
+                raise ValueError(
+                    f"Latent shape mismatch for {student_name}/{teacher_name}: "
+                    f"{student_value.shape} vs {teacher_value.shape}"
+                )
+            if self.latent_distillation_loss == "l1":
+                losses.append(F.l1_loss(student_value.float(), teacher_value.detach().float()))
+            else:
+                losses.append(F.mse_loss(student_value.float(), teacher_value.detach().float()))
+
+        if not losses:
+            if self.latent_allow_missing:
+                return next(self.model.parameters()).new_zeros(())
+            raise ValueError("latent_distillation_weight is enabled but no latent pairs were available")
+        return torch.stack(losses).mean()
+
     def _step(self, wav: torch.Tensor, ref: torch.Tensor, log_prefix: str):
         model = self.ema_model.module if self.use_ema_model and log_prefix != "training" else self.model
-        est = model.css(wav, ref=ref) if log_prefix != "training" and self.css_validation else model(wav)
+        self._student_latents.clear()
+        est, student_aux = self._forward_model(model, wav, ref, log_prefix, css_validation=self.css_validation)
+        if self._student_latents:
+            student_aux = dict(student_aux)
+            student_aux["latents"] = dict(self._student_latents)
+
+        teacher_est: torch.Tensor | None = None
+        teacher_aux: dict[str, Any] = {}
+
+        def get_teacher() -> tuple[torch.Tensor, dict[str, Any]]:
+            nonlocal teacher_est, teacher_aux
+            if teacher_est is None:
+                teacher_est, teacher_aux = self._teacher_forward(wav, ref=ref, log_prefix=log_prefix)
+            return teacher_est, teacher_aux
 
         supervised_loss = self.loss(est.transpose(1, 2), ref.transpose(1, 2)).mean()
         loss = supervised_loss
@@ -176,10 +445,42 @@ class TeacherStudentDistillationTask(SupTask):
         }
 
         if self.teacher_loss_weight > 0.0:
-            teacher_est = self._teacher_forward(wav, ref=ref, log_prefix=log_prefix)
-            teacher_loss = F.l1_loss(est, teacher_est.detach())
+            teacher_est_value, _ = get_teacher()
+            teacher_loss = F.l1_loss(est, teacher_est_value.detach())
             loss = loss + self.teacher_loss_weight * teacher_loss
             log_dict[f"{log_prefix}/loss_teacher"] = teacher_loss
+
+        if self.teacher_mask_loss_weight > 0.0:
+            teacher_est_value, teacher_aux_value = get_teacher()
+            mask_loss = self._mask_or_logit_loss(
+                est,
+                teacher_est_value,
+                wav,
+                student_aux,
+                teacher_aux_value,
+                logit=False,
+            )
+            loss = loss + self.teacher_mask_loss_weight * mask_loss
+            log_dict[f"{log_prefix}/loss_teacher_mask"] = mask_loss
+
+        if self.teacher_logit_loss_weight > 0.0:
+            teacher_est_value, teacher_aux_value = get_teacher()
+            logit_loss = self._mask_or_logit_loss(
+                est,
+                teacher_est_value,
+                wav,
+                student_aux,
+                teacher_aux_value,
+                logit=True,
+            )
+            loss = loss + self.teacher_logit_loss_weight * logit_loss
+            log_dict[f"{log_prefix}/loss_teacher_logit"] = logit_loss
+
+        if self.latent_distillation_weight > 0.0:
+            _, teacher_aux_value = get_teacher()
+            latent_loss = self._latent_distillation_loss(student_aux, teacher_aux_value)
+            loss = loss + self.latent_distillation_weight * latent_loss
+            log_dict[f"{log_prefix}/loss_latent_distillation"] = latent_loss
 
         if self.mixture_consistency_weight > 0.0:
             mixture_loss = F.l1_loss(est.sum(dim=1), wav)
@@ -195,6 +496,11 @@ class TeacherStudentDistillationTask(SupTask):
             silent_loss = self._silent_source_penalty(est, ref)
             loss = loss + self.silent_source_weight * silent_loss
             log_dict[f"{log_prefix}/loss_silent_source"] = silent_loss
+
+        if self.source_activity_loss_weight > 0.0:
+            activity_loss = self._source_activity_l1(est, ref)
+            loss = loss + self.source_activity_loss_weight * activity_loss
+            log_dict[f"{log_prefix}/loss_source_activity"] = activity_loss
 
         if self.composite_loss.enabled:
             composite_loss, component_losses = self.composite_loss(est, ref)

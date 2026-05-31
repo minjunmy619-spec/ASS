@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/focused_onnx_one_20260530_remaining_candidates_fixed/online-hierarchical-soft-band-parallel-ffi-sfc2d.rt192k.speech-lowfreq-narrow.causal20dim.0-1-1l.128-96-48b/calib_sample000_input00.npy

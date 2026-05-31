@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+from argparse import ArgumentParser
 import copy
 import importlib
 import json
-import re
-from argparse import ArgumentParser
 from pathlib import Path
+import re
 import sys
 
 import numpy as np
+
+import torch
+
 import onnx
 from onnx import numpy_helper
-import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -22,7 +24,7 @@ AIACCEL_ROOT = REPO_ROOT / "aiaccel"
 if str(AIACCEL_ROOT) not in sys.path:
     sys.path.insert(0, str(AIACCEL_ROOT))
 
-from spectral_feature_compression.utils.onnx_streaming import (
+from spectral_feature_compression.utils.onnx_streaming import (  # noqa: E402
     ExternalizedConstantsWrapper,
     StreamingStateIOWrapper,
     collect_external_constant_bindings,
@@ -30,7 +32,6 @@ from spectral_feature_compression.utils.onnx_streaming import (
     get_external_constant_tensors,
     tensor_tree_shapes,
 )
-
 
 INTERPOLATION_RE = re.compile(r"^\$\{([^}]+)\}$")
 
@@ -161,10 +162,26 @@ def resolve_value(value, context: dict[str, object], *, stack: tuple[str, ...] =
     return value
 
 
+def resolve_model_top_level_value(
+    key: str,
+    model_cfg: dict[str, object],
+    top_level: dict[str, object],
+    context: dict[str, object],
+    default=None,
+):
+    value = model_cfg.get(key, top_level.get(key, default))
+    if isinstance(value, str):
+        match = INTERPOLATION_RE.fullmatch(value)
+        if match is not None and match.group(1) == key and key in top_level:
+            value = top_level[key]
+    return resolve_value(value, context)
+
+
 def build_model_system_from_recipe_config(config_path: Path):
     try:
-        from aiaccel.config import load_config, resolve_inherit
         from hydra.utils import instantiate
+
+        from aiaccel.config import load_config, resolve_inherit
 
         config = load_config(
             config_path,
@@ -201,8 +218,9 @@ def build_model_system_from_recipe_config(config_path: Path):
 
 
 def load_trained_task(model_path: Path, device: str):
-    from aiaccel.config import load_config
     from hydra.utils import instantiate
+
+    from aiaccel.config import load_config
 
     if model_path.is_dir():
         checkpoint_path = model_path / "checkpoints"
@@ -242,14 +260,118 @@ def load_frequency_preprocess_metadata(model_path: Path) -> dict[str, object] | 
     if config_path is None:
         return None
     top_level = merge_top_level_scalars(config_path)
-    if not bool(top_level.get("online_freq_preprocess_enabled", False)):
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top_level, **model_cfg}
+    enabled = resolve_value(
+        model_cfg.get("freq_preprocess_enabled", top_level.get("online_freq_preprocess_enabled", False)),
+        context,
+    )
+    if not bool(enabled):
         return None
+    n_fft = int(resolve_value(top_level.get("n_fft", 0), context)) if "n_fft" in top_level else None
+    full_n_freq = (n_fft // 2 + 1) if n_fft is not None else None
+    dc_enabled = bool(resolve_value(model_cfg.get("dc_bypass_enabled", False), context))
     return {
         "enabled": True,
-        "keep_bins": top_level.get("online_freq_preprocess_keep_bins"),
-        "target_bins": top_level.get("online_freq_preprocess_target_bins"),
-        "mode": top_level.get("online_freq_preprocess_mode", "triangular"),
-        "full_n_freq": int(top_level.get("n_fft", 0)) // 2 + 1 if "n_fft" in top_level else None,
+        "keep_bins": resolve_value(
+            model_cfg.get("freq_preprocess_keep_bins", top_level.get("online_freq_preprocess_keep_bins")),
+            context,
+        ),
+        "target_bins": resolve_value(
+            model_cfg.get("freq_preprocess_target_bins", top_level.get("online_freq_preprocess_target_bins")),
+            context,
+        ),
+        "mode": resolve_value(
+            model_cfg.get("freq_preprocess_mode", top_level.get("online_freq_preprocess_mode", "triangular")),
+            context,
+        ),
+        "full_n_freq": full_n_freq,
+        "input_n_freq": full_n_freq - 1 if full_n_freq is not None and dc_enabled else full_n_freq,
+    }
+
+
+def load_dc_bypass_metadata(model_path: Path) -> dict[str, object] | None:
+    config_path = infer_recipe_config_path(model_path)
+    if config_path is None:
+        return None
+    top_level = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top_level, **model_cfg}
+    enabled = resolve_value(model_cfg.get("dc_bypass_enabled", False), context)
+    if not bool(enabled):
+        return None
+    n_fft = int(resolve_value(top_level.get("n_fft", 0), context)) if "n_fft" in top_level else None
+    full_n_freq = (n_fft // 2 + 1) if n_fft is not None else None
+    return {
+        "enabled": True,
+        "policy": resolve_value(model_cfg.get("dc_policy", "zero"), context),
+        "full_n_freq": full_n_freq,
+        "body_n_freq": full_n_freq - 1 if full_n_freq is not None else None,
+    }
+
+
+def load_pcen_preprocess_metadata(model_path: Path) -> dict[str, object] | None:
+    config_path = infer_recipe_config_path(model_path)
+    if config_path is None:
+        return None
+    top_level = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top_level, **model_cfg}
+    enabled = resolve_value(model_cfg.get("pcen_preprocess_enabled", False), context)
+    if not bool(enabled):
+        return None
+    n_chan = int(resolve_model_top_level_value("n_chan", model_cfg, top_level, context, 1))
+    n_fft = int(resolve_value(top_level.get("n_fft", 0), context)) if "n_fft" in top_level else None
+    full_n_freq = (n_fft // 2 + 1) if n_fft is not None else None
+    dc_enabled = bool(resolve_value(model_cfg.get("dc_bypass_enabled", False), context))
+    freq_enabled = bool(
+        resolve_value(
+            model_cfg.get("freq_preprocess_enabled", top_level.get("online_freq_preprocess_enabled", False)),
+            context,
+        )
+    )
+    pcen_n_freq = None
+    if freq_enabled:
+        target_bins = resolve_value(
+            model_cfg.get("freq_preprocess_target_bins", top_level.get("online_freq_preprocess_target_bins")),
+            context,
+        )
+        pcen_n_freq = int(target_bins) if target_bins is not None else None
+    elif full_n_freq is not None:
+        pcen_n_freq = full_n_freq - 1 if dc_enabled else full_n_freq
+    return {
+        "enabled": True,
+        "n_chan": n_chan,
+        "state_shape": [1, n_chan, 1, pcen_n_freq] if pcen_n_freq is not None else None,
+        "smooth_coef": resolve_value(model_cfg.get("pcen_smooth_coef", 0.98), context),
+        "alpha": resolve_value(model_cfg.get("pcen_alpha", 0.5), context),
+        "delta": resolve_value(model_cfg.get("pcen_delta", 2.0), context),
+        "root": resolve_value(model_cfg.get("pcen_root", 0.5), context),
+        "eps": resolve_value(model_cfg.get("pcen_eps", 1e-6), context),
+        "gain_floor": resolve_value(model_cfg.get("pcen_gain_floor", 0.05), context),
+        "gain_ceiling": resolve_value(model_cfg.get("pcen_gain_ceiling", 20.0), context),
+    }
+
+
+def load_residual_source_metadata(model_path: Path) -> dict[str, object] | None:
+    config_path = infer_recipe_config_path(model_path)
+    if config_path is None:
+        return None
+    top_level = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top_level, **model_cfg}
+    enabled = resolve_value(model_cfg.get("residual_source_enabled", False), context)
+    if not bool(enabled):
+        return None
+    n_src = int(resolve_model_top_level_value("n_src", model_cfg, top_level, context, 3))
+    core_n_src = int(resolve_value(model_cfg.get("core_n_src", n_src - 1), context))
+    residual_source_index = int(resolve_value(model_cfg.get("residual_source_index", n_src - 1), context))
+    return {
+        "enabled": True,
+        "mode": "mixture_minus_explicit_sources",
+        "explicit_n_src": core_n_src,
+        "output_n_src": n_src,
+        "residual_source_index": residual_source_index,
     }
 
 
@@ -257,8 +379,8 @@ def infer_export_freq_bins(config_path: Path) -> int:
     """Infer ONNX spectral bin count ``F`` for ``[B, 2*n_chan, T, F]`` exports."""
     top_level = merge_top_level_scalars(config_path)
     meta = load_frequency_preprocess_metadata(config_path)
-    if meta is not None and meta.get("keep_bins") is not None:
-        return int(meta["keep_bins"])  # type: ignore[arg-type]
+    if meta is not None and meta.get("target_bins") is not None:
+        return int(meta["target_bins"])  # type: ignore[arg-type]
     n_fft = int(top_level.get("n_fft", 2048))
     return n_fft // 2 + 1
 
@@ -497,7 +619,13 @@ def main():
 
     core, source_mode = load_export_core(args.model_path, args.device)
     frequency_preprocess_meta = load_frequency_preprocess_metadata(args.model_path)
+    dc_bypass_meta = load_dc_bypass_metadata(args.model_path)
+    pcen_preprocess_meta = load_pcen_preprocess_metadata(args.model_path)
+    residual_source_meta = load_residual_source_metadata(args.model_path)
     core = core.to(args.device)
+    actual_n_chan = int(getattr(core, "n_chan", args.n_chan))
+    if actual_n_chan != int(args.n_chan):
+        raise ValueError(f"Export n_chan mismatch: --n-chan={args.n_chan}, but core expects n_chan={actual_n_chan}.")
     if args.disable_masking and hasattr(core, "masking"):
         core = copy.deepcopy(core)
         core.masking = False
@@ -506,9 +634,9 @@ def main():
     core_freqs = getattr(core, "n_freq", None)
     tiger_like = (
         hasattr(core, "forward_cell")
-        and callable(getattr(core, "forward_cell"))
+        and callable(core.forward_cell)
         and hasattr(core, "init_streaming_state")
-        and callable(getattr(core, "init_streaming_state"))
+        and callable(core.init_streaming_state)
         and hasattr(core, "enc_dim")
     )
 
@@ -728,8 +856,12 @@ def main():
             "keep_initializers_as_inputs": args.keep_initializers_as_inputs,
             "frames": args.frames,
             "freqs": export_freqs,
-            "n_chan": args.n_chan,
+            "n_chan": actual_n_chan,
+            "core_n_src": int(getattr(core, "n_src", 0)) if hasattr(core, "n_src") else None,
             "frequency_preprocessing": frequency_preprocess_meta,
+            "dc_bypass": dc_bypass_meta,
+            "pcen_preprocessing": pcen_preprocess_meta,
+            "residual_source": residual_source_meta,
             "input_names": input_names,
             "output_names": output_names,
             "dynamic_inputs": (

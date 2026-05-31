@@ -15,6 +15,10 @@ task:
   low_frequency_hz: 300.0
   silent_source_weight: 0.05
   silent_source_db: -60.0
+  source_activity_loss_weight: 0.1
+  source_activity_db: -50.0
+  source_activity_active_weight: 1.0
+  source_activity_inactive_weight: 0.25
   complex_ri_weight: 0.5
   log_magnitude_weight: 0.2
   multi_resolution_stft_weight: 0.3
@@ -23,6 +27,12 @@ task:
     - [1024, 256]
     - [2048, 512]
   transient_weight: 0.05
+  teacher_mask_loss_weight: 0.1
+  teacher_logit_loss_weight: 0.05
+  latent_distillation_weight: 0.0
+  student_latent_modules: []
+  teacher_latent_modules: []
+  latent_allow_missing: true
   teacher_model:
     _target_: spectral_feature_compression.core.model.proposed_separation_models.build_sfc_locoformer_lite_plus_system
     n_fft: ${n_fft}

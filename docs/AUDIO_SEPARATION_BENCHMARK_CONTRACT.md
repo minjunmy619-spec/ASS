@@ -18,6 +18,10 @@ paper-reported external baselines from being mixed in one ambiguous table.
   the candidate is explicitly chunk-causal rather than frame-streaming.
 - Mixture consistency: report whether it is trained as a loss, applied as a
   post-processing projection, both, or neither.
+- Residual-source ablations may export fewer explicit NPU masks, but they must
+  still return the fixed output order above.  For example, the 2-mask residual-SFX
+  BandSFC RT+ recipe exports Speech/Music only and reconstructs `effects` as
+  `mixture - speech - music` outside the core.
 - Silence behavior: inactive stems should not hallucinate persistent energy;
   report silent-source penalty settings and inactive-stem metrics when available.
 
@@ -67,6 +71,9 @@ Rules:
   citation or paper note in `source`.
 - Leave unavailable metrics blank instead of copying numbers across datasets.
 - Keep DnR three-stem and MUSDB four-stem rows separate.
+- For residual-source ablations, keep `n_src=3` in the result row and describe
+  `core_n_src=2` plus the residual policy in `variant`, `mixture_consistency`, or
+  `notes`.
 
 ## Minimum Report Row For A Candidate
 

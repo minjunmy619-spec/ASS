@@ -61,6 +61,62 @@ Purpose:
 - Warm-start `BandSFCNet-RT+` before teacher distillation.
 - Useful when there is no trained RT+ checkpoint yet.
 
+### Optional PCEN Front-End Ablation
+
+Recipe:
+
+```text
+recipes/dnr/models/band-sfc-net-npu.rt-plus.stage1-supervised-aug-pcen.rt192k.fp512/config.yaml
+```
+
+Purpose:
+
+- Test wrapper-side PCEN-style gain normalization without changing the exported
+  packed core contract.
+- The wrapper applies PCEN gain to the complex input before the core, then
+  divides the output by the same gain expanded over sources so masking remains on
+  the original mixture scale.
+- Treat this as an ablation only until DnR validation metrics show it helps.
+
+### Optional DC-Bin Bypass Ablation
+
+Recipe:
+
+```text
+recipes/dnr/models/band-sfc-net-npu.rt-plus.stage1-supervised-aug-dcbypass.rt192k.fp512/config.yaml
+```
+
+Purpose:
+
+- Keep the STFT DC bin outside the frequency-compressed core so `n_fft=2048`
+  uses body bins `1..1024`, then `1024 -> 512` frequency preprocessing.
+- The wrapper restores a zero DC bin before iSTFT by default.  This avoids
+  source-specific DC prediction inside the exported core and keeps core frequency
+  sizes compiler-friendly.
+- Treat this as an ablation until it has matched or improved validation metrics.
+
+### Optional 2-Mask Residual-SFX Ablation
+
+Recipe:
+
+```text
+recipes/dnr/models/band-sfc-net-npu.rt-plus.2mask-residual-sfx.rt192k.fp512/config.yaml
+```
+
+Purpose:
+
+- Test whether the DnR student can predict only explicit Speech and Music masks
+  while reconstructing SFX outside the NPU core as `mixture - speech - music`.
+- The external training/evaluation contract remains 3 stems in the standard DnR
+  order: `speech`, `music`, `effects`.
+- The exported BandSFCNetNPU core uses `core_n_src=2`; wrapper-side residual
+  reconstruction restores the third source before loss/evaluation/iSTFT.
+- Train and score all 3 stems.  The SFX residual is an error bucket, so compare
+  per-stem SFX metrics and listening leakage before treating this as a size or
+  quality win.
+- ONNX/ONE validation has passed for the config-only core export; trained quality
+  metrics are still pending.
+
 ### Stage 2 Student: Chunk-Causal Distillation
 
 Recipe:
@@ -75,6 +131,11 @@ Purpose:
 - Uses teacher output loss, mixture consistency, low-frequency loss,
   silent-source penalty, complex RI, log-magnitude, multi-resolution STFT, and
   transient losses.
+- Also enables teacher spectral mask/logit distillation and
+  source-activity-aware waveform loss.
+- Latent distillation plumbing is available through `student_latent_modules` and
+  `teacher_latent_modules`, but remains weight `0.0` in default recipes until a
+  shape-compatible teacher/student hook pair is selected.
 
 Required before launch:
 
@@ -117,6 +178,30 @@ Student supervised warm start:
   --config-name config
 ```
 
+Student supervised PCEN ablation:
+
+```bash
+./.venv/bin/python -m spectral_feature_compression.train \
+  --config-path recipes/dnr/models/band-sfc-net-npu.rt-plus.stage1-supervised-aug-pcen.rt192k.fp512 \
+  --config-name config
+```
+
+Student supervised DC-bypass ablation:
+
+```bash
+./.venv/bin/python -m spectral_feature_compression.train \
+  --config-path recipes/dnr/models/band-sfc-net-npu.rt-plus.stage1-supervised-aug-dcbypass.rt192k.fp512 \
+  --config-name config
+```
+
+Student supervised 2-mask residual-SFX ablation:
+
+```bash
+./.venv/bin/python -m spectral_feature_compression.train \
+  --config-path recipes/dnr/models/band-sfc-net-npu.rt-plus.2mask-residual-sfx.rt192k.fp512 \
+  --config-name config
+```
+
 Student distillation:
 
 ```bash
@@ -139,6 +224,9 @@ Strict fine-tune:
 ## Notes
 
 - STFT/iSTFT remain outside the exported strict NPU core.
+- Residual-source recipes keep `n_src=3` externally; only `.model.core` exports
+  with `core_n_src=2`.  Device integration must reconstruct the residual stem
+  outside the NPU core before final iSTFT/output packaging.
 - These recipe variants intentionally do not replace the older baseline configs;
   they are sibling configs for controlled ablation and curriculum training.
 - After each trained stage, fill
@@ -159,3 +247,120 @@ Use `slim_6m` first.  Treat `slim_8m` as a quality probe only after `slim_6m`
 shows a useful quality/state tradeoff.  See
 `docs/DOLPHIN_SFC_NPU_DISTILLATION.md` for launch commands and teacher checkpoint
 compatibility notes.
+
+## Sparse U-Net Mel-SFC Probe
+
+The sparse low/mid/high Mel-SFC U-Net is now available as an opt-in quality
+fallback, not as the primary strict RT+ deployment path.
+
+Recipes:
+
+```text
+recipes/musdb18hq/models/sparse-unet-mel-sfc.music.rt192k.fp512keep475/config.yaml
+recipes/dnr/models/sparse-unet-mel-sfc.rt192k.fp512keep475/config.yaml
+```
+
+Use the MUSDB recipe first because this architecture was added for the
+music-first fallback gap.  The default packed core is about `0.54M` parameters
+with about `140 KiB` fp16 layer cache at `512` preprocessed frequency bins, but
+it still needs trained metrics and ONNX/ONE validation before deployment use.
+
+Example MUSDB launch:
+
+```bash
+./.venv/bin/python -m spectral_feature_compression.train \
+  --config-path recipes/musdb18hq/models/sparse-unet-mel-sfc.music.rt192k.fp512keep475 \
+  --config-name config
+```
+
+## SFC-SepReformer Multi-Stem Probe
+
+The early source-split SFC variant tests whether splitting compressed SFC tokens
+before reconstruction reduces the burden on the final mask head.  It uses packed
+4D source channels, shared source-wise refiner weights, and a shared SFC decoder.
+
+Recipes:
+
+```text
+recipes/dnr/models/sfc-sepreformer-multistem.rt192k.fp512keep475/config.yaml
+recipes/musdb18hq/models/sfc-sepreformer-multistem.rt192k.fp512keep475/config.yaml
+```
+
+Use the DnR recipe first because this idea should help the three-stem universal
+task most.  The default DnR packed core is about `0.04M` parameters with about
+`112 KiB` fp16 layer cache at `512` preprocessed bins; the MUSDB four-stem core
+is about `0.04M` parameters with about `144 KiB` fp16 layer cache.  Treat both
+as ablations until trained metrics and ONNX/ONE export are available.
+
+Example DnR launch:
+
+```bash
+./.venv/bin/python -m spectral_feature_compression.train \
+  --config-path recipes/dnr/models/sfc-sepreformer-multistem.rt192k.fp512keep475 \
+  --config-name config
+```
+
+## SFC Residual-Refinement Probe
+
+The residual-refinement SFC variant tests the useful part of the Mamba2 / TS-BSMamba2
+recommendation without introducing unsupported Mamba2 kernels.  It adds a causal
+dilated long-temporal branch after SFC compression and a second-stage full-band
+correction head that predicts a packed complex residual on top of the first
+masked estimate.
+
+Recipes:
+
+```text
+recipes/dnr/models/sfc-residual-refinement.rt192k.fp512keep475/config.yaml
+recipes/musdb18hq/models/sfc-residual-refinement.rt192k.fp512keep475/config.yaml
+```
+
+Use DnR first, then compare directly with `BandSFCNet-RT+` and
+`online-soft-band-query-sfc2d` under the same loss stack.  The default packed
+core is about `0.03M` parameters with about `144 KiB` fp16 layer cache at `512`
+preprocessed bins.  Keep true Mamba2 outside the strict NPU path until a
+teacher/middle-tier experiment proves it is worth the export risk.
+
+Example DnR launch:
+
+```bash
+./.venv/bin/python -m spectral_feature_compression.train \
+  --config-path recipes/dnr/models/sfc-residual-refinement.rt192k.fp512keep475 \
+  --config-name config
+```
+
+## Band-Mapping Ablation Track
+
+The adaptive mel / overlapped perceptual band-mapping track now has explicit
+fixed and mel-overlap SFC recipes, plus teacher-side SFC-CA and SFC-Mamba rows
+for comparison.
+
+Deployable/online SFC ablations:
+
+```text
+recipes/dnr/models/bandmap-ablation.fixed80.rt192k.fp512keep475/config.yaml
+recipes/dnr/models/bandmap-ablation.mel-overlap80.rt192k.fp512keep475/config.yaml
+recipes/musdb18hq/models/bandmap-ablation.fixed80.rt192k.fp512keep475/config.yaml
+recipes/musdb18hq/models/bandmap-ablation.mel-overlap80.rt192k.fp512keep475/config.yaml
+```
+
+Teacher/non-strict comparison rows:
+
+```text
+recipes/dnr/models/bandmap-ablation.sfc-ca80.teacher/config.yaml
+recipes/musdb18hq/models/bandmap-ablation.sfc-ca80.teacher/config.yaml
+recipes/musdb18hq/models/bandmap-ablation.sfc-mamba64.teacher/config.yaml
+```
+
+The mel-overlap builder exposes `low_freq_hz`, `low_freq_band_fraction`,
+`overlap_factor`, and `low_freq_overlap_factor` for bass/music preservation.  The
+default online packed core is about `0.03M` parameters with about `90 KiB` fp16
+layer cache at `512` preprocessed bins.
+
+Example DnR mel-overlap launch:
+
+```bash
+./.venv/bin/python -m spectral_feature_compression.train \
+  --config-path recipes/dnr/models/bandmap-ablation.mel-overlap80.rt192k.fp512keep475 \
+  --config-name config
+```

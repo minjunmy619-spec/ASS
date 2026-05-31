@@ -1,0 +1,44 @@
+_base_: ../online-soft-band-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml
+
+# Proposal D: Sparse U-Net Mel-SFC music-first quality probe.
+# Low/mid/high branches use overlapped mel routing and branch-local U-Net skips.
+sparse_unet_d_model: 64
+sparse_unet_branch_bands: [24, 32, 24]
+sparse_unet_encoder_layers: [1, 1]
+sparse_unet_bottleneck_layers: 2
+sparse_unet_decoder_layers: 1
+sparse_unet_kernel_size: [3, 3]
+sparse_unet_routing_kernel_size: [1, 3]
+sparse_unet_low_cutoff_hz: 250.0
+sparse_unet_mid_cutoff_hz: 4000.0
+sparse_unet_region_overlap_hz: 250.0
+sparse_unet_routing_normalization: softmax
+
+task:
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_sparse_unet_mel_sfc_music_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    scaling: false
+    css_segment_size: 12
+    css_shift_size: 6
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    d_model: ${sparse_unet_d_model}
+    branch_bands: ${sparse_unet_branch_bands}
+    encoder_layers: ${sparse_unet_encoder_layers}
+    bottleneck_layers: ${sparse_unet_bottleneck_layers}
+    decoder_layers: ${sparse_unet_decoder_layers}
+    kernel_size: ${sparse_unet_kernel_size}
+    routing_kernel_size: ${sparse_unet_routing_kernel_size}
+    low_cutoff_hz: ${sparse_unet_low_cutoff_hz}
+    mid_cutoff_hz: ${sparse_unet_mid_cutoff_hz}
+    region_overlap_hz: ${sparse_unet_region_overlap_hz}
+    routing_normalization: ${sparse_unet_routing_normalization}
+    causal: true
+    masking: true
+    freq_preprocess_enabled: true
+    freq_preprocess_keep_bins: 475
+    freq_preprocess_target_bins: 512
+    freq_preprocess_mode: triangular

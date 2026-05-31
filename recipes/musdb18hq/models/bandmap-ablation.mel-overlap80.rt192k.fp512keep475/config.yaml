@@ -1,0 +1,41 @@
+_base_: ../online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml
+
+# Band mapping ablation: explicit adaptive overlapped mel front-end.
+adaptive_mel_n_bands: 80
+adaptive_mel_d_model: 24
+adaptive_mel_n_layers: 6
+adaptive_mel_kernel_size: [3, 3]
+adaptive_mel_routing_kernel_size: [1, 3]
+adaptive_mel_low_freq_hz: 1000.0
+adaptive_mel_low_freq_band_fraction: 0.45
+adaptive_mel_overlap_factor: 1.5
+adaptive_mel_low_freq_overlap_factor: 2.0
+adaptive_mel_routing_normalization: softmax
+
+task:
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_adaptive_mel_sfc_ablation_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    scaling: false
+    css_segment_size: 12
+    css_shift_size: 6
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    n_bands: ${adaptive_mel_n_bands}
+    d_model: ${adaptive_mel_d_model}
+    n_layers: ${adaptive_mel_n_layers}
+    kernel_size: ${adaptive_mel_kernel_size}
+    routing_kernel_size: ${adaptive_mel_routing_kernel_size}
+    low_freq_hz: ${adaptive_mel_low_freq_hz}
+    low_freq_band_fraction: ${adaptive_mel_low_freq_band_fraction}
+    overlap_factor: ${adaptive_mel_overlap_factor}
+    low_freq_overlap_factor: ${adaptive_mel_low_freq_overlap_factor}
+    causal: true
+    masking: true
+    routing_normalization: ${adaptive_mel_routing_normalization}
+    freq_preprocess_enabled: true
+    freq_preprocess_keep_bins: 475
+    freq_preprocess_target_bins: 512
+    freq_preprocess_mode: triangular

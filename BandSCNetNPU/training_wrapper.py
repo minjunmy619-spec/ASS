@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import torch.nn as nn
 
-from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
 from spectral_feature_compression.core.model.frequency_preprocessing import (
     FrequencyPreprocessedOnlineModel,
     build_frequency_preprocessor,
+    build_pcen_preprocessor,
     resolve_preprocessed_n_freq,
 )
+from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
 from spectral_feature_compression.core.model.online_sfc_2d import (
     pack_complex_stft_as_2d,
     unpack_2d_to_complex_stft,
@@ -59,6 +60,16 @@ def build_band_scnet_npu_system(
     freq_preprocess_keep_bins: int | None = None,
     freq_preprocess_target_bins: int | None = None,
     freq_preprocess_mode: str = "triangular",
+    dc_bypass_enabled: bool = False,
+    dc_policy: str = "zero",
+    pcen_preprocess_enabled: bool = False,
+    pcen_smooth_coef: float = 0.98,
+    pcen_alpha: float = 0.5,
+    pcen_delta: float = 2.0,
+    pcen_root: float = 0.5,
+    pcen_eps: float = 1e-6,
+    pcen_gain_floor: float = 0.05,
+    pcen_gain_ceiling: float = 20.0,
     css_segment_size: int = 12,
     css_shift_size: int = 6,
     css_batch_size: int = 1,
@@ -82,6 +93,7 @@ def build_band_scnet_npu_system(
         enabled=freq_preprocess_enabled,
         keep_bins=freq_preprocess_keep_bins,
         target_bins=freq_preprocess_target_bins,
+        dc_bypass_enabled=dc_bypass_enabled,
     )
     freq_preprocessor = build_frequency_preprocessor(
         full_n_freq,
@@ -89,9 +101,21 @@ def build_band_scnet_npu_system(
         keep_bins=freq_preprocess_keep_bins,
         target_bins=freq_preprocess_target_bins,
         mode=freq_preprocess_mode,
+        dc_bypass_enabled=dc_bypass_enabled,
+    )
+    pcen_preprocessor = build_pcen_preprocessor(
+        n_chan=n_chan,
+        enabled=pcen_preprocess_enabled,
+        smooth_coef=pcen_smooth_coef,
+        alpha=pcen_alpha,
+        delta=pcen_delta,
+        root=pcen_root,
+        eps=pcen_eps,
+        gain_floor=pcen_gain_floor,
+        gain_ceiling=pcen_gain_ceiling,
     )
     core = build_band_scnet_npu_preset(preset, n_freq=core_n_freq, n_src=n_src, n_chan=n_chan)
-    if freq_preprocessor is None:
+    if freq_preprocessor is None and pcen_preprocessor is None and not dc_bypass_enabled:
         model = BandSCNetNPUOnlineModel(core=core, n_src=n_src, n_chan=n_chan)
     else:
         model = FrequencyPreprocessedOnlineModel(
@@ -99,6 +123,9 @@ def build_band_scnet_npu_system(
             n_src=n_src,
             n_chan=n_chan,
             freq_preprocessor=freq_preprocessor,
+            pcen_preprocessor=pcen_preprocessor,
+            dc_bypass_enabled=dc_bypass_enabled,
+            dc_policy=dc_policy,
         )
     return OnlineModelWrapper(
         model=model,
