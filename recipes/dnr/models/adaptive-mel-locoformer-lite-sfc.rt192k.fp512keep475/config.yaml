@@ -1,0 +1,52 @@
+_base_: ../online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml
+
+# Proposal A deployable student: adaptive overlapped mel SFC front-end plus
+# strict causal TF-Locoformer-lite separator blocks.
+adaptive_mel_loco_n_bands: 80
+adaptive_mel_loco_d_model: 32
+adaptive_mel_loco_n_layers: 4
+adaptive_mel_loco_kernel_size: [3, 3]
+adaptive_mel_loco_routing_kernel_size: [1, 3]
+adaptive_mel_loco_dilation_cycle: [1, 2, 1, 2]
+adaptive_mel_loco_expansion: 2
+adaptive_mel_loco_ffn_expansion: 2
+adaptive_mel_loco_capacity_hidden: 6144
+adaptive_mel_loco_capacity_layers: 4
+adaptive_mel_loco_low_freq_hz: 1000.0
+adaptive_mel_loco_low_freq_band_fraction: 0.45
+adaptive_mel_loco_overlap_factor: 1.5
+adaptive_mel_loco_low_freq_overlap_factor: 2.0
+adaptive_mel_loco_routing_normalization: softmax
+
+task:
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_adaptive_mel_locoformer_lite_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    scaling: false
+    css_segment_size: 12
+    css_shift_size: 6
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    n_bands: ${adaptive_mel_loco_n_bands}
+    d_model: ${adaptive_mel_loco_d_model}
+    n_layers: ${adaptive_mel_loco_n_layers}
+    kernel_size: ${adaptive_mel_loco_kernel_size}
+    routing_kernel_size: ${adaptive_mel_loco_routing_kernel_size}
+    dilation_cycle: ${adaptive_mel_loco_dilation_cycle}
+    expansion: ${adaptive_mel_loco_expansion}
+    ffn_expansion: ${adaptive_mel_loco_ffn_expansion}
+    capacity_mixer_hidden: ${adaptive_mel_loco_capacity_hidden}
+    capacity_mixer_layers: ${adaptive_mel_loco_capacity_layers}
+    low_freq_hz: ${adaptive_mel_loco_low_freq_hz}
+    low_freq_band_fraction: ${adaptive_mel_loco_low_freq_band_fraction}
+    overlap_factor: ${adaptive_mel_loco_overlap_factor}
+    low_freq_overlap_factor: ${adaptive_mel_loco_low_freq_overlap_factor}
+    causal: true
+    masking: true
+    routing_normalization: ${adaptive_mel_loco_routing_normalization}
+    freq_preprocess_enabled: true
+    freq_preprocess_keep_bins: 475
+    freq_preprocess_target_bins: 512
+    freq_preprocess_mode: triangular

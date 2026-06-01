@@ -4,6 +4,8 @@ _base_: ../online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/c
 adaptive_mel_n_bands: 80
 adaptive_mel_d_model: 24
 adaptive_mel_n_layers: 6
+adaptive_mel_capacity_hidden: 8192
+adaptive_mel_capacity_layers: 4
 adaptive_mel_kernel_size: [3, 3]
 adaptive_mel_routing_kernel_size: [1, 3]
 adaptive_mel_low_freq_hz: 1000.0
@@ -26,6 +28,8 @@ task:
     n_bands: ${adaptive_mel_n_bands}
     d_model: ${adaptive_mel_d_model}
     n_layers: ${adaptive_mel_n_layers}
+    capacity_mixer_hidden: ${adaptive_mel_capacity_hidden}
+    capacity_mixer_layers: ${adaptive_mel_capacity_layers}
     kernel_size: ${adaptive_mel_kernel_size}
     routing_kernel_size: ${adaptive_mel_routing_kernel_size}
     low_freq_hz: ${adaptive_mel_low_freq_hz}

@@ -862,6 +862,7 @@ def main():
             "dc_bypass": dc_bypass_meta,
             "pcen_preprocessing": pcen_preprocess_meta,
             "residual_source": residual_source_meta,
+            "prompt_conditioning": core.prompt_manifest() if hasattr(core, "prompt_manifest") else None,
             "input_names": input_names,
             "output_names": output_names,
             "dynamic_inputs": (
@@ -920,6 +921,8 @@ def main():
         print("Output: band_masked_output + updated streaming tensors")
     else:
         print("Output shape: (1, 2*N*M, T, F) or raw masks if masking is disabled")
+    if hasattr(core, "prompt_manifest"):
+        print(f"Prompt conditioning: {core.prompt_manifest()}")
     print(f"ONNX ops: {', '.join(audit['ops'])}")
     print(
         "Initializers: "

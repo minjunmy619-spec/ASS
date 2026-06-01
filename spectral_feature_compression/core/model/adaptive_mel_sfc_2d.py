@@ -20,6 +20,7 @@ from spectral_feature_compression.core.model.frequency_preprocessing import (
     build_pcen_preprocessor,
     resolve_preprocessed_n_freq,
 )
+from spectral_feature_compression.core.model.npu_capacity_blocks_2d import build_capacity_mixers
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
 from spectral_feature_compression.core.model.online_sfc_2d import (
     CausalConv2d,
@@ -232,6 +233,8 @@ class OnlineAdaptiveMelSFC2D(nn.Module):
         n_chan: int = 1,
         d_model: int = 24,
         n_layers: int = 6,
+        capacity_mixer_hidden: int = 0,
+        capacity_mixer_layers: int = 0,
         kernel_size: Sequence[int] | tuple[int, int] = (3, 3),
         routing_kernel_size: Sequence[int] | tuple[int, int] = (1, 3),
         low_freq_hz: float = 1000.0,
@@ -276,6 +279,11 @@ class OnlineAdaptiveMelSFC2D(nn.Module):
         self.separator = nn.ModuleList(
             [OnlineConvBlock(d_model, expansion=2, kernel_size=kernel_size, causal=causal) for _ in range(n_layers)]
         )
+        self.capacity_mixers = build_capacity_mixers(
+            channels=d_model,
+            hidden_channels=capacity_mixer_hidden,
+            n_layers=capacity_mixer_layers,
+        )
         self.expander = SoftBandQueryExpander2d(channels=d_model, band_spec=band_spec)
         self.out_proj = nn.Conv2d(d_model, 2 * n_src * n_chan, kernel_size=1, bias=True)
 
@@ -284,8 +292,12 @@ class OnlineAdaptiveMelSFC2D(nn.Module):
         _runtime_assert(x.shape[-1] == self.n_freq, f"{x.shape} vs {self.n_freq}")
         h = self.in_proj(x)
         z, query_tokens = self.compressor(h)
-        for block in self.separator:
+        for block_idx, block in enumerate(self.separator):
             z = block(z)
+            if block_idx < len(self.capacity_mixers):
+                z = self.capacity_mixers[block_idx](z)
+        for block_idx in range(len(self.separator), len(self.capacity_mixers)):
+            z = self.capacity_mixers[block_idx](z)
         y = self.out_proj(self.expander(z, query_tokens))
         if self.masking:
             return _apply_packed_complex_mask_no_repeat(x=x, y=y, n_src=self.n_src, n_chan=self.n_chan)
@@ -320,9 +332,13 @@ class OnlineAdaptiveMelSFC2D(nn.Module):
         h = self.in_proj(x)
         (z, query_tokens), new_comp_state = self.compressor.forward_stream(h, state[0])
         new_sep_states = []
-        for block, block_state in zip(self.separator, state[1:]):
+        for block_idx, (block, block_state) in enumerate(zip(self.separator, state[1:])):
             z, block_state = block.forward_stream(z, block_state)
+            if block_idx < len(self.capacity_mixers):
+                z = self.capacity_mixers[block_idx](z)
             new_sep_states.append(block_state)
+        for block_idx in range(len(self.separator), len(self.capacity_mixers)):
+            z = self.capacity_mixers[block_idx](z)
         y = self.out_proj(self.expander(z, query_tokens))
         if self.masking:
             y = _apply_packed_complex_mask_no_repeat(x=x, y=y, n_src=self.n_src, n_chan=self.n_chan)
@@ -380,6 +396,8 @@ def build_adaptive_mel_sfc_system(
     n_bands: int = 80,
     d_model: int = 24,
     n_layers: int = 6,
+    capacity_mixer_hidden: int = 8192,
+    capacity_mixer_layers: int = 4,
     kernel_size: Sequence[int] | tuple[int, int] = (3, 3),
     routing_kernel_size: Sequence[int] | tuple[int, int] = (1, 3),
     low_freq_hz: float = 1000.0,
@@ -445,6 +463,8 @@ def build_adaptive_mel_sfc_system(
         n_chan=n_chan,
         d_model=d_model,
         n_layers=n_layers,
+        capacity_mixer_hidden=capacity_mixer_hidden,
+        capacity_mixer_layers=capacity_mixer_layers,
         kernel_size=kernel_size,
         routing_kernel_size=routing_kernel_size,
         low_freq_hz=low_freq_hz,

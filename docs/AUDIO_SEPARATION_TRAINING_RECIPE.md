@@ -261,9 +261,11 @@ recipes/dnr/models/sparse-unet-mel-sfc.rt192k.fp512keep475/config.yaml
 ```
 
 Use the MUSDB recipe first because this architecture was added for the
-music-first fallback gap.  The default packed core is about `0.54M` parameters
-with about `140 KiB` fp16 layer cache at `512` preprocessed frequency bins, but
-it still needs trained metrics and ONNX/ONE validation before deployment use.
+music-first fallback gap.  The capacity-updated DnR packed core is about `2.12M`
+parameters with about `140 KiB` fp16 layer cache at `512` preprocessed frequency
+bins, but it still needs trained metrics before deployment use.  The DnR core
+has passed ONNX/ONE validation and direct `circle-verify` after forced ONNX
+simplification.
 
 Example MUSDB launch:
 
@@ -287,10 +289,10 @@ recipes/musdb18hq/models/sfc-sepreformer-multistem.rt192k.fp512keep475/config.ya
 ```
 
 Use the DnR recipe first because this idea should help the three-stem universal
-task most.  The default DnR packed core is about `0.04M` parameters with about
-`112 KiB` fp16 layer cache at `512` preprocessed bins; the MUSDB four-stem core
-is about `0.04M` parameters with about `144 KiB` fp16 layer cache.  Treat both
-as ablations until trained metrics and ONNX/ONE export are available.
+task most.  The capacity-updated DnR packed core is about `2.45M` parameters with
+about `112 KiB` fp16 layer cache at `512` preprocessed bins; the MUSDB four-stem
+core is the untrained sibling probe.  Treat both as ablations until trained
+metrics are available.
 
 Example DnR launch:
 
@@ -317,7 +319,7 @@ recipes/musdb18hq/models/sfc-residual-refinement.rt192k.fp512keep475/config.yaml
 
 Use DnR first, then compare directly with `BandSFCNet-RT+` and
 `online-soft-band-query-sfc2d` under the same loss stack.  The default packed
-core is about `0.03M` parameters with about `144 KiB` fp16 layer cache at `512`
+core is about `2.45M` parameters with about `144 KiB` fp16 layer cache at `512`
 preprocessed bins.  Keep true Mamba2 outside the strict NPU path until a
 teacher/middle-tier experiment proves it is worth the export risk.
 
@@ -326,6 +328,61 @@ Example DnR launch:
 ```bash
 ./.venv/bin/python -m spectral_feature_compression.train \
   --config-path recipes/dnr/models/sfc-residual-refinement.rt192k.fp512keep475 \
+  --config-name config
+```
+
+## Adaptive Mel-SFC Locoformer-Lite Student
+
+The deployable Proposal-A student combines the explicit overlapped mel SFC router
+with strict causal Locoformer-lite blocks over compressed band tokens.  The core
+stays on the packed 2D contract `[B, 2*M, T, F]`; STFT/iSTFT, optional frequency
+preprocessing, PCEN, and DC-bypass remain wrapper-side concerns.
+
+Recipe:
+
+```text
+recipes/dnr/models/adaptive-mel-locoformer-lite-sfc.rt192k.fp512keep475/config.yaml
+```
+
+Use this as the main adaptive-mel student comparison against `BandSFCNet-RT+`,
+`online-soft-band-query-sfc2d`, and the simpler mel-overlap80 band-map ablation.
+The capacity-updated packed core is about `2.50M` parameters with about
+`120 KiB` fp16 layer cache at `512` preprocessed bins.  Config-only ONNX/ONE
+validation passes; trained quality metrics are still pending.
+
+Example DnR launch:
+
+```bash
+./.venv/bin/python -m spectral_feature_compression.train \
+  --config-path recipes/dnr/models/adaptive-mel-locoformer-lite-sfc.rt192k.fp512keep475 \
+  --config-name config
+```
+
+## Prompted Asymmetric SFC Probe
+
+The Prompted Asymmetric SFC probe implements the Proposal-D unified-product idea
+as a fixed-output online DnR student.  The deployable recipe uses static
+`speech`, `music`, and `effects` prompts inside the model, so the ONNX/NPU core
+still has one packed STFT input.  The encoder body is deeper than the shared
+prompt-conditioned decoder/head.
+
+Recipe:
+
+```text
+recipes/dnr/models/prompted-asymmetric-sfc.rt192k.fp512keep475/config.yaml
+```
+
+Use this only if fixed-stem training shows the prompt-conditioned shared decoder
+is competitive or if unified/prompted product behavior becomes important.  The
+capacity-updated packed core is about `2.46M` parameters with about `96 KiB` fp16
+layer cache at `512` preprocessed bins.  Config-only ONNX/ONE validation passes;
+trained quality metrics and prompt-dropout training are still pending.
+
+Example DnR launch:
+
+```bash
+./.venv/bin/python -m spectral_feature_compression.train \
+  --config-path recipes/dnr/models/prompted-asymmetric-sfc.rt192k.fp512keep475 \
   --config-name config
 ```
 
@@ -354,8 +411,9 @@ recipes/musdb18hq/models/bandmap-ablation.sfc-mamba64.teacher/config.yaml
 
 The mel-overlap builder exposes `low_freq_hz`, `low_freq_band_fraction`,
 `overlap_factor`, and `low_freq_overlap_factor` for bass/music preservation.  The
-default online packed core is about `0.03M` parameters with about `90 KiB` fp16
-layer cache at `512` preprocessed bins.
+capacity-updated DnR mel-overlap80 core is about `2.46M` parameters with about
+`90 KiB` fp16 layer cache at `512` preprocessed bins.  The fixed80 recipe remains
+the small simple mapping control unless explicitly upsized.
 
 Example DnR mel-overlap launch:
 

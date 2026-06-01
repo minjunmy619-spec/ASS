@@ -7,6 +7,8 @@ sparse_unet_branch_bands: [24, 32, 24]
 sparse_unet_encoder_layers: [1, 1]
 sparse_unet_bottleneck_layers: 2
 sparse_unet_decoder_layers: 1
+sparse_unet_fullband_capacity_hidden: 8192
+sparse_unet_fullband_capacity_layers: 1
 sparse_unet_kernel_size: [3, 3]
 sparse_unet_routing_kernel_size: [1, 3]
 sparse_unet_low_cutoff_hz: 250.0
@@ -30,6 +32,8 @@ task:
     encoder_layers: ${sparse_unet_encoder_layers}
     bottleneck_layers: ${sparse_unet_bottleneck_layers}
     decoder_layers: ${sparse_unet_decoder_layers}
+    fullband_capacity_hidden: ${sparse_unet_fullband_capacity_hidden}
+    fullband_capacity_layers: ${sparse_unet_fullband_capacity_layers}
     kernel_size: ${sparse_unet_kernel_size}
     routing_kernel_size: ${sparse_unet_routing_kernel_size}
     low_cutoff_hz: ${sparse_unet_low_cutoff_hz}

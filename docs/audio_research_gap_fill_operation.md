@@ -1000,6 +1000,297 @@ Results:
   use the established forced simplification/ONE flow.
 - `git diff --check`: pass.
 
+## 2026-06-01 Capacity And Strict-Edge Follow-Up
+
+Scope:
+
+- Re-reviewed the new proposal recipes after the first implementations were
+  found to be far below the requested `2-7M` parameter range.
+- Added NPU-friendly pooled channel-capacity mixers to the current DnR proposal
+  recipes without increasing streaming cache size.
+- Re-ran focused ONNX/ONE validation and strict-edge ONNX audits for the
+  capacity-updated cores.
+- This section supersedes the earlier initial per-model budget observations in
+  this operation log for the listed DnR proposal recipes.
+
+Capacity changes:
+
+- Added `spectral_feature_compression/core/model/npu_capacity_blocks_2d.py` with
+  `PooledChannelCapacityMixer2d`.
+- Integrated opt-in capacity mixers into adaptive-mel Locoformer-lite, prompted
+  asymmetric SFC, source-split SFC, residual-refinement SFC, adaptive mel SFC,
+  and sparse U-Net Mel-SFC.
+- Updated DnR proposal recipes so the deployable probes are in the target
+  parameter range while preserving fp16 state budgets below the DSP cache quota.
+- Replaced the dynamic `clamp_min` denominator in `SoftBandExpander2d` with the
+  existing transpose-sum-plus-epsilon export pattern to remove ONNX `Max` from
+  sparse U-Net strict-edge exports.
+
+Post-capacity verification summary:
+
+| Variant | Params | fp16 state | ONNX nodes | Conv | MatMul | Remaining risk flags | ONE/Circle |
+|---|---:|---:|---:|---:|---:|---|---|
+| `adaptive-mel-locoformer-lite-sfc.rt192k.fp512keep475` | 2497376 | 120 KiB | 316 | 51 | 3 | `activation_matmul_rank_le3=3`, `transpose=11` | PASS |
+| `prompted-asymmetric-sfc.rt192k.fp512keep475` | 2456888 | 96 KiB | 456 | 58 | 5 | `activation_matmul_rank_le3=5`, `transpose=23` | PASS |
+| `sfc-sepreformer-multistem.rt192k.fp512keep475` | 2449230 | 112 KiB | 435 | 57 | 5 | `activation_matmul_rank_le3=5`, `transpose=23` | PASS |
+| `sfc-residual-refinement.rt192k.fp512keep475` | 2451392 | 144 KiB | 282 | 43 | 4 | `activation_matmul_rank_le3=4`, `transpose=17` | PASS |
+| `bandmap-ablation.mel-overlap80.rt192k.fp512keep475` | 2456272 | 90 KiB | 268 | 37 | 3 | `activation_matmul_rank_le3=3`, `transpose=11` | PASS |
+| `sparse-unet-mel-sfc.rt192k.fp512keep475` | 2123945 | 140 KiB | 576 | 78 | 6 | `activation_matmul_rank_le3=6`, `transpose=27` | PASS |
+
+Verifier artifacts:
+
+- `logs/npu_verify_general/focused_onnx_one_20260601_capacity_adaptive_mel_loco/summary.md`
+- `logs/npu_verify_general/focused_onnx_one_20260601_capacity_prompted_sfc/summary.md`
+- `logs/npu_verify_general/focused_onnx_one_20260601_capacity_sepreformer/summary.md`
+- `logs/npu_verify_general/focused_onnx_one_20260601_capacity_residual_refinement/summary.md`
+- `logs/npu_verify_general/focused_onnx_one_20260601_capacity_mel_overlap80/summary.md`
+- `logs/npu_verify_general/focused_onnx_one_20260601_capacity_sparse_unet_no_max_simplified/summary.md`
+
+Strict-edge audit notes:
+
+- All six capacity-updated simplified ONNX graphs have zero `Tile`,
+  `ConstantOfShape`, `Expand`, `PRelu`, dynamic Slice, scalar Gather, rank>4, and
+  transpose-perm dtype risks after simplification.
+- Sparse U-Net originally emitted three ONNX `Max` nodes from the expander
+  denominator.  The denominator rewrite removes them, but the verifier must use
+  `--force-onnxsim-large-shape-ops` so `onnxsim` clears the temporary
+  shape-materialization ops before ONE import.
+- Direct `circle-verify` passed for the updated sparse U-Net no-`Max` quantized
+  Circle artifact and for the earlier five capacity-updated quantized artifacts.
+
+Commands used for the sparse no-`Max` follow-up:
+
+```bash
+./.venv/bin/python tools/online/verify_npu_variants.py \
+  --mode recipe \
+  --recipe-name-contains sparse-unet-mel-sfc \
+  --run-name focused_onnx_one_20260601_capacity_sparse_unet_no_max_simplified \
+  --force-onnxsim-large-shape-ops
+
+./.venv/bin/python tools/online/audit_onnx_model.py \
+  logs/npu_verify_general/focused_onnx_one_20260601_capacity_sparse_unet_no_max_simplified/sparse-unet-mel-sfc.rt192k.fp512keep475/model.sim.onnx \
+  --op-preset edge_npu_recommended \
+  --risk-profile tiger_one_strict_edge \
+  --transpose-threshold 500
+
+/home/cmj/works/ONE/build/compiler/circle-verify/circle-verify \
+  logs/npu_verify_general/focused_onnx_one_20260601_capacity_sparse_unet_no_max_simplified/sparse-unet-mel-sfc.rt192k.fp512keep475/model.q.circle
+```
+
+Remaining evidence gaps:
+
+- No long training was run in this pass.
+- Local DnR/MUSDB quality metrics, GMAC/s, latency/RTF, MLIR op counts, QAT, and
+  listening notes are still pending.
+
+## Prompted Asymmetric SFC Online Student
+
+Scope:
+
+- Implemented Proposal D as an opt-in fixed-output online DnR student with static
+  `speech`, `music`, and `effects` prompts.
+- Kept the deployable NPU core on the single-input packed STFT contract
+  `[B, 2*M, T, F]`; prompts are internal model parameters for the default export.
+
+Changes:
+
+- Added `spectral_feature_compression/core/model/prompted_asymmetric_sfc_2d.py`.
+- Added `PromptConditioner2d`, `PromptedTokenSplitter2d`,
+  `PromptedSharedRefiner2d`, `PromptedCrossSourceMixer2d`, and
+  `PromptedSharedDecoder2d`.
+- Added `OnlinePromptedAsymmetricSFC2D`, which uses SFC query compression,
+  a deeper shared causal encoder, and a shallower prompt-conditioned shared
+  decoder/head.
+- Added optional external prompt embeddings for PyTorch experiments while keeping
+  the default exported core prompt-static.
+- Exposed the proposal through
+  `build_prompted_asymmetric_sfc_unified_system` in
+  `spectral_feature_compression/core/model/proposed_separation_models.py`.
+- Added lazy top-level exports for the new core and prompt blocks.
+- Added recipe:
+  `recipes/dnr/models/prompted-asymmetric-sfc.rt192k.fp512keep475/config.yaml`.
+- Added prompt metadata to ONNX deploy manifests and streaming run manifests.
+- Added tests for waveform builder output, external prompt embeddings,
+  full-vs-streaming equality, prompt manifest, source-token shape, and deploy
+  fp16 state budget.
+- Added a result-manifest TODO row in
+  `docs/templates/audio_separation_results_manifest.csv`.
+
+Default packed-core budget observation:
+
+```bash
+./.venv/bin/python -c "from spectral_feature_compression.core.model.prompted_asymmetric_sfc_2d import OnlinePromptedAsymmetricSFC2D; import torch; m=OnlinePromptedAsymmetricSFC2D(n_freq=512, n_bands=64, d_model=32, n_encoder_layers=3, n_decoder_layers=1, n_src=3, n_chan=1); print('params', sum(p.numel() for p in m.parameters())); print('state_fp16_kib', m.state_size_bytes(dtype=torch.float16)/1024); print('state_fp32_kib', m.state_size_bytes(dtype=torch.float32)/1024); print('manifest', m.prompt_manifest())"
+```
+
+Result:
+
+- Parameters: `56244`.
+- fp16 layer-cache state: `96.0 KiB`.
+- fp32 layer-cache state: `192.0 KiB`.
+- Prompt manifest: fixed prompt-conditioned shared decoder with labels
+  `speech`, `music`, and `effects`.
+
+Validation commands:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/opencode/pycache \
+  ./.venv/bin/python -m py_compile \
+  spectral_feature_compression/core/model/prompted_asymmetric_sfc_2d.py \
+  spectral_feature_compression/core/model/frequency_preprocessing.py \
+  spectral_feature_compression/core/model/proposed_separation_models.py \
+  spectral_feature_compression/__init__.py \
+  tools/online/export_onnx_online_model.py \
+  tools/online/run_streaming_inference.py \
+  tests/test_proposed_separation_models.py
+
+./.venv/bin/python -m ruff check \
+  spectral_feature_compression/core/model/prompted_asymmetric_sfc_2d.py \
+  spectral_feature_compression/core/model/frequency_preprocessing.py \
+  spectral_feature_compression/core/model/proposed_separation_models.py \
+  spectral_feature_compression/__init__.py \
+  tools/online/export_onnx_online_model.py \
+  tools/online/run_streaming_inference.py \
+  tests/test_proposed_separation_models.py
+
+./.venv/bin/python -m pytest tests/test_proposed_separation_models.py
+
+./.venv/bin/python tools/online/verify_npu_variants.py \
+  --mode recipe \
+  --recipe-name-contains prompted-asymmetric-sfc \
+  --run-name focused_onnx_one_20260601_prompted_asymmetric_sfc_final \
+  --force-onnxsim-large-shape-ops
+
+./.venv/bin/python tools/online/audit_onnx_model.py \
+  logs/npu_verify_general/focused_onnx_one_20260601_prompted_asymmetric_sfc_final/prompted-asymmetric-sfc.rt192k.fp512keep475/model.sim.onnx \
+  --op-preset edge_npu_recommended \
+  --risk-profile tiger_one_strict_edge \
+  --transpose-threshold 500
+
+/home/cmj/works/ONE/build/compiler/circle-verify/circle-verify \
+  logs/npu_verify_general/focused_onnx_one_20260601_prompted_asymmetric_sfc_final/prompted-asymmetric-sfc.rt192k.fp512keep475/model.q.circle
+```
+
+Results:
+
+- `py_compile`: pass.
+- `ruff check`: pass, with only the existing pyproject deprecation warning.
+- `pytest tests/test_proposed_separation_models.py`: 12 passed, with existing
+  CUDA/autocast warnings and local `.pytest_cache` permission warning.
+- First verifier run failed at export because the base config still passed an
+  inherited `n_layers` field; `build_prompted_asymmetric_sfc_unified_system` now
+  accepts and ignores that compatibility field.
+- Full ONNX/ONE verifier pass:
+  `logs/npu_verify_general/focused_onnx_one_20260601_prompted_asymmetric_sfc_final/summary.md`
+  reports 1 PASS / 0 FAIL.
+- Verifier stage return codes: `export_rc=0`, `onnxsim_rc=0`, `dataset_rc=0`,
+  `onecc_rc=0`, `quant_granularity_used=channel`.
+- Deploy manifest records `prompt_conditioning` labels `speech`, `music`, and
+  `effects` while keeping `input_names: [x]`.
+- Simplified ONNX graph: `396` nodes, `50` Conv nodes, `5` MatMul nodes, no
+  disallowed ops.
+- Strict-edge audit flags after simplification: `activation_matmul_rank_le3=5`,
+  `transpose=23`; zero `Tile`, `ConstantOfShape`, `Expand`, `PRelu`, dynamic
+  Slice, scalar Gather, rank>4, and transpose-perm dtype risks.
+- Direct `circle-verify` on `model.q.circle`: pass.
+- Final focused regression after docs/manifest updates: YAML/CSV validation pass
+  with `23 rows x 44 columns`,
+  `pytest tests/test_online_frequency_preprocessing.py tests/test_proposed_separation_models.py`
+  reports 24 passed, and `git diff --check` passes.
+
+## Adaptive Mel-SFC Locoformer-Lite Student
+
+Scope:
+
+- Filled the missing deployable Proposal-A student path by combining the explicit
+  adaptive/overlapped mel SFC router with strict causal Locoformer-lite blocks.
+- Kept the exported core on the packed 2D STFT contract and left STFT/iSTFT,
+  PCEN, DC-bypass, and frequency preprocessing as wrapper-side deployment logic.
+
+Changes:
+
+- Added `spectral_feature_compression/core/model/adaptive_mel_locoformer_lite_sfc_2d.py`.
+- Added `AdaptiveMelLocoformerLiteBlock2d` with alternating causal time,
+  band-axis, and pointwise gated FFN branches implemented with 2D ops.
+- Added `OnlineAdaptiveMelLocoformerLiteSFC2D`, wrapper model, and
+  `build_adaptive_mel_locoformer_lite_sfc_system`.
+- Exposed the proposal through
+  `build_adaptive_mel_locoformer_lite_system` in
+  `spectral_feature_compression/core/model/proposed_separation_models.py`.
+- Added lazy top-level exports for the new core and block.
+- Added DnR recipe:
+  `recipes/dnr/models/adaptive-mel-locoformer-lite-sfc.rt192k.fp512keep475/config.yaml`.
+- Added smoke tests for waveform builder output, packed-core streaming equality,
+  adaptive mel manifest, tiny state budget, and default deploy fp16 state budget.
+- Added a TODO row to `docs/templates/audio_separation_results_manifest.csv`.
+
+Default packed-core budget observation:
+
+```bash
+./.venv/bin/python -c "from spectral_feature_compression.core.model.adaptive_mel_locoformer_lite_sfc_2d import OnlineAdaptiveMelLocoformerLiteSFC2D; import torch; m=OnlineAdaptiveMelLocoformerLiteSFC2D(n_freq=512, n_bands=80, d_model=32, n_layers=4, n_src=3, n_chan=1); print('params', sum(p.numel() for p in m.parameters())); print('state_fp16_kib', m.state_size_bytes(dtype=torch.float16)/1024); print('state_fp32_kib', m.state_size_bytes(dtype=torch.float32)/1024)"
+```
+
+Result:
+
+- Parameters: `88668`.
+- fp16 layer-cache state: `120.0 KiB`.
+- fp32 layer-cache state: `240.0 KiB`.
+
+Validation commands:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/opencode/pycache \
+  ./.venv/bin/python -m py_compile \
+  spectral_feature_compression/core/model/adaptive_mel_locoformer_lite_sfc_2d.py \
+  spectral_feature_compression/core/model/proposed_separation_models.py \
+  spectral_feature_compression/__init__.py \
+  tests/test_proposed_separation_models.py
+
+./.venv/bin/python -m ruff check \
+  spectral_feature_compression/core/model/adaptive_mel_locoformer_lite_sfc_2d.py \
+  spectral_feature_compression/core/model/proposed_separation_models.py \
+  spectral_feature_compression/__init__.py \
+  tests/test_proposed_separation_models.py
+
+./.venv/bin/python -m pytest tests/test_proposed_separation_models.py
+
+./.venv/bin/python tools/online/verify_npu_variants.py \
+  --mode recipe \
+  --recipe-name-contains adaptive-mel-locoformer-lite-sfc \
+  --run-name focused_onnx_one_20260601_adaptive_mel_locoformer_lite \
+  --force-onnxsim-large-shape-ops
+
+./.venv/bin/python tools/online/audit_onnx_model.py \
+  logs/npu_verify_general/focused_onnx_one_20260601_adaptive_mel_locoformer_lite/adaptive-mel-locoformer-lite-sfc.rt192k.fp512keep475/model.sim.onnx \
+  --op-preset edge_npu_recommended \
+  --risk-profile tiger_one_strict_edge \
+  --transpose-threshold 500
+
+/home/cmj/works/ONE/build/compiler/circle-verify/circle-verify \
+  logs/npu_verify_general/focused_onnx_one_20260601_adaptive_mel_locoformer_lite/adaptive-mel-locoformer-lite-sfc.rt192k.fp512keep475/model.q.circle
+```
+
+Results:
+
+- `py_compile`: pass.
+- `ruff check`: pass, with only the existing pyproject deprecation warning.
+- `pytest tests/test_proposed_separation_models.py`: 11 passed, with existing
+  CUDA/autocast warnings and local `.pytest_cache` permission warning.
+- Full ONNX/ONE verifier pass:
+  `logs/npu_verify_general/focused_onnx_one_20260601_adaptive_mel_locoformer_lite/summary.md`
+  reports 1 PASS / 0 FAIL.
+- Verifier stage return codes: `export_rc=0`, `onnxsim_rc=0`, `dataset_rc=0`,
+  `onecc_rc=0`, `quant_granularity_used=channel`.
+- Simplified ONNX graph: `256` nodes, `43` Conv nodes, `3` MatMul nodes, no
+  disallowed ops.
+- Strict-edge audit flags after simplification: `activation_matmul_rank_le3=3`,
+  `transpose=11`; zero `Tile`, `ConstantOfShape`, `Expand`, `PRelu`, dynamic
+  Slice, scalar Gather, rank>4, and transpose-perm dtype risks.
+- Direct `circle-verify` on `model.q.circle`: pass.
+- Result manifest CSV validation: `csv-ok 22 rows x 44 columns`.
+- Final focused regression after docs/manifest updates: YAML/CSV validation pass,
+  `pytest tests/test_online_frequency_preprocessing.py tests/test_proposed_separation_models.py`
+  reports 23 passed, and `git diff --check` passes.
+
 ## BandSFC RT+ 2-Mask Residual SFX Ablation
 
 Scope:

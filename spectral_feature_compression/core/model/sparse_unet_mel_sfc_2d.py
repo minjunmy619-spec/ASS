@@ -19,6 +19,7 @@ from spectral_feature_compression.core.model.frequency_preprocessing import (
     build_pcen_preprocessor,
     resolve_preprocessed_n_freq,
 )
+from spectral_feature_compression.core.model.npu_capacity_blocks_2d import build_capacity_mixers
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
 from spectral_feature_compression.core.model.online_sfc_2d import (
     OnlineConvBlock,
@@ -448,6 +449,8 @@ class SparseUNetMelSFC2D(nn.Module):
         encoder_layers: Sequence[int] = (1, 1),
         bottleneck_layers: int = 2,
         decoder_layers: int = 1,
+        fullband_capacity_hidden: int = 0,
+        fullband_capacity_layers: int = 0,
         kernel_size: Sequence[int] | tuple[int, int] = (3, 3),
         routing_kernel_size: Sequence[int] | tuple[int, int] = (1, 3),
         low_cutoff_hz: float = 250.0,
@@ -532,6 +535,11 @@ class SparseUNetMelSFC2D(nn.Module):
             nn.Conv2d(d_model, d_model, kernel_size=1, bias=True),
             nn.SiLU(),
         )
+        self.fullband_capacity_mixers = build_capacity_mixers(
+            channels=d_model,
+            hidden_channels=fullband_capacity_hidden,
+            n_layers=fullband_capacity_layers,
+        )
         self.out_proj = nn.Conv2d(d_model, out_ch, kernel_size=1, bias=True)
 
     def _forward_branches(self, h: torch.Tensor) -> torch.Tensor:
@@ -551,6 +559,8 @@ class SparseUNetMelSFC2D(nn.Module):
         _runtime_assert(x.shape[-1] == self.n_freq, f"{x.shape} vs {self.n_freq}")
         h = self.in_proj(x)
         h = self.merge(self._forward_branches(h) + self.input_skip(h))
+        for mixer in self.fullband_capacity_mixers:
+            h = mixer(h)
         y = self.out_proj(h)
         if self.masking:
             return apply_packed_complex_mask(x=x, y=y, n_src=self.n_src, n_chan=self.n_chan)
@@ -613,6 +623,8 @@ class SparseUNetMelSFC2D(nn.Module):
         for value in expanded[1:]:
             merged = merged + value
         h = self.merge(merged + self.input_skip(h))
+        for mixer in self.fullband_capacity_mixers:
+            h = mixer(h)
         y = self.out_proj(h)
         if self.masking:
             y = apply_packed_complex_mask(x=x, y=y, n_src=self.n_src, n_chan=self.n_chan)
@@ -698,6 +710,8 @@ def build_sparse_unet_mel_sfc_system(
     encoder_layers: Sequence[int] = (1, 1),
     bottleneck_layers: int = 2,
     decoder_layers: int = 1,
+    fullband_capacity_hidden: int = 8192,
+    fullband_capacity_layers: int = 1,
     kernel_size: Sequence[int] | tuple[int, int] = (3, 3),
     routing_kernel_size: Sequence[int] | tuple[int, int] = (1, 3),
     low_cutoff_hz: float = 250.0,
@@ -764,6 +778,8 @@ def build_sparse_unet_mel_sfc_system(
         encoder_layers=encoder_layers,
         bottleneck_layers=bottleneck_layers,
         decoder_layers=decoder_layers,
+        fullband_capacity_hidden=fullband_capacity_hidden,
+        fullband_capacity_layers=fullband_capacity_layers,
         kernel_size=kernel_size,
         routing_kernel_size=routing_kernel_size,
         low_cutoff_hz=low_cutoff_hz,

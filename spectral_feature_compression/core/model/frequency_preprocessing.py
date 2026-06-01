@@ -649,3 +649,8 @@ class FrequencyPreprocessedOnlineModel(nn.Module):
             "output_n_src": self.n_src,
             "residual_source_index": self.residual_source_index,
         }
+
+    def prompt_conditioning_manifest(self) -> dict[str, object] | None:
+        if not hasattr(self.core, "prompt_manifest"):
+            return None
+        return self.core.prompt_manifest()

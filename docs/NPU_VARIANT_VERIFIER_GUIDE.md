@@ -30,7 +30,8 @@ A variant is only `PASS` if all required artifacts exist.
 Wrapper-side preprocessing or postprocessing is not folded into the exported NPU
 core.  For example, PCEN, DC-bypass, and 2-mask residual-SFX reconstruction are
 recorded in deploy manifests, while the verifier compiles the packed core graph
-that the NPU will run.
+that the NPU will run.  Prompt-conditioned fixed-output cores record their static
+prompt labels in the manifest without adding prompt inputs to the exported graph.
 
 ---
 
@@ -150,6 +151,21 @@ Custom output run folder:
   --mode all \
   --run-name full_regression_20260516
 ```
+
+Force ONNX simplification even when shape-materialization ops appear before
+simplification:
+
+```bash
+./.venv/bin/python tools/online/verify_npu_variants.py \
+  --mode recipe \
+  --recipe-name-contains sparse-unet-mel-sfc \
+  --force-onnxsim-large-shape-ops
+```
+
+Use this for models where an exporter-safe rewrite temporarily introduces
+`ConstantOfShape` or similar shape ops that `onnxsim` can remove before ONE
+import.  Do not treat the unsimplified graph as deployable if ONE fails before
+that simplification step.
 
 ---
 

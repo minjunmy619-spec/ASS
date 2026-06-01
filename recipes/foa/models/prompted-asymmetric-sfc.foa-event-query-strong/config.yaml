@@ -1,0 +1,108 @@
+# Proposal D strong branch: FOA event-query Prompted Asymmetric SFC.
+# This is not an NPU recipe. It uses non-causal axial Transformer blocks and
+# conditions each output query on one-hot or softmax sound-event class vectors.
+
+seed: 2026
+
+sr: 32000
+n_fft: 2048
+hop_length: 512
+
+# FOA waveform input: [B, 4, samples].
+n_chan: 4
+
+# Output one mono estimate per event query: [B, n_queries, 1, samples].
+n_queries: 4
+n_src: ${n_queries}
+output_n_chan: 1
+n_event_classes: 18
+
+foa_event_query_sfc_n_bands: 128
+foa_event_query_sfc_band_config: musical
+foa_event_query_sfc_d_model: 192
+foa_event_query_sfc_heads: 8
+foa_event_query_sfc_encoder_layers: 8
+foa_event_query_sfc_decoder_layers: 4
+foa_event_query_sfc_ffn_mult: 4
+foa_event_query_sfc_dropout: 0.1
+foa_event_query_sfc_conv_kernel_size: [5, 5]
+foa_event_query_sfc_routing_kernel_size: [3, 5]
+foa_event_query_sfc_query_type: adaptive
+foa_event_query_sfc_event_condition_mode: probability
+foa_event_query_sfc_routing_normalization: softmax
+foa_event_query_sfc_residual_output: true
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 1
+  gradient_clip_val: 5.0
+  sync_batchnorm: true
+  deterministic: false
+  benchmark: true
+  precision: bf16-mixed
+
+# The datamodule for this recipe must emit either:
+#   dict(wav=<FOA mix>, ref=<FOA targets>, event_condition=<B,Q,C>), or
+#   tuple(wav, ref, event_condition).
+# event_condition can be one-hot or soft class probabilities by default. Set
+# foa_event_query_sfc_event_condition_mode to softmax/logits if passing logits.
+task:
+  _target_: spectral_feature_compression.core.tasks.conditioned_sup_task.EventConditionedSupTask
+  n_fft: ${n_fft}
+  hop_length: ${hop_length}
+  css_validation: true
+  ema_weight: 0.999
+  ema_update_freq: 1
+  event_condition_key: event_condition
+  allow_missing_event_condition: false
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_prompted_asymmetric_sfc_foa_event_query_strong_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    scaling: true
+    css_segment_size: 12
+    css_shift_size: 6
+    n_src: ${n_src}
+    n_queries: ${n_queries}
+    n_chan: ${n_chan}
+    output_n_chan: ${output_n_chan}
+    n_event_classes: ${n_event_classes}
+    n_bands: ${foa_event_query_sfc_n_bands}
+    band_config: ${foa_event_query_sfc_band_config}
+    d_model: ${foa_event_query_sfc_d_model}
+    n_heads: ${foa_event_query_sfc_heads}
+    n_encoder_layers: ${foa_event_query_sfc_encoder_layers}
+    n_decoder_layers: ${foa_event_query_sfc_decoder_layers}
+    ffn_mult: ${foa_event_query_sfc_ffn_mult}
+    dropout: ${foa_event_query_sfc_dropout}
+    conv_kernel_size: ${foa_event_query_sfc_conv_kernel_size}
+    routing_kernel_size: ${foa_event_query_sfc_routing_kernel_size}
+    sfc_query_type: ${foa_event_query_sfc_query_type}
+    event_condition_mode: ${foa_event_query_sfc_event_condition_mode}
+    masking: true
+    residual_output: ${foa_event_query_sfc_residual_output}
+    routing_normalization: ${foa_event_query_sfc_routing_normalization}
+  loss:
+    _target_: spectral_feature_compression.core.loss.snr.ThresSNRLossWithInactiveSource
+    solve_perm: false
+    n_src: ${n_src}
+    zeroref_weight: 0.1
+    only_denominator: false
+  optimizer_config:
+    _target_: aiaccel.torch.lightning.OptimizerConfig
+    optimizer_generator:
+      _partial_: true
+      _target_: torch.optim.AdamW
+      lr: 3.e-4
+      weight_decay: 1.e-2
+      betas: [0.9, 0.999]
+    scheduler_generator:
+      _partial_: true
+      _target_: spectral_feature_compression.common.lr_schedulers.warmup.WarmUpStepLR
+      warmup_steps: 10000
+      decay_start_step: 200000
+      decay_stop_step: 320000
+      step_size: 1000
+      decay: 0.98
+    scheduler_interval: step

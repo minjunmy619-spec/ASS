@@ -21,6 +21,7 @@ from spectral_feature_compression.core.model.frequency_preprocessing import (
     build_pcen_preprocessor,
     resolve_preprocessed_n_freq,
 )
+from spectral_feature_compression.core.model.npu_capacity_blocks_2d import build_capacity_mixers
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
 from spectral_feature_compression.core.model.online_sfc_2d import (
     OnlineConvBlock,
@@ -231,6 +232,8 @@ class OnlineResidualRefinementSFC2D(nn.Module):
         n_layers: int = 2,
         refinement_layers: int = 1,
         long_branch_layers: int = 1,
+        capacity_mixer_hidden: int = 0,
+        capacity_mixer_layers: int = 0,
         kernel_size: Sequence[int] | tuple[int, int] = (3, 3),
         routing_kernel_size: Sequence[int] | tuple[int, int] = (1, 3),
         dilation_cycle: Sequence[int] | None = (1, 2, 4),
@@ -282,6 +285,11 @@ class OnlineResidualRefinementSFC2D(nn.Module):
                 for dilation in self.primary_dilation_schedule
             ]
         )
+        self.capacity_mixers = build_capacity_mixers(
+            channels=d_model,
+            hidden_channels=capacity_mixer_hidden,
+            n_layers=capacity_mixer_layers,
+        )
         self.long_temporal_refiner = Mamba2LiteTemporalBranch2d(
             channels=d_model,
             n_bands=n_bands,
@@ -317,8 +325,12 @@ class OnlineResidualRefinementSFC2D(nn.Module):
         _runtime_assert(x.shape[-1] == self.n_freq, f"{x.shape} vs {self.n_freq}")
         h = self.in_proj(x)
         z, query_tokens = self.compressor(h)
-        for block in self.primary_separator:
+        for block_idx, block in enumerate(self.primary_separator):
             z = block(z)
+            if block_idx < len(self.capacity_mixers):
+                z = self.capacity_mixers[block_idx](z)
+        for block_idx in range(len(self.primary_separator), len(self.capacity_mixers)):
+            z = self.capacity_mixers[block_idx](z)
 
         z_refined = self.long_temporal_refiner(z)
         primary_context = self.expander(z, query_tokens)
@@ -376,9 +388,13 @@ class OnlineResidualRefinementSFC2D(nn.Module):
         h = self.in_proj(x)
         (z, query_tokens), new_comp_state = self.compressor.forward_stream(h, state[0])
         new_primary_states = []
-        for block, block_state in zip(self.primary_separator, state[1 : 1 + primary_count]):
+        for block_idx, (block, block_state) in enumerate(zip(self.primary_separator, state[1 : 1 + primary_count])):
             z, block_state = block.forward_stream(z, block_state)
+            if block_idx < len(self.capacity_mixers):
+                z = self.capacity_mixers[block_idx](z)
             new_primary_states.append(block_state)
+        for block_idx in range(len(self.primary_separator), len(self.capacity_mixers)):
+            z = self.capacity_mixers[block_idx](z)
 
         long_start = 1 + primary_count
         correction_start = long_start + long_count
@@ -484,6 +500,8 @@ def build_residual_refinement_sfc_system(
     n_layers: int = 2,
     refinement_layers: int = 1,
     long_branch_layers: int = 1,
+    capacity_mixer_hidden: int = 8192,
+    capacity_mixer_layers: int = 4,
     kernel_size: Sequence[int] | tuple[int, int] = (3, 3),
     routing_kernel_size: Sequence[int] | tuple[int, int] = (1, 3),
     dilation_cycle: Sequence[int] | None = (1, 2, 4),
@@ -550,6 +568,8 @@ def build_residual_refinement_sfc_system(
         n_layers=n_layers,
         refinement_layers=refinement_layers,
         long_branch_layers=long_branch_layers,
+        capacity_mixer_hidden=capacity_mixer_hidden,
+        capacity_mixer_layers=capacity_mixer_layers,
         kernel_size=kernel_size,
         routing_kernel_size=routing_kernel_size,
         dilation_cycle=dilation_cycle,

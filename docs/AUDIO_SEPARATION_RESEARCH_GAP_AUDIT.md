@@ -22,9 +22,11 @@ research notes:
   and Music and the wrapper reconstructs Effects as `mixture - speech - music`.
 - Proposal builders for:
   - `SFC-Locoformer-Lite+`
+  - `Adaptive-Mel-SFC-Locoformer-Lite`
   - `BandSFCNet-RT+`
   - `Hierarchical-SFC-FFI-Lite`
   - `Sparse U-Net Mel-SFC`
+  - `Prompted Asymmetric SFC`
   - `SFC-SepReformer-MultiStem`
   - `SFC-Residual-Refinement`
   - `Adaptive-Mel-SFC`
@@ -44,7 +46,11 @@ research notes:
 - A pinned three-stem benchmark contract and result/listening templates in
   `docs/AUDIO_SEPARATION_BENCHMARK_CONTRACT.md` and `docs/templates/`.
 - Proposal smoke tests for the RT+ preset, the SFC-Locoformer teacher builder,
-  middle/edge proposal builders, and the distillation-task fail-fast behavior.
+  adaptive-mel Locoformer-lite student, prompted asymmetric SFC, middle/edge
+  proposal builders, and the distillation-task fail-fast behavior.
+- NPU-friendly capacity mixers on the current DnR proposal recipes so the main
+  candidate probes now sit inside the requested `2-7M` parameter range without
+  increasing streaming cache size.
 - A completed TIGER older-branch compile investigation showing that all seven
   TIGER recipe branches can now reach quantized Circle after export-safe graph
   rewrites.
@@ -65,6 +71,8 @@ Current gap:
 - No trained or downloaded `SFC-Locoformer-Lite+` checkpoint is wired as the
   actual teacher.
 - `BandSFCNet-RT+` has runnable recipes but no trained metric table.
+- `Adaptive-Mel-SFC-Locoformer-Lite` now has a strict online recipe and ONNX/ONE
+  validation, but no trained metric table yet.
 - The 2-mask residual-SFX BandSFC RT+ ablation has ONNX/ONE validation but no
   trained per-stem evidence yet; SFX must be checked carefully because it is the
   residual error bucket.
@@ -149,7 +157,9 @@ Current caveats:
   the strict RT+ NPU student.
 - No trained MUSDB or DnR metrics exist yet.
 - DnR packed-core export now passes ONNX export, ONE import, ONE optimize,
-  ONE quantize, and `circle-verify`; the simplified ONNX graph has `555` nodes.
+  ONE quantize, and `circle-verify`; the capacity-updated DnR core has about
+  `2.12M` parameters, `140 KiB` fp16 state, and a `576`-node simplified ONNX
+  graph after the no-`Max` expander-denominator rewrite.
 - No trained MUSDB or DnR metrics, MUSDB export result, or GMAC/s table exists
   yet for this variant.
 
@@ -160,32 +170,57 @@ Required next work:
 - Run the DnR sibling only if the music-first probe is useful.
 - Run the MUSDB sibling export if the music-first probe becomes useful.
 
-### 4. Prompted Asymmetric SFC Is Not Implemented
+### 4. Prompted Asymmetric SFC
 
-Status: Missing
+Status: Implemented for fixed-output online DnR core; DnR ONNX/ONE validated; pending true prompt-batch training support and metrics
 
 The notes propose a future unified model with prompt-conditioned outputs.
 
-Missing:
+Implemented:
 
-- Prompt embeddings.
-- Prompt-conditioned shared decoder.
-- Prompt dropout training.
-- Task/source prompt taxonomy.
-- Category-aware PIT for same-class sources.
-- Unified speech/music/SFX output contract.
+- Added `spectral_feature_compression/core/model/prompted_asymmetric_sfc_2d.py`.
+- Added fixed static prompt embeddings for the configured output stems, with the
+  default DnR labels `speech`, `music`, and `effects`.
+- Added `PromptConditioner2d`, `PromptedTokenSplitter2d`,
+  `PromptedSharedRefiner2d`, `PromptedCrossSourceMixer2d`, and
+  `PromptedSharedDecoder2d`.
+- Added `OnlinePromptedAsymmetricSFC2D`, which uses SFC query compression,
+  a deeper shared causal encoder body, and a shallower prompt-conditioned shared
+  decoder/head.
+- Kept tensors 4D by packing fixed prompted outputs into channels and by using
+  static Python loops over the configured prompts.
+- Kept the exported ONNX/NPU core input contract as one packed complex STFT input
+  `[B, 2*M, T, F]`; static prompts are model parameters, not extra ONNX inputs.
+- Added optional external prompt embeddings for PyTorch experiments, but the
+  deployable recipe uses static prompts for compiler stability.
+- Added recipe:
+  `recipes/dnr/models/prompted-asymmetric-sfc.rt192k.fp512keep475/config.yaml`.
+- Added prompt metadata to ONNX deploy manifests and streaming run manifests.
+- Added smoke tests for waveform builder output, prompt manifest, external prompt
+  embedding path, full-vs-streaming equality, and fp16 state budget.
 
-Reason not implemented yet:
+Current caveats:
 
-This needs a real product/task/data contract. Adding placeholder prompt code
-without dataset and evaluation semantics would be misleading.
+- This is a fixed-output prompted student for the three-stem DnR product path;
+  it is not yet a dynamic prompt-input ONNX contract.
+- Prompt dropout training is not implemented yet.
+- Task/source prompt taxonomy beyond the fixed DnR labels is not pinned.
+- Category-aware PIT for multiple same-class outputs is not implemented.
+- No trained DnR or multi-task metrics exist yet.
+- The default DnR packed core has about `2.46M` parameters and `96 KiB` fp16
+  layer-cache state at `512` preprocessed bins after capacity mixing.
+- DnR packed-core export passes ONNX export, ONNX simplification, calibration
+  dataset generation, ONE import, ONE optimize, ONE quantize, and direct
+  `circle-verify`; the simplified ONNX graph has `456` nodes.
 
 Required next work:
 
-- Define prompt IDs and source taxonomy.
-- Define fixed-output vs prompted-output training stages.
-- Add datamodule support for prompt batches.
+- Train the fixed-output DnR prompted recipe against BandSFC RT+ and SFC-SepReformer.
+- Define prompt IDs and source taxonomy for non-DnR tasks before adding dynamic
+  prompt inputs to ONNX/ONE export.
+- Add datamodule/task support for prompt dropout and prompt subset batches.
 - Add category-aware PIT only where multiple same-class outputs exist.
+
 
 ### 5. SepReformer-Style Early Source Split
 
@@ -220,8 +255,8 @@ Current caveats:
 - This is a source-disentanglement ablation/middle-tier candidate, not a proven
   strict NPU student.
 - Static per-source loops export and compile for the DnR packed-core recipe; the
-  simplified ONNX graph has `375` nodes and the quantized Circle passes
-  `circle-verify`.
+  capacity-updated DnR core has about `2.45M` parameters, the simplified ONNX
+  graph has `435` nodes, and the quantized Circle passes `circle-verify`.
 - No trained DnR or MUSDB results exist yet.
 
 Required next work:
@@ -268,10 +303,10 @@ Current caveats:
   teacher/middle-tier ablation until export and runtime support are known.
 - The default uses causal dilated 2D blocks so tensors stay 4D and the state is
   budgetable; at `512` preprocessed bins the default fp16 layer cache is about
-  `144 KiB`.
+  `144 KiB` and the capacity-updated DnR core has about `2.45M` parameters.
 - No trained metric comparison against BandSFC RT+ exists yet.
 - DnR packed-core export now passes ONNX export, ONE import, ONE optimize,
-  ONE quantize, and `circle-verify`; the simplified ONNX graph has `222` nodes.
+  ONE quantize, and `circle-verify`; the simplified ONNX graph has `282` nodes.
 
 Required next work:
 
@@ -283,7 +318,7 @@ Required next work:
 
 ### 7. Adaptive Mel / Overlapped Perceptual Band Mapping
 
-Status: Implemented; DnR ONNX/ONE validated for fixed80 and mel-overlap80; pending trained ablation results
+Status: Implemented; DnR ONNX/ONE validated for fixed80, mel-overlap80, and the adaptive-mel Locoformer-lite student; pending trained ablation results
 
 Implemented:
 
@@ -302,6 +337,12 @@ Implemented:
   linear bands can be compared directly against mel-overlap bands.
 - Added `OnlineAdaptiveMelSFC2D` and proposal builder
   `build_adaptive_mel_sfc_ablation_system`.
+- Added `spectral_feature_compression/core/model/adaptive_mel_locoformer_lite_sfc_2d.py`
+  with `OnlineAdaptiveMelLocoformerLiteSFC2D`, which keeps adaptive mel SFC
+  routing and uses alternating causal time, band, and pointwise gated
+  Locoformer-lite blocks.
+- Exposed the deployable Proposal-A student through
+  `build_adaptive_mel_locoformer_lite_system`.
 - Added sibling band-mapping ablation recipes:
   - `recipes/dnr/models/bandmap-ablation.fixed80.rt192k.fp512keep475/config.yaml`
   - `recipes/musdb18hq/models/bandmap-ablation.fixed80.rt192k.fp512keep475/config.yaml`
@@ -310,8 +351,11 @@ Implemented:
   - `recipes/dnr/models/bandmap-ablation.sfc-ca80.teacher/config.yaml`
   - `recipes/musdb18hq/models/bandmap-ablation.sfc-ca80.teacher/config.yaml`
   - `recipes/musdb18hq/models/bandmap-ablation.sfc-mamba64.teacher/config.yaml`
+- Added strict DnR student recipe:
+  - `recipes/dnr/models/adaptive-mel-locoformer-lite-sfc.rt192k.fp512keep475/config.yaml`
 - Added a smoke test checking the explicit mel basis, low-frequency overlap
-  control, waveform builder output, and packed-core streaming shape.
+  control, waveform builder output, packed-core streaming shape, and deploy-size
+  fp16 state budget.
 
 Current caveats:
 
@@ -320,12 +364,19 @@ Current caveats:
 - No trained direct comparison exists yet for fixed80 vs mel-overlap80 vs SFC-CA
   vs SFC-Mamba.
 - DnR fixed80 and mel-overlap80 packed-core exports both pass ONNX export,
-  ONE import, ONE optimize, ONE quantize, and `circle-verify`; both simplified
-  ONNX graphs have `208` nodes.
+  ONE import, ONE optimize, ONE quantize, and `circle-verify`; fixed80 remains
+  the simple `208`-node control, while the capacity-updated mel-overlap80 core
+  has about `2.46M` parameters and `268` simplified ONNX nodes.
+- DnR adaptive-mel Locoformer-lite packed-core export passes ONNX export,
+  ONNX simplification, calibration generation, ONE import, ONE optimize, ONE
+  quantize, and direct `circle-verify`; the capacity-updated core has about
+  `2.50M` parameters, `316` simplified ONNX nodes, and the default fp16 layer
+  cache is about `120 KiB`.
 
 Required next work:
 
-- Train the fixed80 and mel-overlap80 DnR recipes under the same loss stack.
+- Train the adaptive-mel Locoformer-lite, fixed80, and mel-overlap80 DnR recipes
+  under the same loss stack.
 - Compare against the SFC-CA teacher and the existing SFC-Mamba teacher branch
   where dependencies are available.
 - Fill the result manifest with quality, state, node-count, and export metrics.
@@ -344,11 +395,13 @@ Done:
 - DnR ONNX/ONE validation for new proposal candidates:
   - `band-sfc-net-npu.rt-plus.2mask-residual-sfx.rt192k.fp512`: `444`
     simplified ONNX nodes, `core_n_src=2`, wrapper output `n_src=3`.
-  - `sparse-unet-mel-sfc.rt192k.fp512keep475`: `555` simplified ONNX nodes.
-  - `sfc-sepreformer-multistem.rt192k.fp512keep475`: `375` simplified ONNX nodes.
-  - `sfc-residual-refinement.rt192k.fp512keep475`: `222` simplified ONNX nodes.
+  - `sparse-unet-mel-sfc.rt192k.fp512keep475`: `576` simplified ONNX nodes.
+  - `sfc-sepreformer-multistem.rt192k.fp512keep475`: `435` simplified ONNX nodes.
+  - `sfc-residual-refinement.rt192k.fp512keep475`: `282` simplified ONNX nodes.
   - `bandmap-ablation.fixed80.rt192k.fp512keep475`: `208` simplified ONNX nodes.
-  - `bandmap-ablation.mel-overlap80.rt192k.fp512keep475`: `208` simplified ONNX nodes.
+  - `bandmap-ablation.mel-overlap80.rt192k.fp512keep475`: `268` simplified ONNX nodes.
+  - `adaptive-mel-locoformer-lite-sfc.rt192k.fp512keep475`: `316` simplified ONNX nodes.
+  - `prompted-asymmetric-sfc.rt192k.fp512keep475`: `456` simplified ONNX nodes.
 - DnR ONNX/ONE validation for remaining deployable candidates:
   - `dolphin-sfc-npu.large-6m.fp512keep475`: `314` simplified ONNX nodes.
   - `dolphin-sfc-npu.slim-6m.distill.rt192k.fp512keep475`: `314` simplified ONNX nodes.
@@ -540,7 +593,10 @@ Current gap:
   `Tile`/`Expand`/`ConstantOfShape` check. On the current
   `band_sfc_net_rt_plus_stream.onnx` artifact, the new audit reports dynamic
   `Slice` bounds and rank<=3 activation `MatMul` patterns.
-- The audit has not yet been run across every proposal candidate.
+- The audit has now been run across the current capacity-updated DnR proposal
+  candidates.  The remaining recurring conservative flag is rank<=3 activation
+  `MatMul`; sparse U-Net also required forced ONNX simplification after replacing
+  the expander denominator `Max` pattern.
 - TIGER compile success does not make TIGER the primary quality candidate; it
   mainly provides proven graph hygiene patterns for the strict NPU path.
 
@@ -573,8 +629,8 @@ Current gap:
 - The teacher path is discussed for both MUSDB and DnR, but the exact checkpoint
   selection and conversion from four-stem music training to three-stem TV/CASS
   deployment is not defined.
-- Prompted/unified future work depends on source taxonomy, but that taxonomy is
-  not pinned even for the fixed three-stem product path.
+- Prompted/unified future work beyond the fixed DnR `speech/music/effects`
+  labels still depends on a broader source taxonomy.
 
 Required next work:
 
@@ -597,8 +653,8 @@ Required next work:
    and distillation.
 8. Add true `Sparse U-Net Mel-SFC` if RT+ quality still leaves a large gap.
 9. Add DolphinSFCNPU distillation as a second deployable candidate.
-10. Only then invest in Prompted Asymmetric SFC unless unified prompted
-   separation becomes a near-term product requirement.
+10. Train the fixed-output Prompted Asymmetric SFC DnR recipe only if unified
+    prompted separation becomes a near-term product requirement.
 
 ## Bottom Line
 
@@ -609,7 +665,7 @@ plumbing. The remaining work is mostly in four buckets:
 1. Real training evidence and benchmark tables.
 2. Completing the proposed loss, augmentation, ablation, and deployment
    validation workflow with trained metrics.
-3. Filling empirical evidence for the implemented architecture probes; prompted
-   asymmetric SFC and true Mamba2 kernels remain future work.
+3. Filling empirical evidence for the implemented architecture probes; dynamic
+   prompt-batch training and true Mamba2 kernels remain future work.
 4. Turning the TIGER/ONE failure lessons and the three-stem product target into
    reusable regression checks and result manifests.

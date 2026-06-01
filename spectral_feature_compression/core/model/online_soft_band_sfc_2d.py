@@ -359,7 +359,9 @@ class SoftBandExpander2d(nn.Module):
 
         # coeff: (B, K_in, T, F_out)
         coeff = self.expansion_basis * (self.basis_scale + gains)
-        coeff = coeff / coeff.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        # Avoid dynamic clamp_min lowering to ONNX Max in strict-edge exports.
+        coeff_tr = coeff.transpose(1, -1)
+        coeff = coeff / (coeff_tr.sum(dim=-1, keepdim=True).transpose(1, -1) + 1e-6)
 
         # h_btck: (B*T, C, K_in)
         h_btck = h.permute(0, 2, 1, 3).reshape(batch * n_frames, channels, n_bands)

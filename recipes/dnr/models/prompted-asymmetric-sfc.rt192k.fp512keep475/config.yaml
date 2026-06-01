@@ -1,0 +1,49 @@
+_base_: ../online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml
+
+# Proposal D: fixed-output prompted asymmetric SFC for the DnR three-stem task.
+# The NPU export path keeps static Speech/Music/Effects prompts inside the core
+# so the deployed packed-core input remains only [B, 2*M, T, F].
+prompted_sfc_n_bands: 64
+prompted_sfc_band_config: musical
+prompted_sfc_d_model: 32
+prompted_sfc_encoder_layers: 3
+prompted_sfc_decoder_layers: 1
+prompted_sfc_encoder_capacity_hidden: 6144
+prompted_sfc_encoder_capacity_layers: 3
+prompted_sfc_source_capacity_hidden: 2048
+prompted_sfc_source_capacity_layers: 1
+prompted_sfc_kernel_size: [3, 3]
+prompted_sfc_routing_kernel_size: [1, 3]
+prompted_sfc_labels: [speech, music, effects]
+prompted_sfc_routing_normalization: softmax
+
+task:
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_prompted_asymmetric_sfc_unified_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    scaling: false
+    css_segment_size: 12
+    css_shift_size: 6
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    n_bands: ${prompted_sfc_n_bands}
+    band_config: ${prompted_sfc_band_config}
+    d_model: ${prompted_sfc_d_model}
+    n_encoder_layers: ${prompted_sfc_encoder_layers}
+    n_decoder_layers: ${prompted_sfc_decoder_layers}
+    encoder_capacity_hidden: ${prompted_sfc_encoder_capacity_hidden}
+    encoder_capacity_layers: ${prompted_sfc_encoder_capacity_layers}
+    source_capacity_hidden: ${prompted_sfc_source_capacity_hidden}
+    source_capacity_layers: ${prompted_sfc_source_capacity_layers}
+    kernel_size: ${prompted_sfc_kernel_size}
+    routing_kernel_size: ${prompted_sfc_routing_kernel_size}
+    prompt_labels: ${prompted_sfc_labels}
+    causal: true
+    masking: true
+    routing_normalization: ${prompted_sfc_routing_normalization}
+    freq_preprocess_enabled: true
+    freq_preprocess_keep_bins: 475
+    freq_preprocess_target_bins: 512
+    freq_preprocess_mode: triangular

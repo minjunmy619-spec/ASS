@@ -478,6 +478,9 @@ def write_run_manifest(
     residual_source = None
     if hasattr(online_model, "residual_source_manifest"):
         residual_source = online_model.residual_source_manifest()
+    prompt_conditioning = None
+    if hasattr(online_model, "prompt_conditioning_manifest"):
+        prompt_conditioning = online_model.prompt_conditioning_manifest()
 
     manifest = {
         "model_path": str(model_path),
@@ -499,6 +502,7 @@ def write_run_manifest(
         "pcen_preprocessing": pcen_preprocess,
         "dc_bypass": dc_bypass,
         "residual_source": residual_source,
+        "prompt_conditioning": prompt_conditioning,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -691,6 +695,11 @@ def main() -> None:
         if hasattr(online_model, "residual_source_manifest")
         else None
     )
+    prompt_manifest = (
+        online_model.prompt_conditioning_manifest()
+        if hasattr(online_model, "prompt_conditioning_manifest")
+        else None
+    )
     if freq_manifest is not None:
         print(
             "frequency_preprocess: "
@@ -709,6 +718,8 @@ def main() -> None:
             f"output={residual_manifest.get('output_n_src')} "
             f"index={residual_manifest.get('residual_source_index')}"
         )
+    if prompt_manifest is not None:
+        print(f"prompt_conditioning: labels={prompt_manifest.get('labels')}")
     print("=" * 48)
 
     for idx, src_file in enumerate(src_files, start=1):

@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/focused_onnx_one_20260601_capacity_residual_refinement/sfc-residual-refinement.rt192k.fp512keep475/calib_sample000_input00.npy

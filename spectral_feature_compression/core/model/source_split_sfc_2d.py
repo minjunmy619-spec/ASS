@@ -20,6 +20,7 @@ from spectral_feature_compression.core.model.frequency_preprocessing import (
     build_pcen_preprocessor,
     resolve_preprocessed_n_freq,
 )
+from spectral_feature_compression.core.model.npu_capacity_blocks_2d import build_capacity_mixers
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
 from spectral_feature_compression.core.model.online_sfc_2d import (
     OnlineConvBlock,
@@ -218,6 +219,8 @@ class OnlineSourceSplitSFC2D(nn.Module):
         d_model: int = 32,
         n_shared_layers: int = 1,
         n_source_layers: int = 2,
+        shared_capacity_hidden: int = 0,
+        shared_capacity_layers: int = 0,
         kernel_size: Sequence[int] | tuple[int, int] = (3, 3),
         routing_kernel_size: Sequence[int] | tuple[int, int] = (1, 3),
         causal: bool = True,
@@ -259,6 +262,11 @@ class OnlineSourceSplitSFC2D(nn.Module):
                 for _ in range(n_shared_layers)
             ]
         )
+        self.shared_capacity_mixers = build_capacity_mixers(
+            channels=d_model,
+            hidden_channels=shared_capacity_hidden,
+            n_layers=shared_capacity_layers,
+        )
         self.source_splitter = SourceTokenSplitter2d(channels=d_model, n_src=n_src)
         self.source_refiner = SharedSourceRefiner2d(
             channels=d_model,
@@ -280,8 +288,12 @@ class OnlineSourceSplitSFC2D(nn.Module):
         _runtime_assert(x.shape[-1] == self.n_freq, f"{x.shape} vs {self.n_freq}")
         h = self.in_proj(x)
         z, query_tokens = self.compressor(h)
-        for block in self.shared_analysis:
+        for block_idx, block in enumerate(self.shared_analysis):
             z = block(z)
+            if block_idx < len(self.shared_capacity_mixers):
+                z = self.shared_capacity_mixers[block_idx](z)
+        for block_idx in range(len(self.shared_analysis), len(self.shared_capacity_mixers)):
+            z = self.shared_capacity_mixers[block_idx](z)
         source_tokens = self.source_splitter(z)
         source_tokens = self.source_refiner(source_tokens)
         y = self.reconstructor(source_tokens, query_tokens, z)
@@ -334,9 +346,13 @@ class OnlineSourceSplitSFC2D(nn.Module):
         h = self.in_proj(x)
         (z, query_tokens), new_comp_state = self.compressor.forward_stream(h, state[0])
         new_shared_states = []
-        for block, block_state in zip(self.shared_analysis, state[1 : 1 + shared_count]):
+        for block_idx, (block, block_state) in enumerate(zip(self.shared_analysis, state[1 : 1 + shared_count])):
             z, block_state = block.forward_stream(z, block_state)
+            if block_idx < len(self.shared_capacity_mixers):
+                z = self.shared_capacity_mixers[block_idx](z)
             new_shared_states.append(block_state)
+        for block_idx in range(len(self.shared_analysis), len(self.shared_capacity_mixers)):
+            z = self.shared_capacity_mixers[block_idx](z)
 
         source_tokens = self.source_splitter(z)
         source_tokens, new_source_states = self.source_refiner.forward_stream(source_tokens, state[1 + shared_count :])
@@ -425,6 +441,8 @@ def build_source_split_sfc_system(
     d_model: int = 32,
     n_shared_layers: int = 1,
     n_source_layers: int = 2,
+    shared_capacity_hidden: int = 6144,
+    shared_capacity_layers: int = 4,
     kernel_size: Sequence[int] | tuple[int, int] = (3, 3),
     routing_kernel_size: Sequence[int] | tuple[int, int] = (1, 3),
     causal: bool = True,
@@ -488,6 +506,8 @@ def build_source_split_sfc_system(
         d_model=d_model,
         n_shared_layers=n_shared_layers,
         n_source_layers=n_source_layers,
+        shared_capacity_hidden=shared_capacity_hidden,
+        shared_capacity_layers=shared_capacity_layers,
         kernel_size=kernel_size,
         routing_kernel_size=routing_kernel_size,
         causal=causal,

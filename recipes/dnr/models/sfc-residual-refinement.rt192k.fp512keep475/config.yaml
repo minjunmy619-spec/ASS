@@ -8,6 +8,8 @@ residual_refine_n_bands: 64
 residual_refine_n_layers: 2
 residual_refine_long_branch_layers: 1
 residual_refine_refinement_layers: 1
+residual_refine_capacity_hidden: 8192
+residual_refine_capacity_layers: 4
 residual_refine_kernel_size: [3, 3]
 residual_refine_routing_kernel_size: [1, 3]
 residual_refine_dilation_cycle: [1, 2, 4]
@@ -32,6 +34,8 @@ task:
     n_layers: ${residual_refine_n_layers}
     long_branch_layers: ${residual_refine_long_branch_layers}
     refinement_layers: ${residual_refine_refinement_layers}
+    capacity_mixer_hidden: ${residual_refine_capacity_hidden}
+    capacity_mixer_layers: ${residual_refine_capacity_layers}
     kernel_size: ${residual_refine_kernel_size}
     routing_kernel_size: ${residual_refine_routing_kernel_size}
     dilation_cycle: ${residual_refine_dilation_cycle}
