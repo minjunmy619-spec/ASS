@@ -261,7 +261,11 @@ def load_frequency_preprocess_metadata(model_path: Path) -> dict[str, object] | 
         return None
     top_level = merge_top_level_scalars(config_path)
     model_cfg = merge_task_model_mapping(config_path)
-    context = {**top_level, **model_cfg}
+    # Model entries often mirror top-level recipe values, e.g.
+    # ``freq_preprocess_enabled: ${freq_preprocess_enabled}``.  Keep top-level
+    # values last so those self-named interpolations do not resolve to the model
+    # entry itself.
+    context = {**model_cfg, **top_level}
     enabled = resolve_value(
         model_cfg.get("freq_preprocess_enabled", top_level.get("online_freq_preprocess_enabled", False)),
         context,
@@ -296,7 +300,7 @@ def load_dc_bypass_metadata(model_path: Path) -> dict[str, object] | None:
         return None
     top_level = merge_top_level_scalars(config_path)
     model_cfg = merge_task_model_mapping(config_path)
-    context = {**top_level, **model_cfg}
+    context = {**model_cfg, **top_level}
     enabled = resolve_value(model_cfg.get("dc_bypass_enabled", False), context)
     if not bool(enabled):
         return None
@@ -316,7 +320,7 @@ def load_pcen_preprocess_metadata(model_path: Path) -> dict[str, object] | None:
         return None
     top_level = merge_top_level_scalars(config_path)
     model_cfg = merge_task_model_mapping(config_path)
-    context = {**top_level, **model_cfg}
+    context = {**model_cfg, **top_level}
     enabled = resolve_value(model_cfg.get("pcen_preprocess_enabled", False), context)
     if not bool(enabled):
         return None
@@ -359,7 +363,7 @@ def load_residual_source_metadata(model_path: Path) -> dict[str, object] | None:
         return None
     top_level = merge_top_level_scalars(config_path)
     model_cfg = merge_task_model_mapping(config_path)
-    context = {**top_level, **model_cfg}
+    context = {**model_cfg, **top_level}
     enabled = resolve_value(model_cfg.get("residual_source_enabled", False), context)
     if not bool(enabled):
         return None
@@ -626,6 +630,8 @@ def main():
     actual_n_chan = int(getattr(core, "n_chan", args.n_chan))
     if actual_n_chan != int(args.n_chan):
         raise ValueError(f"Export n_chan mismatch: --n-chan={args.n_chan}, but core expects n_chan={actual_n_chan}.")
+    core_masking_enabled = bool(getattr(core, "masking", False))
+    core_mask_activation = getattr(core, "mask_activation", None)
     if args.disable_masking and hasattr(core, "masking"):
         core = copy.deepcopy(core)
         core.masking = False
@@ -853,6 +859,12 @@ def main():
             "core_type": type(core).__name__,
             "streaming": args.streaming,
             "masking_inside_graph": not args.disable_masking,
+            "mask_postprocess": {
+                "trained_masking_enabled": core_masking_enabled,
+                "inside_graph": core_masking_enabled and not args.disable_masking,
+                "activation": core_mask_activation,
+                "external_postprocess_required": core_masking_enabled and args.disable_masking,
+            },
             "keep_initializers_as_inputs": args.keep_initializers_as_inputs,
             "frames": args.frames,
             "freqs": export_freqs,
@@ -904,6 +916,8 @@ def main():
     print("Dynamo exporter: False")
     print(f"Streaming export: {args.streaming}")
     print(f"Masking inside graph: {not args.disable_masking}")
+    if core_mask_activation is not None:
+        print(f"Mask activation: {core_mask_activation}")
     print(f"Keep initializers as inputs: {args.keep_initializers_as_inputs}")
     print(f"Externalize band constants: {args.externalize_band_constants}")
     if tiger_like:

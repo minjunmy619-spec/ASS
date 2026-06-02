@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/dolphin_mixsoftmax_force_onnxsim_20260602/dolphin-sfc-npu.slim-6m.distill-mixsoftmax.rt192k.fp512keep475/calib_sample000_input00.npy

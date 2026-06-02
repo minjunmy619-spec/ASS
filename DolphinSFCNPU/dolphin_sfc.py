@@ -35,6 +35,8 @@ Why this shape is chosen:
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -524,9 +526,12 @@ class DolphinSFCNPUSeparator(nn.Module):
         time_kernels: tuple[int, ...] | None = None,
         freq_kernels: tuple[int, ...] | None = None,
         masking: bool = True,
+        mask_activation: str = "sigmoid",
     ):
         super().__init__()
         _validate_even_pyramid(n_bands, num_scales)
+        if mask_activation not in {"sigmoid", "softmax"}:
+            raise ValueError(f"Unsupported mask_activation={mask_activation!r}; expected 'sigmoid' or 'softmax'.")
         if widths is None:
             widths = tuple(d_model * (2**i) for i in range(num_scales))
         if len(widths) != num_scales:
@@ -555,6 +560,7 @@ class DolphinSFCNPUSeparator(nn.Module):
         self.time_kernels = tuple(time_kernels)
         self.freq_kernels = tuple(freq_kernels)
         self.masking = masking
+        self.mask_activation = mask_activation
 
         self.band_spec = self._build_band_spec(
             n_freq=n_freq,
@@ -603,6 +609,26 @@ class DolphinSFCNPUSeparator(nn.Module):
         self.decoder_to_freq = SpectralDecoder2d(self.widths[0], self.band_spec)
         out_ch = n_src * n_chan if masking else 2 * n_src * n_chan
         self.out_proj = nn.Conv2d(self.widths[0], out_ch, kernel_size=1)
+        self._init_output_head()
+
+    def _init_output_head(self) -> None:
+        """Start from a mixture split instead of random source gains."""
+
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is None:
+            return
+        nn.init.zeros_(self.out_proj.bias)
+        if not self.masking:
+            return
+
+        if self.mask_activation == "softmax":
+            return
+
+        eps = 1.0e-4
+        source_gain = min(max(1.0 / float(self.n_src), eps), 1.0 - eps)
+        source_logit = math.log(source_gain / (1.0 - source_gain))
+        with torch.no_grad():
+            self.out_proj.bias.fill_(source_logit)
 
     @staticmethod
     def _build_band_spec(
@@ -637,7 +663,13 @@ class DolphinSFCNPUSeparator(nn.Module):
 
         y = self.out_proj(self.decoder_to_freq(z))
         if self.masking:
-            y = apply_source_gain_mask_4d(x, y, n_src=self.n_src, n_chan=self.n_chan)
+            y = apply_source_gain_mask_4d(
+                x,
+                y,
+                n_src=self.n_src,
+                n_chan=self.n_chan,
+                activation=self.mask_activation,
+            )
         return y
 
     # -- streaming ----------------------------------------------------------
@@ -688,7 +720,13 @@ class DolphinSFCNPUSeparator(nn.Module):
 
         y = self.out_proj(self.decoder_to_freq(z))
         if self.masking:
-            y = apply_source_gain_mask_4d(x, y, n_src=self.n_src, n_chan=self.n_chan)
+            y = apply_source_gain_mask_4d(
+                x,
+                y,
+                n_src=self.n_src,
+                n_chan=self.n_chan,
+                activation=self.mask_activation,
+            )
         return y, (tuple(new_enc_states), tuple(new_dec_states))
 
     # -- state accounting ---------------------------------------------------
@@ -716,16 +754,41 @@ def _tree_numel(tree) -> int:
 # ---------------------------------------------------------------------------
 
 
-def apply_source_gain_mask_4d(x: torch.Tensor, mask_logits: torch.Tensor, n_src: int, n_chan: int) -> torch.Tensor:
+def apply_source_gain_mask_4d(
+    x: torch.Tensor,
+    mask_logits: torch.Tensor,
+    n_src: int,
+    n_chan: int,
+    *,
+    activation: str = "sigmoid",
+) -> torch.Tensor:
     """Apply real-valued source gains to packed complex input using 4D tensors only."""
 
     _runtime_assert(x.shape[1] == 2 * n_chan, f"{x.shape[1]} vs {2 * n_chan}")
     _runtime_assert(mask_logits.shape[1] == n_src * n_chan, f"{mask_logits.shape[1]} vs {n_src * n_chan}")
-    gains = torch.sigmoid(mask_logits)
+    if activation not in {"sigmoid", "softmax"}:
+        raise ValueError(f"Unsupported activation={activation!r}; expected 'sigmoid' or 'softmax'.")
+
+    gains = torch.sigmoid(mask_logits) if activation == "sigmoid" else None
+    softmax_gains = []
+    if activation == "softmax":
+        for chan_idx in range(n_chan):
+            chan_logits = torch.cat(
+                [
+                    mask_logits[:, src_idx * n_chan + chan_idx : src_idx * n_chan + chan_idx + 1, :, :]
+                    for src_idx in range(n_src)
+                ],
+                dim=1,
+            )
+            softmax_gains.append(torch.softmax(chan_logits, dim=1))
+
     outputs = []
     for src_idx in range(n_src):
         for chan_idx in range(n_chan):
-            gain = gains[:, src_idx * n_chan + chan_idx : src_idx * n_chan + chan_idx + 1, :, :]
+            if activation == "sigmoid":
+                gain = gains[:, src_idx * n_chan + chan_idx : src_idx * n_chan + chan_idx + 1, :, :]
+            else:
+                gain = softmax_gains[chan_idx][:, src_idx : src_idx + 1, :, :]
             real = x[:, 2 * chan_idx : 2 * chan_idx + 1, :, :] * gain
             imag = x[:, 2 * chan_idx + 1 : 2 * chan_idx + 2, :, :] * gain
             outputs.extend([real, imag])
@@ -899,6 +962,7 @@ def build_dolphin_sfc_npu_preset(
     n_chan: int = 1,
     band_config: str = "musical",
     masking: bool = True,
+    mask_activation: str = "sigmoid",
 ) -> DolphinSFCNPUSeparator:
     """
     Build a named DolphinSFCNPU configuration.
@@ -922,5 +986,6 @@ def build_dolphin_sfc_npu_preset(
         n_src=n_src,
         n_chan=n_chan,
         masking=masking,
+        mask_activation=mask_activation,
         **cfg,  # type: ignore[arg-type]
     )

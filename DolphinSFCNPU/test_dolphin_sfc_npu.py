@@ -107,6 +107,34 @@ def test_training_wrapper_frequency_preprocessing_shape() -> None:
     assert system.model.core_n_freq == 257
 
 
+def test_default_output_head_initializes_to_mixture_split_gain() -> None:
+    torch.manual_seed(0)
+    model = build_dolphin_sfc_npu_preset("edge_small", n_freq=65, n_fft=128, sample_rate=16000).eval()
+    x = torch.randn(1, 2, 3, model.n_freq)
+    with torch.no_grad():
+        y = model(x)
+
+    expected = torch.cat([x / float(model.n_src) for _ in range(model.n_src)], dim=1)
+    torch.testing.assert_close(y, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_softmax_output_head_is_mixture_consistent() -> None:
+    torch.manual_seed(0)
+    model = build_dolphin_sfc_npu_preset(
+        "edge_small",
+        n_freq=65,
+        n_fft=128,
+        sample_rate=16000,
+        mask_activation="softmax",
+    ).eval()
+    x = torch.randn(1, 2, 3, model.n_freq)
+    with torch.no_grad():
+        y = model(x)
+
+    summed = y.reshape(1, model.n_src, 2 * model.n_chan, x.shape[2], x.shape[3]).sum(dim=1)
+    torch.testing.assert_close(summed, x, rtol=1e-6, atol=1e-6)
+
+
 def test_slim_presets_forward_stream_match() -> None:
     torch.manual_seed(0)
     for preset in ("slim_4m", "slim_6m", "slim_8m"):
@@ -161,6 +189,18 @@ def test_slim_presets_onnx_op_audit() -> None:
             assert len(model_proto.graph.output) == 2, [o.name for o in model_proto.graph.output]
             assert packed_state.ndim == 2 and packed_state.shape[0] == 1
 
+        model = build_dolphin_sfc_npu_preset(
+            "edge_small",
+            n_freq=257,
+            n_fft=512,
+            sample_rate=16000,
+            mask_activation="softmax",
+        ).eval()
+        model_proto, _packed_state = export_streaming_onnx(model, Path(tmpdir) / "edge_small_softmax.onnx")
+        ops = collect_ops(model_proto)
+        assert "Softmax" in ops
+        assert not sorted(ops & FORBIDDEN_EXPORT_OPS)
+
 
 def test_packed_state_roundtrip_matches_tree() -> None:
     torch.manual_seed(0)
@@ -202,6 +242,8 @@ def test_state_leaf_count_is_small() -> None:
 
 if __name__ == "__main__":
     test_forward_stream_matches_forward()
+    test_default_output_head_initializes_to_mixture_split_gain()
+    test_softmax_output_head_is_mixture_consistent()
     test_slim_presets_forward_stream_match()
     test_slim_presets_fit_param_and_state_budgets()
     test_state_leaf_count_is_small()

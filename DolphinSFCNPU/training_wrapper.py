@@ -63,6 +63,7 @@ def build_dolphin_sfc_npu_system(
     n_chan: int = 1,
     preset: str = "large_6m",
     band_config: str = "musical",
+    mask_activation: str = "sigmoid",
     scaling: bool = False,
     freq_preprocess_enabled: bool = False,
     freq_preprocess_keep_bins: int | None = None,
@@ -131,6 +132,7 @@ def build_dolphin_sfc_npu_system(
         n_chan=n_chan,
         band_config=band_config,
         masking=True,
+        mask_activation=mask_activation,
     )
     if freq_preprocessor is None and pcen_preprocessor is None and not dc_bypass_enabled:
         model = DolphinSFCNPUOnlineModel(core=core, n_src=n_src, n_chan=n_chan)

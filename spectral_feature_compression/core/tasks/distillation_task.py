@@ -180,6 +180,9 @@ class TeacherStudentDistillationTask(SupTask):
         teacher_required_weight += latent_distillation_weight
         if teacher_required_weight > 0.0 and teacher_model is None:
             raise ValueError("teacher distillation weights require teacher_model")
+        self.teacher_metric_enabled = teacher_model is not None and (
+            teacher_checkpoint_path is not None or teacher_required_weight > 0.0
+        )
         if latent_distillation_loss not in {"l1", "l2"}:
             raise ValueError("latent_distillation_loss must be 'l1' or 'l2'")
 
@@ -513,6 +516,15 @@ class TeacherStudentDistillationTask(SupTask):
         if log_prefix == "validation":
             snr_score = self.snr(est.transpose(1, 2), ref.transpose(1, 2)).mean()
             log_dict[f"{log_prefix}/snr"] = snr_score
+            if self.teacher_metric_enabled:
+                teacher_est_value, _ = get_teacher()
+                teacher_snr_score = self.snr(teacher_est_value.transpose(1, 2), ref.transpose(1, 2)).mean()
+                student_teacher_snr_score = self.snr(
+                    est.transpose(1, 2),
+                    teacher_est_value.detach().transpose(1, 2),
+                ).mean()
+                log_dict[f"{log_prefix}/teacher_snr"] = teacher_snr_score
+                log_dict[f"{log_prefix}/student_teacher_snr"] = student_teacher_snr_score
 
         self.log_dict(log_dict, prog_bar=False, on_epoch=True, on_step=False, batch_size=wav.shape[0], sync_dist=True)
         return loss

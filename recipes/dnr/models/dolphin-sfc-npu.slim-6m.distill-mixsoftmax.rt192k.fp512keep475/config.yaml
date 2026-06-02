@@ -1,0 +1,9 @@
+_base_: ../dolphin-sfc-npu.slim-6m.distill.rt192k.fp512keep475/config.yaml
+
+# Repair candidate for the first DolphinSFCNPU distillation run that plateaued
+# around validation SNR 6.9.  The default Dolphin head now initializes to a
+# mixture split, and this recipe additionally uses a source-axis softmax mask so
+# reduced-frequency estimates are mixture-consistent before synthesis.
+task:
+  model:
+    mask_activation: softmax
