@@ -401,6 +401,44 @@ Operational findings from a 22-model SFC batch:
 
 This means simplification is a high-value pre-import step, but not a full solution.
 
+### 6.8.1 Adaptive-mel Locoformer `ConstantOfShape` import failure
+
+For `adaptive-mel-locoformer-lite-sfc.rt192k.fp512keep475`, the raw exported
+ONNX contains `ConstantOfShape`. If simplification is skipped, `one-import-onnx`
+can fail before quantization with:
+
+```text
+error: invalid tensor dimension size
+onnx2circle: ... RankedTensorType ... Assertion `succeeded(...)' failed.
+```
+
+Validated local workaround:
+
+```bash
+./.venv/bin/python tools/online/verify_npu_variants.py \
+  --mode recipe \
+  --recipe-name-contains adaptive-mel-locoformer-lite-sfc \
+  --run-name <RUN_NAME> \
+  --force-onnxsim-large-shape-ops
+```
+
+Compile the simplified `model.sim.onnx`, not the raw `model.onnx`.
+
+### 6.8.2 Quantization warning: all-positive min/max
+
+ONE may print this message during uint8 asymmetric quantization when verbose luci
+logging is enabled:
+
+```text
+The minimum and maximum values are all positive.
+```
+
+In the current local ONE build this comes from `compute_asym_scale_zp` in
+`compiler/luci/pass/src/QuantizationUtils.cpp`. It is a warning that the
+calibrated range is strictly positive, not a failure by itself. Treat the compile
+as failed only if the command exits nonzero or an expected artifact such as
+`model.q.circle` is missing.
+
 ## 6.9 Known issue after simplification: `Clip/min` and broadcast add
 
 Common remaining failures:
@@ -602,4 +640,3 @@ onecc -C <CONFIG.CFG>
   - `[ ] model graph`
 - Chosen fix and reason: `______________________________`
 - Re-run result: `______________________________`
-

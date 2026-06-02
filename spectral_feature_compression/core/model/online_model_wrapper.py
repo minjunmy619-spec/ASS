@@ -133,6 +133,7 @@ class OnlineModelWrapper(nn.Module):
         self.wave_tail_pad_samples = n_fft - hop_length
 
     def forward(self, wav, **kwargs):
+        kwargs.pop("ref", None)
         left_pad = self.wave_context_samples
         right_pad = self.wave_tail_pad_samples
         wav_pad = F.pad(wav, (left_pad, right_pad))

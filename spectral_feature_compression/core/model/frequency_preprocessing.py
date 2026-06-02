@@ -487,6 +487,7 @@ class FrequencyPreprocessedOnlineModel(nn.Module):
         return self.pcen_preprocessor.invert_output_gain(y2d, gain, n_src=self.core_n_src)
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        kwargs.pop("ref", None)
         mixture2d = pack_complex_stft_as_2d(x)
         x2d, dc2d = self.split_dc_2d(mixture2d)
         core_ref = self.preprocess_2d(x2d)

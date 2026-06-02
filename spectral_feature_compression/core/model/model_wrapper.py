@@ -39,6 +39,7 @@ class ModelWrapper(nn.Module):
         self.css_batch_size = css_batch_size
 
     def forward(self, wav, **kwargs):
+        kwargs.pop("ref", None)
         if self.scaling:
             with autocast(device_type="cuda", enabled=False):
                 wav_stft = self.stft(wav)

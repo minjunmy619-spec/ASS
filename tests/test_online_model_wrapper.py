@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from spectral_feature_compression.core.model.model_wrapper import ModelWrapper
 from spectral_feature_compression.core.model.online_model_wrapper import CausalISTFTOLA, OnlineModelWrapper
 from spectral_feature_compression.core.model.online_soft_band_sfc_2d import build_online_soft_band_sfc_system
 
@@ -9,6 +10,30 @@ from spectral_feature_compression.core.model.online_soft_band_sfc_2d import buil
 class _IdentityStftModel(torch.nn.Module):
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return x
+
+
+class _SingleSourceStrictStftModel(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.unsqueeze(1)
+
+
+def test_model_wrapper_css_validation_ignores_reference_kwarg() -> None:
+    wrapper = ModelWrapper(
+        model=_SingleSourceStrictStftModel(),
+        n_fft=64,
+        hop_length=16,
+        fs=64,
+        scaling=False,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 96)
+    ref = torch.randn(1, 1, 1, 96)
+
+    with torch.no_grad():
+        est = wrapper.css(wav, ref=ref)
+
+    assert est.shape == ref.shape
 
 
 def test_causal_istft_ola_reconstructs_center_false_stft() -> None:

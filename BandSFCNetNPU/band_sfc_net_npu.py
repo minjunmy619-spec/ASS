@@ -380,6 +380,26 @@ class BandSFCNetNPU(nn.Module):
             ]
         )
         self.out_proj = nn.Conv2d(channels, out_ch * (2 if residual_head else 1), kernel_size=1, bias=True)
+        self._init_output_head()
+
+    def _init_output_head(self) -> None:
+        """Start from a conservative mixture-split mask instead of random complex gains."""
+
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is None:
+            return
+        nn.init.zeros_(self.out_proj.bias)
+        if not self.masking:
+            return
+
+        with torch.no_grad():
+            source_gain = 1.0 / float(self.n_src)
+            mask_channels = 2 * self.n_src * self.n_chan
+            for src_idx in range(self.n_src):
+                for chan_idx in range(self.n_chan):
+                    real_idx = 2 * (src_idx * self.n_chan + chan_idx)
+                    if real_idx < mask_channels:
+                        self.out_proj.bias[real_idx] = source_gain
 
     def _encode(self, x: torch.Tensor):
         if self.transport == "soft":

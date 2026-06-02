@@ -28,6 +28,7 @@ def build_band_sfc_net_npu_system(
     freq_preprocess_keep_bins: int | None = 475,
     freq_preprocess_target_bins: int | None = 512,
     freq_preprocess_mode: str = "triangular",
+    band_config: str = "musical",
     dc_bypass_enabled: bool = False,
     dc_policy: str = "zero",
     pcen_preprocess_enabled: bool = False,
@@ -52,6 +53,7 @@ def build_band_sfc_net_npu_system(
         target_bins=freq_preprocess_target_bins,
         dc_bypass_enabled=dc_bypass_enabled,
     )
+    core_n_fft = 2 * (core_n_freq - 1)
     freq_preprocessor = build_frequency_preprocessor(
         full_n_freq,
         enabled=freq_preprocess_enabled,
@@ -83,6 +85,9 @@ def build_band_sfc_net_npu_system(
     core = build_band_sfc_net_npu_preset(
         preset,
         n_freq=core_n_freq,
+        n_fft=core_n_fft,
+        sample_rate=fs,
+        band_config=band_config,
         n_src=explicit_n_src,
         n_chan=n_chan,
     )

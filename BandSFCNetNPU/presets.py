@@ -8,6 +8,9 @@ from .band_sfc_net_npu import BandSFCNetNPU
 def safe(
     n_freq: int,
     *,
+    n_fft: int | None = None,
+    sample_rate: int | None = None,
+    band_config: str = "musical",
     n_src: int = 3,
     n_chan: int = 1,
     masking: bool = True,
@@ -15,6 +18,9 @@ def safe(
     """Deployment-first baseline: soft SFC transport plus BandSCNet stages."""
     return BandSFCNetNPU(
         n_freq=n_freq,
+        n_fft=n_fft,
+        sample_rate=sample_rate,
+        band_config=band_config,
         n_bands=64,
         n_src=n_src,
         n_chan=n_chan,
@@ -33,6 +39,9 @@ def safe(
 def quality(
     n_freq: int,
     *,
+    n_fft: int | None = None,
+    sample_rate: int | None = None,
+    band_config: str = "musical",
     n_src: int = 3,
     n_chan: int = 1,
     masking: bool = True,
@@ -40,6 +49,9 @@ def quality(
     """Main quality candidate with cross-attention transport and pooled attention."""
     return BandSFCNetNPU(
         n_freq=n_freq,
+        n_fft=n_fft,
+        sample_rate=sample_rate,
+        band_config=band_config,
         n_bands=64,
         n_src=n_src,
         n_chan=n_chan,
@@ -61,6 +73,9 @@ def quality(
 def quality6m(
     n_freq: int,
     *,
+    n_fft: int | None = None,
+    sample_rate: int | None = None,
+    band_config: str = "musical",
     n_src: int = 3,
     n_chan: int = 1,
     masking: bool = True,
@@ -68,6 +83,9 @@ def quality6m(
     """Large parameter probe; validate state and compiler budget before deployment."""
     return BandSFCNetNPU(
         n_freq=n_freq,
+        n_fft=n_fft,
+        sample_rate=sample_rate,
+        band_config=band_config,
         n_bands=64,
         n_src=n_src,
         n_chan=n_chan,
@@ -89,6 +107,9 @@ def quality6m(
 def rt_plus(
     n_freq: int,
     *,
+    n_fft: int | None = None,
+    sample_rate: int | None = None,
+    band_config: str = "musical",
     n_src: int = 3,
     n_chan: int = 1,
     masking: bool = True,
@@ -96,6 +117,9 @@ def rt_plus(
     """Research proposal B: quality preset plus complex residual correction."""
     return BandSFCNetNPU(
         n_freq=n_freq,
+        n_fft=n_fft,
+        sample_rate=sample_rate,
+        band_config=band_config,
         n_bands=64,
         n_src=n_src,
         n_chan=n_chan,
@@ -127,6 +151,9 @@ def build_band_sfc_net_npu_preset(
     preset: str,
     *,
     n_freq: int,
+    n_fft: int | None = None,
+    sample_rate: int | None = None,
+    band_config: str = "musical",
     n_src: int = 3,
     n_chan: int = 1,
     masking: bool = True,
@@ -134,4 +161,12 @@ def build_band_sfc_net_npu_preset(
     if preset not in _PRESETS:
         names = ", ".join(sorted(_PRESETS))
         raise ValueError(f"Unknown BandSFCNetNPU preset {preset!r}. Available: {names}")
-    return _PRESETS[preset](n_freq=n_freq, n_src=n_src, n_chan=n_chan, masking=masking)
+    return _PRESETS[preset](
+        n_freq=n_freq,
+        n_fft=n_fft,
+        sample_rate=sample_rate,
+        band_config=band_config,
+        n_src=n_src,
+        n_chan=n_chan,
+        masking=masking,
+    )
