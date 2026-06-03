@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/dolphin_sfc_slim6m_crossattn_query_controls_20260603/dolphin-sfc-npu.slim-6m.crossattn-query.distill-mixsoftmax.rt192k.fp512keep475/calib_sample000_input00.npy

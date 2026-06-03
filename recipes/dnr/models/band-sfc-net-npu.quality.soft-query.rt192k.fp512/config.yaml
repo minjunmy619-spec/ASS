@@ -1,0 +1,7 @@
+_base_: ../band-sfc-net-npu.quality.rt192k.fp512/config.yaml
+
+# BandSFCNetNPU quality-shape explicit soft-band-query SFC transport.
+band_sfc_preset: quality_soft_band_query
+task:
+  model:
+    query_type: adaptive

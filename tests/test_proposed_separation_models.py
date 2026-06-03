@@ -388,6 +388,10 @@ def test_adaptive_mel_locoformer_lite_builder_forward_and_streaming_shape() -> N
         n_layers=2,
         dilation_cycle=(1, 2),
         capacity_mixer_layers=0,
+        encoder_capacity_mixer_hidden=16,
+        encoder_capacity_mixer_layers=1,
+        decoder_capacity_mixer_hidden=16,
+        decoder_capacity_mixer_layers=1,
         low_freq_hz=1000.0,
         low_freq_band_fraction=0.5,
         freq_preprocess_enabled=False,
@@ -438,6 +442,27 @@ def test_adaptive_mel_locoformer_lite_builder_forward_and_streaming_shape() -> N
     deploy_params = sum(p.numel() for p in deploy_core.parameters())
     assert 2_000_000 <= deploy_params <= 7_000_000
     assert deploy_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+    io_balanced_core = OnlineAdaptiveMelLocoformerLiteSFC2D(
+        n_freq=512,
+        n_bands=80,
+        d_model=40,
+        n_layers=4,
+        capacity_mixer_hidden=2048,
+        capacity_mixer_layers=2,
+        encoder_capacity_mixer_hidden=4096,
+        encoder_capacity_mixer_layers=2,
+        decoder_capacity_mixer_hidden=4096,
+        decoder_capacity_mixer_layers=2,
+    ).eval()
+    io_params = sum(p.numel() for p in io_balanced_core.parameters())
+    encoder_params = sum(p.numel() for p in io_balanced_core.encoder_capacity_mixers.parameters())
+    separator_capacity_params = sum(p.numel() for p in io_balanced_core.capacity_mixers.parameters())
+    decoder_params = sum(p.numel() for p in io_balanced_core.decoder_capacity_mixers.parameters())
+    assert 2_000_000 <= io_params <= 7_000_000
+    assert io_balanced_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+    assert encoder_params > separator_capacity_params
+    assert decoder_params > separator_capacity_params
 
 
 def test_prompted_asymmetric_sfc_builder_forward_and_streaming_shape() -> None:

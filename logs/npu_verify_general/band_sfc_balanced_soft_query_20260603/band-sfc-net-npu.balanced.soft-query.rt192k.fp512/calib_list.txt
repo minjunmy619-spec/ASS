@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/band_sfc_balanced_soft_query_20260603/band-sfc-net-npu.balanced.soft-query.rt192k.fp512/calib_sample000_input00.npy

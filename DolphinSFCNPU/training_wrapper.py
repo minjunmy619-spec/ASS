@@ -10,6 +10,7 @@ The ``DolphinSFCNPUSeparator`` forward contract is identical to
 STFT ``[B, 2*n_src*n_chan, T, F]`` out), so this wrapper mirrors the
 ``BandSCNetNPU.training_wrapper`` layout one-for-one.
 """
+
 from __future__ import annotations
 
 import torch.nn as nn
@@ -26,7 +27,7 @@ from spectral_feature_compression.core.model.online_sfc_2d import (
     unpack_2d_to_complex_stft,
 )
 
-from .dolphin_sfc import build_dolphin_sfc_npu_preset
+from .dolphin_sfc import build_dolphin_sfc_npu_from_config
 
 
 class DolphinSFCNPUOnlineModel(nn.Module):
@@ -64,6 +65,17 @@ def build_dolphin_sfc_npu_system(
     preset: str = "large_6m",
     band_config: str = "musical",
     mask_activation: str = "sigmoid",
+    query_variant: str | None = None,
+    query_type: str = "adaptive",
+    n_bands: int | None = None,
+    d_model: int | None = None,
+    num_scales: int | None = None,
+    widths: tuple[int, ...] | list[int] | None = None,
+    blocks_per_scale: tuple[int, ...] | list[int] | None = None,
+    time_kernels: tuple[int, ...] | list[int] | None = None,
+    freq_kernels: tuple[int, ...] | list[int] | None = None,
+    compressor_freq_kernel: int | None = None,
+    ffn_expansion: int | None = None,
     scaling: bool = False,
     freq_preprocess_enabled: bool = False,
     freq_preprocess_keep_bins: int | None = None,
@@ -95,6 +107,8 @@ def build_dolphin_sfc_npu_system(
           n_src: ${n_src}
           n_chan: ${n_chan}
           preset: large_6m
+          # or preset: large_6m_soft_query / large_6m_crossattn_query
+          # or query_variant: soft_band_query / crossattn_query
     """
     full_n_freq = (n_fft // 2) + 1
     core_n_freq = resolve_preprocessed_n_freq(
@@ -123,8 +137,8 @@ def build_dolphin_sfc_npu_system(
         gain_floor=pcen_gain_floor,
         gain_ceiling=pcen_gain_ceiling,
     )
-    core = build_dolphin_sfc_npu_preset(
-        preset,
+    core = build_dolphin_sfc_npu_from_config(
+        preset=preset,
         n_freq=core_n_freq,
         n_fft=n_fft,
         sample_rate=fs,
@@ -133,6 +147,17 @@ def build_dolphin_sfc_npu_system(
         band_config=band_config,
         masking=True,
         mask_activation=mask_activation,
+        query_variant=query_variant,
+        query_type=query_type,
+        n_bands=n_bands,
+        d_model=d_model,
+        num_scales=num_scales,
+        widths=widths,
+        blocks_per_scale=blocks_per_scale,
+        time_kernels=time_kernels,
+        freq_kernels=freq_kernels,
+        compressor_freq_kernel=compressor_freq_kernel,
+        ffn_expansion=ffn_expansion,
     )
     if freq_preprocessor is None and pcen_preprocessor is None and not dc_bypass_enabled:
         model = DolphinSFCNPUOnlineModel(core=core, n_src=n_src, n_chan=n_chan)

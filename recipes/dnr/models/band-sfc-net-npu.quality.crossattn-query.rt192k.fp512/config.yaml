@@ -1,0 +1,7 @@
+_base_: ../band-sfc-net-npu.quality.rt192k.fp512/config.yaml
+
+# Explicit alias for the current BandSFC quality cross-attention-query transport.
+band_sfc_preset: quality_crossattn_query
+task:
+  model:
+    query_type: adaptive

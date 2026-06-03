@@ -1,0 +1,26 @@
+_base_: ../adaptive-mel-locoformer-lite-sfc.rt192k.fp512keep475/config.yaml
+
+# IO-balanced Proposal A variant.
+# The original adaptive-mel Locoformer-lite recipe places most trainable
+# parameters in separator-side pooled capacity mixers.  This variant moves a
+# large share of capacity into the encoder and decoder sides while keeping the
+# streaming layer cache under the 192 KiB target.
+adaptive_mel_loco_d_model: 40
+adaptive_mel_loco_n_layers: 4
+adaptive_mel_loco_capacity_hidden: 2048
+adaptive_mel_loco_capacity_layers: 2
+adaptive_mel_loco_encoder_capacity_hidden: 4096
+adaptive_mel_loco_encoder_capacity_layers: 2
+adaptive_mel_loco_decoder_capacity_hidden: 4096
+adaptive_mel_loco_decoder_capacity_layers: 2
+
+task:
+  model:
+    d_model: ${adaptive_mel_loco_d_model}
+    n_layers: ${adaptive_mel_loco_n_layers}
+    capacity_mixer_hidden: ${adaptive_mel_loco_capacity_hidden}
+    capacity_mixer_layers: ${adaptive_mel_loco_capacity_layers}
+    encoder_capacity_mixer_hidden: ${adaptive_mel_loco_encoder_capacity_hidden}
+    encoder_capacity_mixer_layers: ${adaptive_mel_loco_encoder_capacity_layers}
+    decoder_capacity_mixer_hidden: ${adaptive_mel_loco_decoder_capacity_hidden}
+    decoder_capacity_mixer_layers: ${adaptive_mel_loco_decoder_capacity_layers}

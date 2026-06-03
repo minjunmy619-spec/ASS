@@ -1,0 +1,7 @@
+_base_: ../band-sfc-net-npu.rt-plus.distill.rt192k.fp512/config.yaml
+
+# RT+ residual BandSFCNetNPU with explicit soft-band-query SFC transport.
+band_sfc_preset: rt_plus_soft_band_query
+task:
+  model:
+    query_type: adaptive

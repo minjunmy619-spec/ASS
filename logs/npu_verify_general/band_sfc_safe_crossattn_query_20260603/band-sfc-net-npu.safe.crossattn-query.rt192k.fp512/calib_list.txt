@@ -1,0 +1,1 @@
+/home/cmj/works/ASS/logs/npu_verify_general/band_sfc_safe_crossattn_query_20260603/band-sfc-net-npu.safe.crossattn-query.rt192k.fp512/calib_sample000_input00.npy

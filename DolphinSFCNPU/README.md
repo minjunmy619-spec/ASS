@@ -139,9 +139,62 @@ The test suite asserts:
   guard — if somebody reintroduces an extra per-block cache, this test
   catches it).
 
+## Explicit-query variants
+
+Two opt-in Dolphin/SFC hybrids are available for ablation while preserving the
+same packed-state streaming/export contract:
+
+- `query_variant="soft_band_query"` / preset suffix `_soft_query`: the
+  stateless compressor emits both K-band latent tokens and K-band query tokens;
+  the decoder uses those query tokens to condition SFC expansion back to full
+  frequency. This is the lower-risk query path because the side-path remains on
+  the compressed band axis.
+- `query_variant="crossattn_query"` / preset suffix `_crossattn_query`: the
+  stateless compressor performs F-to-K cross-attention, and the decoder uses
+  full-frequency side embeddings as queries over K latent Dolphin tokens. This
+  is closer to query/cross-attention SFC, but has more `MatMul`/`Softmax` and
+  reshape traffic.
+
+Both variants keep the Dolphin multi-scale separator unchanged and add no extra
+streaming cache. Example presets:
+
+- `slim_6m_soft_query` / `slim_6m_soft_band_query`
+- `slim_6m_crossattn_query`
+
+The query recipe overlays expose the critical capacity/latency/performance
+controls directly in YAML:
+
+- `n_bands`: compressed band resolution and state width;
+- `d_model`: compressor/query side-path width;
+- `num_scales`, `widths`, `blocks_per_scale`: multi-scale separator capacity;
+- `time_kernels`: temporal receptive field and per-block state size;
+- `freq_kernels`: stateless frequency-mixing width;
+- `compressor_freq_kernel`: stateless compressor frequency refinement;
+- `ffn_expansion`: stateless frequency/channel FFN capacity.
+
+The current slim-6m query recipes resolve to useful-capacity models:
+
+| Recipe | Params | fp16 state | ONE result |
+|---|---:|---:|---|
+| `dolphin-sfc-npu.slim-6m.soft-query.distill-mixsoftmax.rt192k.fp512keep475` | 5.25M | 162 KiB | PASS, 782 ONNX nodes |
+| `dolphin-sfc-npu.slim-6m.crossattn-query.distill-mixsoftmax.rt192k.fp512keep475` | 5.31M | 162 KiB | PASS, 761 ONNX nodes |
+
+NPU artifact roots:
+
+```text
+logs/npu_verify_general/dolphin_sfc_slim6m_soft_query_controls_20260603
+logs/npu_verify_general/dolphin_sfc_slim6m_crossattn_query_controls_20260603
+```
+
+DnR distillation overlays are provided at:
+
+- `recipes/dnr/models/dolphin-sfc-npu.slim-6m.soft-query.distill-mixsoftmax.rt192k.fp512keep475/config.yaml`
+- `recipes/dnr/models/dolphin-sfc-npu.slim-6m.crossattn-query.distill-mixsoftmax.rt192k.fp512keep475/config.yaml`
+
 ## Presets
 
 - `edge_small`: `n_bands=32, d_model=16, widths=(16, 32, 64), blocks=(1,1,1)`. Smoke/export only.
 - `slim_4m`: `n_bands=48, d_model=128, widths=(128, 192, 256), blocks=(1,2,1)`. ~3.6 M params.
 - `slim_6m`: `n_bands=48, d_model=128, widths=(128, 224, 320), blocks=(1,2,1)`. ~5.0 M params.
-- `slim_8m`: `n_bands=48, d_model=128, widths=(128, 256, 448), blocks=(1,2,1)`. ~7.7 M params.
+- `slim_8m`: `n_bands=48, d_model=128, widths=(128, 240, 384), blocks=(1,2,1)`. ~6.5 M params.
+- Append `_soft_query` or `_crossattn_query` to any preset above to select an explicit-query variant.

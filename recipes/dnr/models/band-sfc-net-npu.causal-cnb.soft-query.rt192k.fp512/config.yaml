@@ -1,0 +1,50 @@
+_base_: ../band-sfc-net-npu.safe.rt192k.fp512/config.yaml
+
+# Proposal B — Causal BandSFC-CNB, deployable soft-query transport.
+# The document sketch uses FSMN kernel_t=5 with dilations [1, 2, 4], but the
+# current NPU validator rejects span 16.  This recipe uses the nearest safe
+# schedule [1, 2, 3] while preserving the exact CNB block structure:
+# CrossBandMixer -> CausalFSMNBandMixer -> CompressedSelfAttentionFusion.
+band_sfc_preset: causal_cnb_soft_band_query
+band_sfc_transport: soft_band_query
+band_sfc_n_bands: 48
+band_sfc_channels: 24
+band_sfc_num_stages: 5
+band_sfc_time_kernel: 1
+band_sfc_freq_kernel: 3
+band_sfc_dilation_cycle: [1, 1, 1, 1, 1]
+band_sfc_stage_type: causal_cnb
+band_sfc_cnb_kernel: 5
+band_sfc_cnb_dilation_schedule: [1, 2, 3]
+band_sfc_routing_normalization: softmax
+band_sfc_use_attn: false
+band_sfc_attn_window: 16
+band_sfc_num_heads: 4
+band_sfc_head_dim: 8
+band_sfc_pooled_mixer_hidden: 0
+band_sfc_pooled_mixer_hidden_schedule: [0, 0, 0, 0, 0]
+band_sfc_residual_head: false
+band_sfc_query_type: adaptive
+
+task:
+  model:
+    preset: ${band_sfc_preset}
+    transport: ${band_sfc_transport}
+    n_bands: ${band_sfc_n_bands}
+    channels: ${band_sfc_channels}
+    num_stages: ${band_sfc_num_stages}
+    time_kernel: ${band_sfc_time_kernel}
+    freq_kernel: ${band_sfc_freq_kernel}
+    dilation_cycle: ${band_sfc_dilation_cycle}
+    stage_type: ${band_sfc_stage_type}
+    cnb_kernel: ${band_sfc_cnb_kernel}
+    cnb_dilation_schedule: ${band_sfc_cnb_dilation_schedule}
+    routing_normalization: ${band_sfc_routing_normalization}
+    use_attn: ${band_sfc_use_attn}
+    attn_window: ${band_sfc_attn_window}
+    num_heads: ${band_sfc_num_heads}
+    head_dim: ${band_sfc_head_dim}
+    pooled_mixer_hidden: ${band_sfc_pooled_mixer_hidden}
+    pooled_mixer_hidden_schedule: ${band_sfc_pooled_mixer_hidden_schedule}
+    residual_head: ${band_sfc_residual_head}
+    query_type: ${band_sfc_query_type}

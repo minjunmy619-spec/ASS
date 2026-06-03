@@ -1,0 +1,7 @@
+_base_: ../band-sfc-net-npu.safe.rt192k.fp512/config.yaml
+
+# BandSFCNetNPU safe-shape explicit cross-attention-query SFC transport.
+band_sfc_preset: safe_crossattn_query
+task:
+  model:
+    query_type: adaptive

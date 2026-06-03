@@ -180,6 +180,10 @@ class OnlineAdaptiveMelLocoformerLiteSFC2D(nn.Module):
         ffn_expansion: int = 2,
         capacity_mixer_hidden: int = 0,
         capacity_mixer_layers: int = 0,
+        encoder_capacity_mixer_hidden: int = 0,
+        encoder_capacity_mixer_layers: int = 0,
+        decoder_capacity_mixer_hidden: int = 0,
+        decoder_capacity_mixer_layers: int = 0,
         low_freq_hz: float = 1000.0,
         low_freq_band_fraction: float = 0.45,
         overlap_factor: float = 1.5,
@@ -216,6 +220,11 @@ class OnlineAdaptiveMelLocoformerLiteSFC2D(nn.Module):
             nn.Conv2d(2 * n_chan, d_model, kernel_size=1, bias=True),
             RMSNorm2d(d_model),
         )
+        self.encoder_capacity_mixers = build_capacity_mixers(
+            channels=d_model,
+            hidden_channels=encoder_capacity_mixer_hidden,
+            n_layers=encoder_capacity_mixer_layers,
+        )
         self.compressor = SoftBandQueryCompressor2d(
             channels=d_model,
             band_spec=band_spec,
@@ -243,12 +252,19 @@ class OnlineAdaptiveMelLocoformerLiteSFC2D(nn.Module):
             n_layers=capacity_mixer_layers,
         )
         self.expander = SoftBandQueryExpander2d(channels=d_model, band_spec=band_spec)
+        self.decoder_capacity_mixers = build_capacity_mixers(
+            channels=d_model,
+            hidden_channels=decoder_capacity_mixer_hidden,
+            n_layers=decoder_capacity_mixer_layers,
+        )
         self.out_proj = nn.Conv2d(d_model, 2 * n_src * n_chan, kernel_size=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _runtime_assert(x.ndim == 4, f"Expected 4D input (B,C,T,F), got {x.shape}")
         _runtime_assert(x.shape[-1] == self.n_freq, f"{x.shape} vs {self.n_freq}")
         h = self.in_proj(x)
+        for mixer in self.encoder_capacity_mixers:
+            h = mixer(h)
         z, query_tokens = self.compressor(h)
         for block_idx, block in enumerate(self.separator):
             z = block(z)
@@ -256,7 +272,10 @@ class OnlineAdaptiveMelLocoformerLiteSFC2D(nn.Module):
                 z = self.capacity_mixers[block_idx](z)
         for block_idx in range(len(self.separator), len(self.capacity_mixers)):
             z = self.capacity_mixers[block_idx](z)
-        y = self.out_proj(self.expander(z, query_tokens))
+        h = self.expander(z, query_tokens)
+        for mixer in self.decoder_capacity_mixers:
+            h = mixer(h)
+        y = self.out_proj(h)
         if self.masking:
             return _apply_packed_complex_mask_no_repeat(x=x, y=y, n_src=self.n_src, n_chan=self.n_chan)
         return y
@@ -290,6 +309,8 @@ class OnlineAdaptiveMelLocoformerLiteSFC2D(nn.Module):
         _runtime_assert(len(state) == 1 + len(self.separator), f"Unexpected state tuple: {len(state)}")
 
         h = self.in_proj(x)
+        for mixer in self.encoder_capacity_mixers:
+            h = mixer(h)
         (z, query_tokens), new_comp_state = self.compressor.forward_stream(h, state[0])
         new_sep_states = []
         for block_idx, (block, block_state) in enumerate(zip(self.separator, state[1:])):
@@ -299,7 +320,10 @@ class OnlineAdaptiveMelLocoformerLiteSFC2D(nn.Module):
             new_sep_states.append(block_state)
         for block_idx in range(len(self.separator), len(self.capacity_mixers)):
             z = self.capacity_mixers[block_idx](z)
-        y = self.out_proj(self.expander(z, query_tokens))
+        h = self.expander(z, query_tokens)
+        for mixer in self.decoder_capacity_mixers:
+            h = mixer(h)
+        y = self.out_proj(h)
         if self.masking:
             y = _apply_packed_complex_mask_no_repeat(x=x, y=y, n_src=self.n_src, n_chan=self.n_chan)
         return y, (new_comp_state, *new_sep_states)
@@ -383,6 +407,10 @@ def build_adaptive_mel_locoformer_lite_sfc_system(
     ffn_expansion: int = 2,
     capacity_mixer_hidden: int = 6144,
     capacity_mixer_layers: int = 4,
+    encoder_capacity_mixer_hidden: int = 0,
+    encoder_capacity_mixer_layers: int = 0,
+    decoder_capacity_mixer_hidden: int = 0,
+    decoder_capacity_mixer_layers: int = 0,
     low_freq_hz: float = 1000.0,
     low_freq_band_fraction: float = 0.45,
     overlap_factor: float = 1.5,
@@ -453,6 +481,10 @@ def build_adaptive_mel_locoformer_lite_sfc_system(
         ffn_expansion=ffn_expansion,
         capacity_mixer_hidden=capacity_mixer_hidden,
         capacity_mixer_layers=capacity_mixer_layers,
+        encoder_capacity_mixer_hidden=encoder_capacity_mixer_hidden,
+        encoder_capacity_mixer_layers=encoder_capacity_mixer_layers,
+        decoder_capacity_mixer_hidden=decoder_capacity_mixer_hidden,
+        decoder_capacity_mixer_layers=decoder_capacity_mixer_layers,
         low_freq_hz=low_freq_hz,
         low_freq_band_fraction=low_freq_band_fraction,
         overlap_factor=overlap_factor,

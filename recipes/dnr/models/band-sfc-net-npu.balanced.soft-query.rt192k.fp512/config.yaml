@@ -1,0 +1,52 @@
+_base_: ../band-sfc-net-npu.safe.rt192k.fp512/config.yaml
+
+# Useful-capacity BandSFCNetNPU soft-band-query target.
+# Capacity is intentionally placed in latent width and frequency-pooled channel
+# mixers: this improves model capability while keeping streaming state under
+# the 192 KiB DSP budget.
+#
+# Critical capacity/latency/performance controls:
+# - band_sfc_channels: raises local feature width and streaming state.
+# - band_sfc_num_stages: raises depth, latency, and state leaves.
+# - band_sfc_pooled_mixer_hidden_schedule: per-stage parameter capacity with
+#   no streaming-state increase because it runs on frequency-pooled tokens.
+# - band_sfc_time_kernel / dilation_cycle: temporal receptive field and state.
+# - band_sfc_freq_kernel / n_bands: latent frequency resolution and local band mixing.
+# - attention knobs are exposed but disabled for this strict balanced variant.
+band_sfc_preset: balanced_soft_band_query
+band_sfc_transport: soft_band_query
+band_sfc_n_bands: 64
+band_sfc_channels: 40
+band_sfc_num_stages: 4
+band_sfc_time_kernel: 3
+band_sfc_freq_kernel: 3
+band_sfc_dilation_cycle: [1, 1, 2, 4]
+band_sfc_routing_normalization: softmax
+band_sfc_use_attn: false
+band_sfc_attn_window: 16
+band_sfc_num_heads: 4
+band_sfc_head_dim: 8
+band_sfc_pooled_mixer_hidden: 8192
+band_sfc_pooled_mixer_hidden_schedule: [8192, 8192, 8192, 8192]
+band_sfc_residual_head: false
+band_sfc_query_type: adaptive
+
+task:
+    model:
+        preset: ${band_sfc_preset}
+        transport: ${band_sfc_transport}
+        n_bands: ${band_sfc_n_bands}
+        channels: ${band_sfc_channels}
+        num_stages: ${band_sfc_num_stages}
+        time_kernel: ${band_sfc_time_kernel}
+        freq_kernel: ${band_sfc_freq_kernel}
+        dilation_cycle: ${band_sfc_dilation_cycle}
+        routing_normalization: ${band_sfc_routing_normalization}
+        use_attn: ${band_sfc_use_attn}
+        attn_window: ${band_sfc_attn_window}
+        num_heads: ${band_sfc_num_heads}
+        head_dim: ${band_sfc_head_dim}
+        pooled_mixer_hidden: ${band_sfc_pooled_mixer_hidden}
+        pooled_mixer_hidden_schedule: ${band_sfc_pooled_mixer_hidden_schedule}
+        residual_head: ${band_sfc_residual_head}
+        query_type: ${band_sfc_query_type}

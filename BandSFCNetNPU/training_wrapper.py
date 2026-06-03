@@ -11,7 +11,7 @@ from spectral_feature_compression.core.model.frequency_preprocessing import (
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
 
 from .band_sfc_net_npu import BandSFCNetNPUModel
-from .presets import build_band_sfc_net_npu_preset
+from .presets import build_band_sfc_net_npu_from_config
 
 
 def build_band_sfc_net_npu_system(
@@ -23,6 +23,25 @@ def build_band_sfc_net_npu_system(
     n_chan: int = 1,
     core_n_src: int | None = None,
     preset: str = "safe",
+    query_type: str = "adaptive",
+    n_bands: int | None = None,
+    channels: int | None = None,
+    num_stages: int | None = None,
+    time_kernel: int | None = None,
+    freq_kernel: int | None = None,
+    dilation_cycle: tuple[int, ...] | list[int] | None = None,
+    transport: str | None = None,
+    routing_normalization: str | None = None,
+    use_attn: bool | None = None,
+    attn_window: int | None = None,
+    num_heads: int | None = None,
+    head_dim: int | None = None,
+    pooled_mixer_hidden: int | None = None,
+    pooled_mixer_hidden_schedule: tuple[int, ...] | list[int] | None = None,
+    stage_type: str | None = None,
+    cnb_kernel: int | None = None,
+    cnb_dilation_schedule: tuple[int, ...] | list[int] | None = None,
+    residual_head: bool | None = None,
     scaling: bool = False,
     freq_preprocess_enabled: bool = True,
     freq_preprocess_keep_bins: int | None = 475,
@@ -74,22 +93,39 @@ def build_band_sfc_net_npu_system(
         gain_ceiling=pcen_gain_ceiling,
     )
     explicit_n_src = (
-        int(core_n_src)
-        if core_n_src is not None
-        else (int(n_src) - 1 if residual_source_enabled else int(n_src))
+        int(core_n_src) if core_n_src is not None else (int(n_src) - 1 if residual_source_enabled else int(n_src))
     )
     if residual_source_enabled and explicit_n_src != int(n_src) - 1:
         raise ValueError(f"residual_source_enabled expects core_n_src=n_src-1={int(n_src) - 1}, got {explicit_n_src}")
     if not residual_source_enabled and explicit_n_src != int(n_src):
         raise ValueError(f"core_n_src={explicit_n_src} requires residual_source_enabled=true when n_src={int(n_src)}")
-    core = build_band_sfc_net_npu_preset(
-        preset,
+    core = build_band_sfc_net_npu_from_config(
+        preset=preset,
         n_freq=core_n_freq,
         n_fft=core_n_fft,
         sample_rate=fs,
         band_config=band_config,
         n_src=explicit_n_src,
         n_chan=n_chan,
+        query_type=query_type,
+        n_bands=n_bands,
+        channels=channels,
+        num_stages=num_stages,
+        time_kernel=time_kernel,
+        freq_kernel=freq_kernel,
+        dilation_cycle=dilation_cycle,
+        transport=transport,
+        routing_normalization=routing_normalization,
+        use_attn=use_attn,
+        attn_window=attn_window,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        pooled_mixer_hidden=pooled_mixer_hidden,
+        pooled_mixer_hidden_schedule=pooled_mixer_hidden_schedule,
+        stage_type=stage_type,
+        cnb_kernel=cnb_kernel,
+        cnb_dilation_schedule=cnb_dilation_schedule,
+        residual_head=residual_head,
     )
     model = BandSFCNetNPUModel(core)
     if freq_preprocessor is not None or pcen_preprocessor is not None or dc_bypass_enabled or residual_source_enabled:

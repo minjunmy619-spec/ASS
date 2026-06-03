@@ -35,6 +35,7 @@ Why this shape is chosen:
 
 from __future__ import annotations
 
+from copy import deepcopy
 import math
 
 import torch
@@ -111,6 +112,16 @@ class FrozenDolphinBandSpec2d(nn.Module):
     def decode_basis(self) -> torch.Tensor:
         return self.basis / self.basis.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
+    def routing_bias(self) -> torch.Tensor:
+        """Alias used by the query/cross-attention Dolphin variants."""
+
+        return self.band_bias()
+
+    def expansion_basis(self) -> torch.Tensor:
+        """Alias used by the query/cross-attention Dolphin variants."""
+
+        return self.decode_basis()
+
 
 # ---------------------------------------------------------------------------
 # Stateless building blocks
@@ -173,6 +184,229 @@ class StatelessBandCompressor2d(nn.Module):
     # Stateless along time: streaming == offline.
     def forward_stream(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward(x)
+
+
+class StatelessSoftBandQueryCompressor2d(nn.Module):
+    """Dolphin compressor that also emits K-band query tokens.
+
+    This is the low-risk query variant: both the latent and query side-path stay
+    on the compressed band axis, so it adds no streaming cache and avoids a
+    full-resolution attention decoder.
+    """
+
+    def __init__(self, channels: int, band_spec: FrozenDolphinBandSpec2d | BandSpec2d, freq_kernel: int = 3):
+        super().__init__()
+        if freq_kernel % 2 == 0:
+            raise ValueError(f"freq_kernel must be odd; got {freq_kernel}.")
+        self.channels = channels
+        self.band_spec = band_spec
+        self.n_bands = band_spec.n_bands
+
+        self.norm = RMSNorm2d(channels)
+        self.pw = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.dw_f = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(1, freq_kernel),
+            padding=(0, freq_kernel // 2),
+            groups=channels,
+            bias=True,
+        )
+        self.score = nn.Conv2d(channels, self.n_bands, kernel_size=1, bias=True)
+        self.value = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.query = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.score_scale = nn.Parameter(torch.tensor(1.0))
+        self.bias_scale = nn.Parameter(torch.tensor(1.0))
+        self.register_buffer("band_bias", band_spec.band_bias())
+
+    def _pool(self, h: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        batch, channels, n_frames, n_freq = h.shape
+        h_btfc = h.permute(0, 2, 3, 1).reshape(batch * n_frames, n_freq, channels)
+        w_btkf = weights.permute(0, 2, 1, 3).reshape(batch * n_frames, self.n_bands, n_freq)
+        z_btkc = torch.bmm(w_btkf, h_btfc)
+        return z_btkc.reshape(batch, n_frames, self.n_bands, channels).permute(0, 3, 1, 2)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        _runtime_assert(x.shape[-1] == self.band_spec.n_freq, f"{x.shape} vs {self.band_spec.n_freq}")
+        h = F.silu(self.dw_f(self.pw(self.norm(x))))
+        scores = self.score(h) * self.score_scale + self.band_bias * self.bias_scale
+        weights = torch.softmax(scores, dim=-1)
+        return self._pool(self.value(h), weights), self._pool(self.query(h), weights)
+
+    def forward_stream(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward(x)
+
+
+class DolphinSoftBandQueryDecoder2d(nn.Module):
+    """K-band query-conditioned decoder for DolphinSFCNPU."""
+
+    def __init__(self, channels: int, query_channels: int, band_spec: FrozenDolphinBandSpec2d | BandSpec2d):
+        super().__init__()
+        self.channels = channels
+        self.query_channels = query_channels
+        self.band_spec = band_spec
+        self.n_bands = band_spec.n_bands
+        self.n_freq = band_spec.n_freq
+
+        self.latent_pre = nn.Sequential(RMSNorm2d(channels), nn.Conv2d(channels, channels, kernel_size=1, bias=True))
+        self.query_pre = nn.Sequential(
+            RMSNorm2d(query_channels),
+            nn.Conv2d(query_channels, channels, kernel_size=1, bias=True),
+        )
+        self.fuse = nn.Conv2d(2 * channels, channels, kernel_size=1, bias=True)
+        self.band_gain = nn.Conv2d(channels, 1, kernel_size=1, bias=True)
+        self.query_skip_scale = nn.Parameter(torch.tensor(1.0))
+        self.gain_scale = nn.Parameter(torch.tensor(1.0))
+        self.basis_scale = nn.Parameter(torch.tensor(1.0))
+        self.register_buffer("decode_basis", band_spec.decode_basis())
+
+    def forward(self, z: torch.Tensor, query_tokens: torch.Tensor) -> torch.Tensor:
+        _runtime_assert(z.shape[-1] == self.n_bands, f"{z.shape} vs {self.n_bands}")
+        _runtime_assert(query_tokens.shape[-1] == self.n_bands, f"{query_tokens.shape} vs {self.n_bands}")
+        latent_h = F.silu(self.latent_pre(z))
+        query_h = F.silu(self.query_pre(query_tokens))
+        fused = F.silu(self.fuse(torch.cat([latent_h, query_h], dim=1)))
+
+        gains = 1.0 + torch.sigmoid(self.band_gain(fused)) * self.gain_scale
+        gains = gains.permute(0, 3, 2, 1)  # (B, K, T, 1)
+        coeff = self.decode_basis * (self.basis_scale + gains)
+        coeff = coeff / (coeff.sum(dim=1, keepdim=True) + 1.0e-6)
+
+        tokens = latent_h + query_h * self.query_skip_scale
+        batch, channels, n_frames, _ = tokens.shape
+        tokens_btck = tokens.permute(0, 2, 1, 3).reshape(batch * n_frames, channels, self.n_bands)
+        coeff_btkf = coeff.permute(0, 2, 1, 3).reshape(batch * n_frames, self.n_bands, self.n_freq)
+        expanded = torch.bmm(tokens_btck, coeff_btkf)
+        return expanded.reshape(batch, n_frames, channels, self.n_freq).permute(0, 2, 1, 3)
+
+
+class StatelessCrossAttentionQueryCompressor2d(nn.Module):
+    """Stateless F->K cross-attention compressor for DolphinSFCNPU."""
+
+    def __init__(
+        self,
+        channels: int,
+        band_spec: FrozenDolphinBandSpec2d | BandSpec2d,
+        *,
+        freq_kernel: int = 3,
+        query_type: str = "adaptive",
+    ):
+        super().__init__()
+        if query_type not in {"adaptive", "learnable"}:
+            raise ValueError(f"Unsupported query_type={query_type!r}.")
+        if freq_kernel % 2 == 0:
+            raise ValueError(f"freq_kernel must be odd; got {freq_kernel}.")
+        self.channels = channels
+        self.band_spec = band_spec
+        self.n_bands = band_spec.n_bands
+        self.n_freq = band_spec.n_freq
+        self.query_type = query_type
+
+        self.norm = RMSNorm2d(channels)
+        self.pw = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.dw_f = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(1, freq_kernel),
+            padding=(0, freq_kernel // 2),
+            groups=channels,
+            bias=True,
+        )
+        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.k_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.v_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.score_scale = nn.Parameter(torch.tensor(1.0 / math.sqrt(max(channels, 1)), dtype=torch.float32))
+        self.prior_scale = nn.Parameter(torch.tensor(1.0))
+        self.register_buffer("routing_bias", band_spec.routing_bias())
+        self.register_buffer("query_basis", band_spec.expansion_basis())
+        if query_type == "learnable":
+            self.query = nn.Parameter(torch.randn(1, channels, 1, self.n_bands) * 0.02)
+        else:
+            self.query = None
+
+    def _pool_query_tokens(self, h: torch.Tensor) -> torch.Tensor:
+        batch, channels, n_frames, n_freq = h.shape
+        h_btfc = h.permute(0, 2, 3, 1).reshape(batch * n_frames, n_freq, channels)
+        basis_kf = self.query_basis.reshape(self.n_bands, n_freq).to(dtype=h.dtype)
+        pooled = torch.matmul(basis_kf, h_btfc)
+        return pooled.reshape(batch, n_frames, self.n_bands, channels).permute(0, 3, 1, 2)
+
+    def _prepare_query(self, h: torch.Tensor) -> torch.Tensor:
+        if self.query is not None:
+            return self.query.expand(h.shape[0], -1, h.shape[2], -1)
+        return self._pool_query_tokens(h)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        _runtime_assert(x.shape[-1] == self.n_freq, f"{x.shape} vs {self.n_freq}")
+        h = F.silu(self.dw_f(self.pw(self.norm(x))))
+        query_seed = self._prepare_query(h)
+        keys = self.k_proj(h)
+        values = self.v_proj(h)
+        queries = self.q_proj(query_seed)
+
+        batch, channels, n_frames, n_freq = h.shape
+        q = queries.permute(0, 2, 3, 1).reshape(batch * n_frames, self.n_bands, channels)
+        k = keys.permute(0, 2, 3, 1).reshape(batch * n_frames, n_freq, channels)
+        v = values.permute(0, 2, 3, 1).reshape(batch * n_frames, n_freq, channels)
+
+        scores = torch.bmm(q, k.transpose(1, 2)) * self.score_scale.to(dtype=h.dtype)
+        scores = scores.reshape(batch, n_frames, self.n_bands, n_freq)
+        bias = self.routing_bias.permute(0, 2, 1, 3).to(dtype=scores.dtype)
+        scores = scores + bias * self.prior_scale.to(dtype=scores.dtype)
+        weights = torch.softmax(scores.reshape(batch * n_frames, self.n_bands, n_freq), dim=-1)
+        z = torch.bmm(weights, v)
+        z = z.reshape(batch, n_frames, self.n_bands, channels).permute(0, 3, 1, 2)
+        return self.out_proj(z), h
+
+    def forward_stream(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward(x)
+
+
+class DolphinCrossAttentionQueryDecoder2d(nn.Module):
+    """Full-resolution query decoder: F queries attend to K Dolphin tokens."""
+
+    def __init__(self, channels: int, side_channels: int, band_spec: FrozenDolphinBandSpec2d | BandSpec2d):
+        super().__init__()
+        self.channels = channels
+        self.side_channels = side_channels
+        self.band_spec = band_spec
+        self.n_bands = band_spec.n_bands
+        self.n_freq = band_spec.n_freq
+
+        self.latent_pre = nn.Sequential(RMSNorm2d(channels), nn.Conv2d(channels, channels, kernel_size=1, bias=True))
+        self.query_pre = nn.Sequential(
+            RMSNorm2d(side_channels),
+            nn.Conv2d(side_channels, channels, kernel_size=1, bias=True),
+        )
+        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.k_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.v_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.score_scale = nn.Parameter(torch.tensor(1.0 / math.sqrt(max(channels, 1)), dtype=torch.float32))
+        self.prior_scale = nn.Parameter(torch.tensor(1.0))
+        self.query_skip_scale = nn.Parameter(torch.tensor(1.0))
+        self.register_buffer("expansion_basis", band_spec.expansion_basis())
+
+    def forward(self, z: torch.Tensor, side: torch.Tensor) -> torch.Tensor:
+        _runtime_assert(z.shape[-1] == self.n_bands, f"{z.shape} vs {self.n_bands}")
+        _runtime_assert(side.shape[-1] == self.n_freq, f"{side.shape} vs {self.n_freq}")
+        latent_h = F.silu(self.latent_pre(z))
+        query_h = F.silu(self.query_pre(side))
+
+        batch, channels, n_frames, _ = query_h.shape
+        q = self.q_proj(query_h).permute(0, 2, 3, 1).reshape(batch * n_frames, self.n_freq, channels)
+        k = self.k_proj(latent_h).permute(0, 2, 3, 1).reshape(batch * n_frames, self.n_bands, channels)
+        v = self.v_proj(latent_h).permute(0, 2, 3, 1).reshape(batch * n_frames, self.n_bands, channels)
+
+        scores = torch.bmm(q, k.transpose(1, 2)) * self.score_scale.to(dtype=query_h.dtype)
+        scores = scores.reshape(batch, n_frames, self.n_freq, self.n_bands)
+        bias = self.expansion_basis.squeeze(0).squeeze(1).transpose(0, 1).reshape(1, 1, self.n_freq, self.n_bands)
+        scores = scores + bias.to(dtype=scores.dtype) * self.prior_scale.to(dtype=scores.dtype)
+        weights = torch.softmax(scores.reshape(batch * n_frames, self.n_freq, self.n_bands), dim=-1)
+        y = torch.bmm(weights, v)
+        y = y.reshape(batch, n_frames, self.n_freq, channels).permute(0, 3, 1, 2)
+        return self.out_proj(y) + query_h * self.query_skip_scale
 
 
 class StatelessBandDown(nn.Module):
@@ -356,6 +590,7 @@ class DolphinSFCNPUSlimEncoderStage(nn.Module):
         time_kernel: int,
         freq_kernel: int,
         do_downsample: bool,
+        ffn_expansion: int = 2,
     ):
         super().__init__()
         if num_blocks < 1:
@@ -375,6 +610,7 @@ class DolphinSFCNPUSlimEncoderStage(nn.Module):
                 channels=channels_out,
                 time_kernel=time_kernel,
                 freq_kernel=freq_kernel,
+                ffn_expansion=ffn_expansion,
             )
             for _ in range(num_blocks)
         )
@@ -429,6 +665,7 @@ class DolphinSFCNPUSlimDecoderStage(nn.Module):
         time_kernel: int,
         freq_kernel: int,
         do_upsample: bool,
+        ffn_expansion: int = 2,
     ):
         super().__init__()
         if num_blocks < 1:
@@ -451,6 +688,7 @@ class DolphinSFCNPUSlimDecoderStage(nn.Module):
                 channels=channels_out,
                 time_kernel=time_kernel,
                 freq_kernel=freq_kernel,
+                ffn_expansion=ffn_expansion,
             )
             for _ in range(num_blocks)
         )
@@ -525,13 +763,24 @@ class DolphinSFCNPUSeparator(nn.Module):
         blocks_per_scale: tuple[int, ...] | None = None,
         time_kernels: tuple[int, ...] | None = None,
         freq_kernels: tuple[int, ...] | None = None,
+        compressor_freq_kernel: int = 3,
+        ffn_expansion: int = 2,
         masking: bool = True,
         mask_activation: str = "sigmoid",
+        query_variant: str = "none",
+        query_type: str = "adaptive",
     ):
         super().__init__()
         _validate_even_pyramid(n_bands, num_scales)
         if mask_activation not in {"sigmoid", "softmax"}:
             raise ValueError(f"Unsupported mask_activation={mask_activation!r}; expected 'sigmoid' or 'softmax'.")
+        if query_variant not in {"none", "soft_band_query", "crossattn_query"}:
+            raise ValueError(
+                f"Unsupported query_variant={query_variant!r}; "
+                "expected 'none', 'soft_band_query', or 'crossattn_query'."
+            )
+        if query_type not in {"adaptive", "learnable"}:
+            raise ValueError(f"Unsupported query_type={query_type!r}; expected 'adaptive' or 'learnable'.")
         if widths is None:
             widths = tuple(d_model * (2**i) for i in range(num_scales))
         if len(widths) != num_scales:
@@ -548,6 +797,12 @@ class DolphinSFCNPUSeparator(nn.Module):
             freq_kernels = (3,) * num_scales
         if len(freq_kernels) != num_scales:
             raise ValueError(f"freq_kernels must have {num_scales} entries, got {freq_kernels}.")
+        if compressor_freq_kernel % 2 == 0:
+            raise ValueError(f"compressor_freq_kernel must be odd, got {compressor_freq_kernel}.")
+        if (compressor_freq_kernel - 1) >= 14:
+            raise ValueError("compressor_freq_kernel violates AGENT.md rule 5.")
+        if ffn_expansion < 1:
+            raise ValueError(f"ffn_expansion must be >= 1, got {ffn_expansion}.")
 
         self.n_freq = n_freq
         self.n_bands = n_bands
@@ -559,8 +814,12 @@ class DolphinSFCNPUSeparator(nn.Module):
         self.blocks_per_scale = tuple(blocks_per_scale)
         self.time_kernels = tuple(time_kernels)
         self.freq_kernels = tuple(freq_kernels)
+        self.compressor_freq_kernel = compressor_freq_kernel
+        self.ffn_expansion = ffn_expansion
         self.masking = masking
         self.mask_activation = mask_activation
+        self.query_variant = query_variant
+        self.query_type = query_type
 
         self.band_spec = self._build_band_spec(
             n_freq=n_freq,
@@ -570,7 +829,21 @@ class DolphinSFCNPUSeparator(nn.Module):
             band_config=band_config,
         )
         self.in_proj = nn.Sequential(nn.Conv2d(2 * n_chan, d_model, kernel_size=1), RMSNorm2d(d_model))
-        self.compressor = StatelessBandCompressor2d(d_model, self.band_spec, freq_kernel=3)
+        if query_variant == "soft_band_query":
+            self.compressor = StatelessSoftBandQueryCompressor2d(
+                d_model,
+                self.band_spec,
+                freq_kernel=compressor_freq_kernel,
+            )
+        elif query_variant == "crossattn_query":
+            self.compressor = StatelessCrossAttentionQueryCompressor2d(
+                d_model,
+                self.band_spec,
+                freq_kernel=compressor_freq_kernel,
+                query_type=query_type,
+            )
+        else:
+            self.compressor = StatelessBandCompressor2d(d_model, self.band_spec, freq_kernel=compressor_freq_kernel)
 
         encoder_stages: list[DolphinSFCNPUSlimEncoderStage] = []
         prev_channels = d_model
@@ -583,6 +856,7 @@ class DolphinSFCNPUSeparator(nn.Module):
                     time_kernel=self.time_kernels[idx],
                     freq_kernel=self.freq_kernels[idx],
                     do_downsample=idx < num_scales - 1,
+                    ffn_expansion=ffn_expansion,
                 )
             )
             prev_channels = self.widths[idx]
@@ -602,11 +876,17 @@ class DolphinSFCNPUSeparator(nn.Module):
                     time_kernel=self.time_kernels[scale_idx],
                     freq_kernel=self.freq_kernels[scale_idx],
                     do_upsample=idx > 0,
+                    ffn_expansion=ffn_expansion,
                 )
             )
         self.decoder = nn.ModuleList(decoder_stages)
 
-        self.decoder_to_freq = SpectralDecoder2d(self.widths[0], self.band_spec)
+        if query_variant == "soft_band_query":
+            self.decoder_to_freq = DolphinSoftBandQueryDecoder2d(self.widths[0], d_model, self.band_spec)
+        elif query_variant == "crossattn_query":
+            self.decoder_to_freq = DolphinCrossAttentionQueryDecoder2d(self.widths[0], d_model, self.band_spec)
+        else:
+            self.decoder_to_freq = SpectralDecoder2d(self.widths[0], self.band_spec)
         out_ch = n_src * n_chan if masking else 2 * n_src * n_chan
         self.out_proj = nn.Conv2d(self.widths[0], out_ch, kernel_size=1)
         self._init_output_head()
@@ -646,7 +926,12 @@ class DolphinSFCNPUSeparator(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _runtime_assert(x.ndim == 4, f"Expected (B,C,T,F), got {x.shape}")
         _runtime_assert(x.shape[-1] == self.n_freq, f"{x.shape[-1]} vs {self.n_freq}")
-        z = self.compressor(self.in_proj(x))
+        query_side = None
+        compressed = self.compressor(self.in_proj(x))
+        if self.query_variant == "none":
+            z = compressed
+        else:
+            z, query_side = compressed
 
         skips: list[torch.Tensor] = []
         for stage in self.encoder:
@@ -661,7 +946,12 @@ class DolphinSFCNPUSeparator(nn.Module):
             scale_idx = self.num_scales - 1 - idx
             z = stage(z, skips[scale_idx])
 
-        y = self.out_proj(self.decoder_to_freq(z))
+        if self.query_variant == "none":
+            decoded = self.decoder_to_freq(z)
+        else:
+            _runtime_assert(query_side is not None, "Query side-path was not produced by the compressor.")
+            decoded = self.decoder_to_freq(z, query_side)
+        y = self.out_proj(decoded)
         if self.masking:
             y = apply_source_gain_mask_4d(
                 x,
@@ -678,18 +968,14 @@ class DolphinSFCNPUSeparator(nn.Module):
         enc_states: list[tuple[torch.Tensor, ...]] = []
         bands = self.n_bands
         for idx, stage in enumerate(self.encoder):
-            enc_states.append(
-                stage.init_stream_state(batch_size, freq_bins=bands, device=device, dtype=dtype)
-            )
+            enc_states.append(stage.init_stream_state(batch_size, freq_bins=bands, device=device, dtype=dtype))
             if idx < self.num_scales - 1:
                 bands = bands // 2
 
         dec_states: list[tuple[torch.Tensor, ...]] = []
         # Deepest stage first, mirroring forward_stream order.
         for idx, stage in enumerate(self.decoder):
-            dec_states.append(
-                stage.init_stream_state(batch_size, freq_bins=bands, device=device, dtype=dtype)
-            )
+            dec_states.append(stage.init_stream_state(batch_size, freq_bins=bands, device=device, dtype=dtype))
             if idx < self.num_scales - 1:
                 bands = bands * 2
 
@@ -702,7 +988,12 @@ class DolphinSFCNPUSeparator(nn.Module):
             state = self.init_stream_state(batch_size=x.shape[0], device=x.device, dtype=x.dtype)
 
         enc_states, dec_states = state
-        z = self.compressor.forward_stream(self.in_proj(x))
+        query_side = None
+        compressed = self.compressor.forward_stream(self.in_proj(x))
+        if self.query_variant == "none":
+            z = compressed
+        else:
+            z, query_side = compressed
 
         skips: list[torch.Tensor] = []
         new_enc_states: list[tuple[torch.Tensor, ...]] = []
@@ -718,7 +1009,12 @@ class DolphinSFCNPUSeparator(nn.Module):
             z, new_state = stage.forward_stream(z, skip, stage_state)
             new_dec_states.append(new_state)
 
-        y = self.out_proj(self.decoder_to_freq(z))
+        if self.query_variant == "none":
+            decoded = self.decoder_to_freq(z)
+        else:
+            _runtime_assert(query_side is not None, "Query side-path was not produced by the compressor.")
+            decoded = self.decoder_to_freq(z, query_side)
+        y = self.out_proj(decoded)
         if self.masking:
             y = apply_source_gain_mask_4d(
                 x,
@@ -769,7 +1065,7 @@ def apply_source_gain_mask_4d(
     if activation not in {"sigmoid", "softmax"}:
         raise ValueError(f"Unsupported activation={activation!r}; expected 'sigmoid' or 'softmax'.")
 
-    gains = torch.sigmoid(mask_logits) if activation == "sigmoid" else None
+    gains = torch.sigmoid(mask_logits)
     softmax_gains = []
     if activation == "softmax":
         for chan_idx in range(n_chan):
@@ -828,8 +1124,7 @@ class DolphinSFCNPUStreamingExportWrapper(nn.Module):
         for tensor in flat_state:
             if tensor.shape[0] != batch_size:
                 raise ValueError(
-                    f"All leaf state tensors must start with batch dim {batch_size}; "
-                    f"got {tuple(tensor.shape)}."
+                    f"All leaf state tensors must start with batch dim {batch_size}; got {tuple(tensor.shape)}."
                 )
             shape_wo_batch = tuple(int(d) for d in tensor.shape[1:])
             numel = int(tensor.numel() // max(batch_size, 1))
@@ -951,6 +1246,74 @@ _PRESETS: dict[str, dict[str, object]] = {
 _PRESETS["large_6m"] = dict(_PRESETS["slim_6m"])
 _PRESETS["large_8m"] = dict(_PRESETS["slim_8m"])
 
+# Query variants are named presets for recipe convenience.  They intentionally
+# reuse the same width/depth/state profile; only the compressor/decoder contract
+# changes via ``query_variant``.
+for _base_name in ("edge_small", "slim_4m", "slim_6m", "slim_8m", "large_6m", "large_8m"):
+    _PRESETS[f"{_base_name}_soft_query"] = dict(_PRESETS[_base_name], query_variant="soft_band_query")
+    _PRESETS[f"{_base_name}_soft_band_query"] = dict(_PRESETS[_base_name], query_variant="soft_band_query")
+    _PRESETS[f"{_base_name}_crossattn_query"] = dict(_PRESETS[_base_name], query_variant="crossattn_query")
+
+
+def build_dolphin_sfc_npu_from_config(
+    *,
+    preset: str,
+    n_freq: int,
+    n_fft: int | None = None,
+    sample_rate: int | None = None,
+    n_src: int = 3,
+    n_chan: int = 1,
+    band_config: str = "musical",
+    masking: bool = True,
+    mask_activation: str = "sigmoid",
+    query_variant: str | None = None,
+    query_type: str = "adaptive",
+    n_bands: int | None = None,
+    d_model: int | None = None,
+    num_scales: int | None = None,
+    widths: tuple[int, ...] | list[int] | None = None,
+    blocks_per_scale: tuple[int, ...] | list[int] | None = None,
+    time_kernels: tuple[int, ...] | list[int] | None = None,
+    freq_kernels: tuple[int, ...] | list[int] | None = None,
+    compressor_freq_kernel: int | None = None,
+    ffn_expansion: int | None = None,
+) -> DolphinSFCNPUSeparator:
+    if preset not in _PRESETS:
+        names = ", ".join(sorted(_PRESETS))
+        raise ValueError(f"Unknown DolphinSFCNPU preset {preset!r}. Available presets: {names}")
+
+    cfg = deepcopy(_PRESETS[preset])
+    preset_query_variant = cfg.pop("query_variant", "none")
+    if query_variant is None:
+        query_variant = str(preset_query_variant)
+    overrides = {
+        "n_bands": n_bands,
+        "d_model": d_model,
+        "num_scales": num_scales,
+        "widths": tuple(widths) if widths is not None else None,
+        "blocks_per_scale": tuple(blocks_per_scale) if blocks_per_scale is not None else None,
+        "time_kernels": tuple(time_kernels) if time_kernels is not None else None,
+        "freq_kernels": tuple(freq_kernels) if freq_kernels is not None else None,
+        "compressor_freq_kernel": compressor_freq_kernel,
+        "ffn_expansion": ffn_expansion,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            cfg[key] = value
+    return DolphinSFCNPUSeparator(
+        n_freq=n_freq,
+        n_fft=n_fft,
+        sample_rate=sample_rate,
+        band_config=band_config,
+        n_src=n_src,
+        n_chan=n_chan,
+        masking=masking,
+        mask_activation=mask_activation,
+        query_variant=query_variant,
+        query_type=query_type,
+        **cfg,  # type: ignore[arg-type]
+    )
+
 
 def build_dolphin_sfc_npu_preset(
     preset: str,
@@ -963,6 +1326,8 @@ def build_dolphin_sfc_npu_preset(
     band_config: str = "musical",
     masking: bool = True,
     mask_activation: str = "sigmoid",
+    query_variant: str | None = None,
+    query_type: str = "adaptive",
 ) -> DolphinSFCNPUSeparator:
     """
     Build a named DolphinSFCNPU configuration.
@@ -971,21 +1336,21 @@ def build_dolphin_sfc_npu_preset(
     - ``slim_4m``, ``slim_6m``, ``slim_8m``: 3-8M parameter range, designed to
       stay under the 192 KiB streaming-state budget at fp16 with batch=1 while
       offering useful separation capacity at the bottleneck.
+    - append ``_soft_query`` or ``_crossattn_query`` to any preset name to use
+      the new explicit-query compressor/decoder variants.  The same effect can
+      be requested with ``query_variant=...``.
     """
 
-    if preset not in _PRESETS:
-        names = ", ".join(sorted(_PRESETS))
-        raise ValueError(f"Unknown DolphinSFCNPU preset {preset!r}. Available presets: {names}")
-
-    cfg = dict(_PRESETS[preset])
-    return DolphinSFCNPUSeparator(
+    return build_dolphin_sfc_npu_from_config(
+        preset=preset,
         n_freq=n_freq,
         n_fft=n_fft,
         sample_rate=sample_rate,
-        band_config=band_config,
         n_src=n_src,
         n_chan=n_chan,
+        band_config=band_config,
         masking=masking,
         mask_activation=mask_activation,
-        **cfg,  # type: ignore[arg-type]
+        query_variant=query_variant,
+        query_type=query_type,
     )

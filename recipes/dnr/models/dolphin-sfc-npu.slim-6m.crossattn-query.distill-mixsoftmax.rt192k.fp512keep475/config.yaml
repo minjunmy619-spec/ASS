@@ -1,0 +1,32 @@
+_base_: ../dolphin-sfc-npu.slim-6m.distill-mixsoftmax.rt192k.fp512keep475/config.yaml
+
+# DolphinSFCNPU explicit-query ablation: cross-attention F<->K SFC path.
+# The compressor performs stateless F-to-K cross-attention and the decoder uses
+# full-frequency side embeddings as queries over the Dolphin latent bands.
+dolphin_preset: slim_6m_crossattn_query
+dolphin_query_variant: crossattn_query
+dolphin_query_type: adaptive
+dolphin_n_bands: 48
+dolphin_d_model: 128
+dolphin_num_scales: 3
+dolphin_widths: [128, 224, 320]
+dolphin_blocks_per_scale: [1, 2, 1]
+dolphin_time_kernels: [3, 3, 3]
+dolphin_freq_kernels: [3, 3, 3]
+dolphin_compressor_freq_kernel: 3
+dolphin_ffn_expansion: 2
+
+task:
+    model:
+        preset: ${dolphin_preset}
+        query_variant: ${dolphin_query_variant}
+        query_type: ${dolphin_query_type}
+        n_bands: ${dolphin_n_bands}
+        d_model: ${dolphin_d_model}
+        num_scales: ${dolphin_num_scales}
+        widths: ${dolphin_widths}
+        blocks_per_scale: ${dolphin_blocks_per_scale}
+        time_kernels: ${dolphin_time_kernels}
+        freq_kernels: ${dolphin_freq_kernels}
+        compressor_freq_kernel: ${dolphin_compressor_freq_kernel}
+        ffn_expansion: ${dolphin_ffn_expansion}
