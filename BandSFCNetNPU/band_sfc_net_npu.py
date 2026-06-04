@@ -23,6 +23,8 @@ import torch
 import torch.nn as nn
 
 from BandSCNetNPU.blocks import BoundedCausalAttn, CrossBandBlock, GatedAct, PooledChannelMixer
+from spectral_feature_compression.core.model.adaptive_mel_sfc_2d import AdaptiveMelBandSpec2d
+from spectral_feature_compression.core.model.npu_capacity_blocks_2d import apply_capacity_mixers, build_capacity_mixers
 from spectral_feature_compression.core.model.online_crossattn_query_sfc_2d import (
     NPUSafeCrossAttnDecoder2d,
     NPUSafeCrossAttnEncoder2d,
@@ -31,6 +33,7 @@ from spectral_feature_compression.core.model.online_sfc_2d import (
     CausalConv2d,
     RMSNorm2d,
     _runtime_assert,
+    _validate_npu_kernel_dilation_limit,
     pack_complex_stft_as_2d,
     unpack_2d_to_complex_stft,
 )
@@ -325,10 +328,7 @@ class CausalFSMNBandMixer(nn.Module):
         for output in outputs[1:]:
             y_mem = y_mem + output
         y = y_mem * torch.sigmoid(self.gate(y))
-        if self.max_context == 0:
-            new_state = history[:, :, 0:0, :]
-        else:
-            new_state = history[:, :, -self.max_context :, :]
+        new_state = history[:, :, 0:0, :] if self.max_context == 0 else history[:, :, -self.max_context :, :]
         return self.out_proj(y), new_state
 
 
@@ -391,6 +391,7 @@ class CausalCNBBlock(nn.Module):
         dilation_schedule: tuple[int, ...] | list[int] = (1, 2, 3),
         num_heads: int = 4,
         head_dim: int = 8,
+        pooled_mixer_hidden: int = 0,
     ):
         super().__init__()
         self.cross_band = CrossBandMixer(d_model, grouped=True, freq_kernel=freq_kernel)
@@ -400,6 +401,9 @@ class CausalCNBBlock(nn.Module):
             dilation_schedule=dilation_schedule,
         )
         self.csa = CompressedSelfAttentionFusion(d_model, num_heads=num_heads, head_dim=head_dim)
+        self.pooled_mixer = (
+            PooledChannelMixer(d_model, pooled_mixer_hidden) if pooled_mixer_hidden > 0 else nn.Identity()
+        )
 
     def forward(self, z: torch.Tensor, state: torch.Tensor | None = None):
         if state is not None:
@@ -408,7 +412,8 @@ class CausalCNBBlock(nn.Module):
         z = z + self.cross_band(z)
         narrow_out = self.narrow_band(z)
         z = z + narrow_out
-        return z + self.csa(z)
+        z = z + self.csa(z)
+        return self.pooled_mixer(z)
 
     def stream_context_frames(self) -> int:
         return self.narrow_band.stream_context_frames()
@@ -428,7 +433,217 @@ class CausalCNBBlock(nn.Module):
         narrow_out, state = self.narrow_band.forward_stream(z, state)
         z = z + narrow_out
         z = z + self.csa.forward_stream(z)
-        return z, state
+        return self.pooled_mixer(z), state
+
+
+class LocalTFLocoMixer(nn.Module):
+    """TF-Locoformer-inspired local mixer for compressed-band tokens.
+
+    This block adds the missing local-detail path in the earlier BandSFC CNB
+    variants without introducing Transformer/RNN operators.  It uses three
+    residual subpaths:
+
+    * causal depthwise time convolution for short local temporal detail,
+    * depthwise band convolution for neighbouring compressed-band structure,
+    * pointwise gated channel FFN for per-frame nonlinear capacity.
+
+    Activations are expressed as ``value * sigmoid(gate)`` rather than SiLU so
+    the exported graph stays within the project's basic NPU op set.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        expansion: int = 2,
+        ffn_expansion: int = 2,
+        time_kernel: int = 3,
+        band_kernel: int = 3,
+        time_dilation: int = 1,
+    ):
+        super().__init__()
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}")
+        if expansion <= 0 or ffn_expansion <= 0:
+            raise ValueError("expansion and ffn_expansion must be positive")
+        if band_kernel <= 0 or band_kernel % 2 != 1:
+            raise ValueError(f"band_kernel must be a positive odd integer, got {band_kernel}")
+        _validate_npu_kernel_dilation_limit(band_kernel, 1, axis="band")
+
+        hidden = int(channels) * int(expansion)
+        ffn_hidden = int(channels) * int(ffn_expansion)
+        self.channels = int(channels)
+        self.hidden = hidden
+        self.ffn_hidden = ffn_hidden
+        self.time_kernel = int(time_kernel)
+        self.band_kernel = int(band_kernel)
+        self.time_dilation = int(time_dilation)
+
+        self.time_norm = RMSNorm2d(channels)
+        self.time_in = nn.Conv2d(channels, 2 * hidden, kernel_size=1, bias=True)
+        self.time_dw = CausalConv2d(
+            hidden,
+            hidden,
+            kernel_size=(time_kernel, 1),
+            dilation=(time_dilation, 1),
+            groups=hidden,
+            bias=True,
+        )
+        self.time_out = nn.Conv2d(hidden, channels, kernel_size=1, bias=True)
+        self.time_scale = nn.Parameter(torch.tensor(0.1))
+
+        self.band_norm = RMSNorm2d(channels)
+        self.band_in = nn.Conv2d(channels, 2 * hidden, kernel_size=1, bias=True)
+        self.band_dw = nn.Conv2d(
+            hidden,
+            hidden,
+            kernel_size=(1, band_kernel),
+            padding=(0, band_kernel // 2),
+            groups=hidden,
+            bias=True,
+        )
+        self.band_out = nn.Conv2d(hidden, channels, kernel_size=1, bias=True)
+        self.band_scale = nn.Parameter(torch.tensor(0.1))
+
+        self.ffn_norm = RMSNorm2d(channels)
+        self.ffn_in = nn.Conv2d(channels, 2 * ffn_hidden, kernel_size=1, bias=True)
+        self.ffn_out = nn.Conv2d(ffn_hidden, channels, kernel_size=1, bias=True)
+        self.ffn_scale = nn.Parameter(torch.tensor(0.1))
+
+    @staticmethod
+    def _gate(x: torch.Tensor) -> torch.Tensor:
+        value, gate = x.chunk(2, dim=1)
+        return value * torch.sigmoid(gate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _runtime_assert(x.ndim == 4, f"Expected 4D input, got {tuple(x.shape)}")
+        y = self._gate(self.time_in(self.time_norm(x)))
+        y = self.time_dw(y)
+        x = x + self.time_out(y) * self.time_scale
+
+        y = self._gate(self.band_in(self.band_norm(x)))
+        y = self.band_dw(y)
+        x = x + self.band_out(y) * self.band_scale
+
+        y = self._gate(self.ffn_in(self.ffn_norm(x)))
+        return x + self.ffn_out(y) * self.ffn_scale
+
+    def stream_context_frames(self) -> int:
+        return self.time_dw.stream_context_frames()
+
+    def init_stream_state(
+        self,
+        batch_size: int,
+        *,
+        freq_bins: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        return self.time_dw.init_stream_state(batch_size, freq_bins=freq_bins, device=device, dtype=dtype)
+
+    def forward_stream(self, x: torch.Tensor, state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        _runtime_assert(x.ndim == 4, f"Expected 4D input, got {tuple(x.shape)}")
+        _runtime_assert(x.shape[2] == 1, f"Expected single-frame input, got T={x.shape[2]}")
+        y = self._gate(self.time_in(self.time_norm(x)))
+        y, new_state = self.time_dw.forward_stream(y, state)
+        x = x + self.time_out(y) * self.time_scale
+
+        y = self._gate(self.band_in(self.band_norm(x)))
+        y = self.band_dw(y)
+        x = x + self.band_out(y) * self.band_scale
+
+        y = self._gate(self.ffn_in(self.ffn_norm(x)))
+        return x + self.ffn_out(y) * self.ffn_scale, new_state
+
+
+class CausalLocoCNBBlock(nn.Module):
+    """Stronger CNB stage with local TF modeling plus causal FSMN memory.
+
+    Compared with :class:`CausalCNBBlock`, this stage adds a local
+    TF-Locoformer-style mixer before the cross/narrow/attention CNB flow.  The
+    deployable presets use ``cnb_kernel=4`` with dilations ``(1, 2, 3)`` so the
+    FSMN cache has 9 frames.  Together with the 2-frame local time cache, each
+    stage stores 11 frames, keeping five stages at fp512 under 192 KiB.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        freq_kernel: int = 3,
+        cnb_kernel: int = 4,
+        cnb_dilation_schedule: tuple[int, ...] | list[int] = (1, 2, 3),
+        num_heads: int = 4,
+        head_dim: int = 8,
+        pooled_mixer_hidden: int = 0,
+        loco_expansion: int = 2,
+        loco_ffn_expansion: int = 2,
+        loco_time_kernel: int = 3,
+        loco_band_kernel: int = 3,
+        loco_time_dilation: int = 1,
+    ):
+        super().__init__()
+        self.local = LocalTFLocoMixer(
+            d_model,
+            expansion=loco_expansion,
+            ffn_expansion=loco_ffn_expansion,
+            time_kernel=loco_time_kernel,
+            band_kernel=loco_band_kernel,
+            time_dilation=loco_time_dilation,
+        )
+        self.cross_band = CrossBandMixer(d_model, grouped=True, freq_kernel=freq_kernel)
+        self.narrow_band = CausalFSMNBandMixer(
+            d_model,
+            kernel_t=cnb_kernel,
+            dilation_schedule=cnb_dilation_schedule,
+        )
+        self.csa = CompressedSelfAttentionFusion(d_model, num_heads=num_heads, head_dim=head_dim)
+        self.pooled_mixer = (
+            PooledChannelMixer(d_model, pooled_mixer_hidden) if pooled_mixer_hidden > 0 else nn.Identity()
+        )
+
+    def forward(self, z: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor] | None = None):
+        if state is not None:
+            _runtime_assert(
+                z.shape[2] == 1, f"Stateful Loco-CNB forward expects single-frame input, got T={z.shape[2]}"
+            )
+            return self.forward_stream(z, state)
+        z = self.local(z)
+        z = z + self.cross_band(z)
+        narrow_out = self.narrow_band(z)
+        z = z + narrow_out
+        z = z + self.csa(z)
+        return self.pooled_mixer(z)
+
+    def stream_context_frames(self) -> int:
+        return self.local.stream_context_frames() + self.narrow_band.stream_context_frames()
+
+    def init_stream_state(
+        self,
+        batch_size: int,
+        *,
+        freq_bins: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        local_state = self.local.init_stream_state(batch_size, freq_bins=freq_bins, device=device, dtype=dtype)
+        narrow_state = self.narrow_band.init_stream_state(batch_size, freq_bins=freq_bins, device=device, dtype=dtype)
+        return local_state, narrow_state
+
+    def forward_stream(
+        self,
+        z: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if state is None:
+            state = self.init_stream_state(z.shape[0], freq_bins=z.shape[-1], device=z.device, dtype=z.dtype)
+        local_state, narrow_state = state
+        z, new_local_state = self.local.forward_stream(z, local_state)
+        z = z + self.cross_band(z)
+        narrow_out, new_narrow_state = self.narrow_band.forward_stream(z, narrow_state)
+        z = z + narrow_out
+        z = z + self.csa.forward_stream(z)
+        return self.pooled_mixer(z), (new_local_state, new_narrow_state)
 
 
 class BandSFCStage(nn.Module):
@@ -551,9 +766,24 @@ class BandSFCNetNPU(nn.Module):
         head_dim: int = 8,
         pooled_mixer_hidden: int = 0,
         pooled_mixer_hidden_schedule: tuple[int, ...] | list[int] | None = None,
+        encoder_capacity_mixer_hidden: int = 0,
+        encoder_capacity_mixer_layers: int = 0,
+        decoder_capacity_mixer_hidden: int = 0,
+        decoder_capacity_mixer_layers: int = 0,
         stage_type: str = "band_sfc",
         cnb_kernel: int = 5,
         cnb_dilation_schedule: tuple[int, ...] | list[int] | None = None,
+        band_spec_type: str = "soft",
+        low_freq_hz: float = 1000.0,
+        low_freq_band_fraction: float = 0.45,
+        overlap_factor: float = 1.5,
+        low_freq_overlap_factor: float = 2.0,
+        bin_frequencies_hz: torch.Tensor | None = None,
+        loco_expansion: int = 2,
+        loco_ffn_expansion: int = 2,
+        loco_time_kernel: int = 3,
+        loco_band_kernel: int = 3,
+        loco_time_dilation: int = 1,
         causal: bool = True,
         masking: bool = True,
         residual_head: bool = False,
@@ -574,8 +804,10 @@ class BandSFCNetNPU(nn.Module):
             raise ValueError(f"channels must be even, got {channels}")
         if residual_head and not masking:
             raise ValueError("residual_head requires masking=True so mask and residual estimates can be fused")
-        if stage_type not in {"band_sfc", "causal_cnb"}:
-            raise ValueError(f"stage_type must be 'band_sfc' or 'causal_cnb', got {stage_type!r}")
+        if stage_type not in {"band_sfc", "causal_cnb", "loco_cnb"}:
+            raise ValueError(f"stage_type must be 'band_sfc', 'causal_cnb', or 'loco_cnb', got {stage_type!r}")
+        if band_spec_type not in {"soft", "static", "adaptive_mel", "adaptive-mel"}:
+            raise ValueError(f"band_spec_type must be 'soft'/'static' or 'adaptive_mel', got {band_spec_type!r}")
 
         self.n_freq = n_freq
         self.n_bands = n_bands
@@ -595,7 +827,22 @@ class BandSFCNetNPU(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.pooled_mixer_hidden = pooled_mixer_hidden
+        self.encoder_capacity_mixer_hidden = int(encoder_capacity_mixer_hidden)
+        self.encoder_capacity_mixer_layers = int(encoder_capacity_mixer_layers)
+        self.decoder_capacity_mixer_hidden = int(decoder_capacity_mixer_hidden)
+        self.decoder_capacity_mixer_layers = int(decoder_capacity_mixer_layers)
         self.stage_type = stage_type
+        self.band_spec_type = "adaptive_mel" if band_spec_type == "adaptive-mel" else band_spec_type
+        self.low_freq_hz = float(low_freq_hz)
+        self.low_freq_band_fraction = float(low_freq_band_fraction)
+        self.overlap_factor = float(overlap_factor)
+        self.low_freq_overlap_factor = float(low_freq_overlap_factor)
+        self.bin_frequencies_hz = bin_frequencies_hz
+        self.loco_expansion = int(loco_expansion)
+        self.loco_ffn_expansion = int(loco_ffn_expansion)
+        self.loco_time_kernel = int(loco_time_kernel)
+        self.loco_band_kernel = int(loco_band_kernel)
+        self.loco_time_dilation = int(loco_time_dilation)
         self.cnb_kernel = int(cnb_kernel)
         self.cnb_dilation_schedule = tuple(int(v) for v in (cnb_dilation_schedule or (1, 2, 3)))
         self.dilation_schedule = _normalize_dilation_schedule(num_stages, dilation_cycle)
@@ -619,12 +866,35 @@ class BandSFCNetNPU(nn.Module):
             nn.Conv2d(in_ch, channels, kernel_size=1, bias=True),
             RMSNorm2d(channels),
         )
-        band_spec = SoftBandSpec2d(
-            n_freq=n_freq,
-            n_bands=n_bands,
-            n_fft=n_fft,
-            sample_rate=sample_rate,
-            band_config=band_config,
+        if self.band_spec_type == "adaptive_mel":
+            band_spec = AdaptiveMelBandSpec2d(
+                n_freq=n_freq,
+                n_bands=n_bands,
+                sample_rate=44100 if sample_rate is None else sample_rate,
+                low_freq_hz=low_freq_hz,
+                low_freq_band_fraction=low_freq_band_fraction,
+                overlap_factor=overlap_factor,
+                low_freq_overlap_factor=low_freq_overlap_factor,
+                bin_frequencies_hz=bin_frequencies_hz,
+            )
+        else:
+            band_spec = SoftBandSpec2d(
+                n_freq=n_freq,
+                n_bands=n_bands,
+                n_fft=n_fft,
+                sample_rate=sample_rate,
+                band_config=band_config,
+            )
+        self.band_spec = band_spec
+        self.encoder_capacity_mixers = build_capacity_mixers(
+            channels=channels,
+            hidden_channels=encoder_capacity_mixer_hidden,
+            n_layers=encoder_capacity_mixer_layers,
+        )
+        self.decoder_capacity_mixers = build_capacity_mixers(
+            channels=channels,
+            hidden_channels=decoder_capacity_mixer_hidden,
+            n_layers=decoder_capacity_mixer_layers,
         )
 
         if transport == "soft":
@@ -671,8 +941,29 @@ class BandSFCNetNPU(nn.Module):
                         dilation_schedule=self.cnb_dilation_schedule,
                         num_heads=num_heads,
                         head_dim=head_dim,
+                        pooled_mixer_hidden=stage_pooled_hidden,
                     )
-                    for _ in range(num_stages)
+                    for stage_pooled_hidden in self.pooled_mixer_hidden_schedule
+                ]
+            )
+        elif self.stage_type == "loco_cnb":
+            self.stages = nn.ModuleList(
+                [
+                    CausalLocoCNBBlock(
+                        channels,
+                        freq_kernel=freq_kernel,
+                        cnb_kernel=self.cnb_kernel,
+                        cnb_dilation_schedule=self.cnb_dilation_schedule,
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                        pooled_mixer_hidden=stage_pooled_hidden,
+                        loco_expansion=self.loco_expansion,
+                        loco_ffn_expansion=self.loco_ffn_expansion,
+                        loco_time_kernel=self.loco_time_kernel,
+                        loco_band_kernel=self.loco_band_kernel,
+                        loco_time_dilation=self.loco_time_dilation,
+                    )
+                    for stage_pooled_hidden in self.pooled_mixer_hidden_schedule
                 ]
             )
         else:
@@ -757,14 +1048,19 @@ class BandSFCNetNPU(nn.Module):
         _runtime_assert(x.shape[-1] == self.n_freq, f"{x.shape[-1]} vs {self.n_freq}")
 
         h = self.in_proj(x)
+        h = apply_capacity_mixers(h, self.encoder_capacity_mixers)
         z, side = self._encode(h)
         for stage in self.stages:
             z = stage(z)
         h = self._decode(z, side)
+        h = apply_capacity_mixers(h, self.decoder_capacity_mixers)
         return self._project_output(x, h)
 
     def stream_context_frames(self) -> int:
         return self.encoder.stream_context_frames() + sum(stage.stream_context_frames() for stage in self.stages)
+
+    def _encoder_has_stream_state(self) -> bool:
+        return self.encoder.stream_context_frames() > 0
 
     def init_stream_state(
         self,
@@ -773,11 +1069,13 @@ class BandSFCNetNPU(nn.Module):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        enc = self.encoder.init_stream_state(batch_size, freq_bins=self.n_freq, device=device, dtype=dtype)
         sep = tuple(
             stage.init_stream_state(batch_size, freq_bins=self.n_bands, device=device, dtype=dtype)
             for stage in self.stages
         )
+        if not self._encoder_has_stream_state():
+            return sep
+        enc = self.encoder.init_stream_state(batch_size, freq_bins=self.n_freq, device=device, dtype=dtype)
         return (enc, *sep)
 
     def forward_stream(
@@ -790,15 +1088,42 @@ class BandSFCNetNPU(nn.Module):
         if state is None:
             state = self.init_stream_state(batch_size=x.shape[0], device=x.device, dtype=x.dtype)
 
+        has_encoder_state = self._encoder_has_stream_state()
+        legacy_empty_encoder_state = False
+        if has_encoder_state:
+            _runtime_assert(
+                len(state) == len(self.stages) + 1,
+                f"Expected {len(self.stages) + 1} stream state tensors, got {len(state)}",
+            )
+            enc_state = state[0]
+            sep_states = state[1:]
+        elif len(state) == len(self.stages) + 1:
+            # Accept states produced by older exports before zero-context encoder
+            # caches were omitted from the public streaming state contract.
+            legacy_empty_encoder_state = True
+            enc_state = state[0]
+            sep_states = state[1:]
+        else:
+            _runtime_assert(
+                len(state) == len(self.stages),
+                f"Expected {len(self.stages)} stream state tensors, got {len(state)}",
+            )
+            enc_state = None
+            sep_states = state
+
         h = self.in_proj(x)
-        z, side, new_enc_state = self._encode_stream(h, state[0])
-        new_sep_states: list[tuple[torch.Tensor, ...]] = []
-        for stage, stage_state in zip(self.stages, state[1:]):
+        h = apply_capacity_mixers(h, self.encoder_capacity_mixers)
+        z, side, new_enc_state = self._encode_stream(h, enc_state)
+        new_sep_states = []
+        for stage, stage_state in zip(self.stages, sep_states):
             z, new_stage_state = stage.forward_stream(z, stage_state)
             new_sep_states.append(new_stage_state)
         h = self._decode(z, side)
+        h = apply_capacity_mixers(h, self.decoder_capacity_mixers)
         y = self._project_output(x, h)
-        return y, (new_enc_state, *new_sep_states)
+        if has_encoder_state or legacy_empty_encoder_state:
+            return y, (new_enc_state, *new_sep_states)
+        return y, tuple(new_sep_states)
 
     def layer_cache_numel(self, batch_size: int = 1) -> int:
         states = self.init_stream_state(

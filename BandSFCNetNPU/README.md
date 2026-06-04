@@ -18,8 +18,15 @@ Deployable core:
 ```text
 input:  [B, 2*n_chan, T, F]
 output: [B, 2*n_src*n_chan, T, F]
-state:  encoder causal-conv cache + per-stage narrow-band caches
+state:  encoder causal-conv cache when non-empty + per-stage narrow-band/local caches
 ```
+
+Zero-context caches are intentionally omitted from the public streaming state.
+For example, the fp512 `adaptive_mel_loco_cnb_*` presets have no encoder cache
+and expose 10 non-empty state tensors: local `[1, 32, 2, 48]` and FSMN
+`[1, 32, 9, 48]` for each of 5 stages.  This avoids zero-sized state tensors in
+stateful ONNX/ONE quantization while preserving `forward_stream` compatibility
+with older 11-state exports.
 
 The `safe` preset uses soft-band SFC transport. The `quality` presets use the
 NPU-friendly cross-attention-query SFC transport and should be treated as
@@ -47,8 +54,12 @@ quality_soft_band_query           # quality probe, larger graph
 quality_crossattn_query           # quality probe, existing cross-attn path
 rt_plus_soft_band_query           # residual-head quality probe
 rt_plus_crossattn_query           # residual-head quality probe
-causal_cnb_soft_band_query        # Proposal B CNB block, safer soft-query transport
-causal_cnb_crossattn_query        # Proposal B CNB block, cross-attn-query transport
+causal_cnb_soft_band_query        # Proposal B CNB block, compile-smoke soft-query transport
+causal_cnb_crossattn_query        # Proposal B CNB block, compile-smoke cross-attn transport
+causal_cnb_balanced_soft_band_query     # useful-capacity CNB soft-query target
+causal_cnb_balanced_crossattn_query     # useful-capacity CNB cross-attn target
+adaptive_mel_loco_cnb_soft_band_query   # strongest strict-NPU training target
+adaptive_mel_loco_cnb_crossattn_query   # stronger transport ablation for the Loco-CNB target
 ```
 
 `balanced_*` is the preferred starting point for training: it uses 40 latent
@@ -58,6 +69,15 @@ for parameter count, latency, and quality: `channels`, `n_bands`, `num_stages`,
 `time_kernel`, `freq_kernel`, `dilation_cycle`, `routing_normalization`,
 `use_attn`, `attn_window`, `num_heads`, `head_dim`, `pooled_mixer_hidden`, and
 `pooled_mixer_hidden_schedule`.
+
+`adaptive_mel_loco_cnb_*` is the follow-up to the balanced CNB branch when
+`causal_cnb_balanced_*` trains below target quality.  It is intentionally not
+just another pooled-mixer variant: it adds adaptive overlapped-mel band priors,
+state-free encoder capacity before compression, local TF-Locoformer-style
+current/detail modeling around each CNB stage, state-free decoder capacity after
+expansion, and a safely initialized residual-capable output head.  The soft-query
+version is the recommended first training target; the cross-attention-query
+version is the quality ablation after export/compile audits pass.
 
 `quality6m_*` query variants are available for research, but at fp512 they are
 above the current deployment budget (~9.1M params and ~218 KiB fp16 state), so
@@ -77,7 +97,11 @@ do not use them as strict NPU targets without resizing.
 | `rt_plus` / `rt_plus_crossattn_query` | cross-attn-query + residual | 32 | 64 | 5 | 1,1,2,4,6 | RT+ residual candidate |
 | `rt_plus_soft_band_query` | soft-band-query + residual | 32 | 64 | 5 | 1,1,2,4,6 | RT+ residual query ablation |
 | `causal_cnb_soft_band_query` | soft-band-query + CNB | 24 | 48 | 5 | CNB FSMN 1,2,3 | Proposal B block, strict-state smoke target |
-| `causal_cnb_crossattn_query` | cross-attn-query + CNB | 24 | 48 | 5 | CNB FSMN 1,2,3 | Proposal B cross-attn transport ablation |
+| `causal_cnb_crossattn_query` | cross-attn-query + CNB | 24 | 48 | 5 | CNB FSMN 1,2,3 | Proposal B cross-attn compile-smoke ablation |
+| `causal_cnb_balanced_soft_band_query` | soft-band-query + CNB + pooled mixers | 32 | 48 | 5 | CNB FSMN 1,2,3 | useful-capacity CNB training target |
+| `causal_cnb_balanced_crossattn_query` | cross-attn-query + CNB + pooled mixers | 32 | 48 | 5 | CNB FSMN 1,2,3 | useful-capacity CNB cross-attn target |
+| `adaptive_mel_loco_cnb_soft_band_query` | adaptive-mel soft-query + Loco-CNB + IO capacity + residual | 32 | 48 | 5 | local 2 + FSMN 1,2,3 | strongest strict-NPU training target |
+| `adaptive_mel_loco_cnb_crossattn_query` | adaptive-mel cross-attn-query + Loco-CNB + IO capacity + residual | 32 | 48 | 5 | local 2 + FSMN 1,2,3 | stronger transport ablation |
 | `quality6m` | cross-attn-query | 40 | 64 | 4 | 1,2,4,6 | high-capacity probe, not strict fp512 deploy |
 
 ## Smoke
@@ -96,6 +120,11 @@ The CNB presets use explicit classes from the research sketch:
 branch has span `(5 - 1) * 4 = 16 >= 14`.  The deployable presets therefore use
 `cnb_dilation_schedule=(1, 2, 3)`, preserving the CNB block structure while
 staying inside the current NPU kernel-span rule.
+
+The plain `causal_cnb_*` presets are intentionally tiny compile-smoke models.
+For training, prefer `causal_cnb_balanced_*`: they raise width to 32 and add
+large frequency-pooled channel mixers after each CNB block.  These mixers add
+millions of parameters without increasing persistent streaming cache.
 
 ## ONE Compile Notes
 
@@ -124,6 +153,11 @@ Validated local artifacts on 2026-05-20:
 | `band-sfc-net-npu.balanced.soft-query.rt192k.fp512` | 635 | 4,066,492 | 160.00 KiB | `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
 | `band-sfc-net-npu.balanced.crossattn-query.rt192k.fp512` | 721 | 4,083,627 | 160.00 KiB | `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
 | `band-sfc-net-npu.quality.soft-query.rt192k.fp512` | 1,424 | 2,082,092 | 186.00 KiB | `model.circle`, `model.opt.circle`, `model.q.circle` PASS; ONNX audit flags `And/Less/GreaterOrEqual` |
+| `band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.rt192k.fp512keep475` | 701 non-Constant simplified nodes | 5,741,397 | 165.00 KiB | stateless and stateful `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
+| `band-sfc-net-npu.adaptive-mel-loco-cnb.crossattn-query.rt192k.fp512keep475` | 739 non-Constant simplified nodes | 5,752,548 | 165.00 KiB | stateless and stateful `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
+
+The stateful adaptive-mel Loco-CNB exports use 10 state tensors and also pass
+channel-wise uint8 quantization.  Artifact roots are listed below.
 
 Artifact roots:
 
@@ -135,6 +169,10 @@ logs/npu_verify_general/band_sfc_safe_crossattn_query_20260603
 logs/npu_verify_general/band_sfc_balanced_soft_query_20260603
 logs/npu_verify_general/band_sfc_balanced_crossattn_query_20260603
 logs/npu_verify_general/band_sfc_quality_soft_query_20260603
+logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_soft_query_20260604
+logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_crossattn_query_20260604
+logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_streaming_soft_verify_20260604
+logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_streaming_cross_verify_20260604
 ```
 
 ## Recipes
@@ -153,6 +191,10 @@ recipes/dnr/models/band-sfc-net-npu.quality.soft-query.rt192k.fp512
 recipes/dnr/models/band-sfc-net-npu.quality.crossattn-query.rt192k.fp512
 recipes/dnr/models/band-sfc-net-npu.rt-plus.soft-query.distill.rt192k.fp512
 recipes/dnr/models/band-sfc-net-npu.rt-plus.crossattn-query.distill.rt192k.fp512
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.rt192k.fp512keep475
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.crossattn-query.rt192k.fp512keep475
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.distill.rt192k.fp512keep475
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.crossattn-query.distill.rt192k.fp512keep475
 recipes/dnr/models/band-sfc-net-npu.quality6m.fp256
 ```
 

@@ -5,8 +5,10 @@ from .band_sfc_net_npu import (
     BandSFCNetNPUModel,
     CausalCNBBlock,
     CausalFSMNBandMixer,
+    CausalLocoCNBBlock,
     CompressedSelfAttentionFusion,
     CrossBandMixer,
+    LocalTFLocoMixer,
 )
 from .presets import build_band_sfc_net_npu_preset
 
@@ -15,7 +17,9 @@ __all__ = [
     "BandSFCNetNPUModel",
     "CausalCNBBlock",
     "CausalFSMNBandMixer",
+    "CausalLocoCNBBlock",
     "CompressedSelfAttentionFusion",
+    "LocalTFLocoMixer",
     "CrossBandMixer",
     "build_band_sfc_net_npu_preset",
 ]

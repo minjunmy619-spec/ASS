@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import torch
 
+from spectral_feature_compression.core.model.adaptive_mel_sfc_2d import AdaptiveMelBandSpec2d
+from spectral_feature_compression.core.model.frequency_preprocessing import build_hybrid_frequency_bin_frequencies
 from spectral_feature_compression.core.model.online_soft_band_sfc_2d import SoftBandSpec2d
 
-from .band_sfc_net_npu import CausalCNBBlock, CausalFSMNBandMixer
+from .band_sfc_net_npu import CausalCNBBlock, CausalFSMNBandMixer, CausalLocoCNBBlock
 from .presets import build_band_sfc_net_npu_preset, quality_soft_query, safe_soft_query
 from .training_wrapper import build_band_sfc_net_npu_system
 
@@ -115,8 +117,14 @@ def test_query_variant_deployable_state_budgets_fp512() -> None:
         "rt_plus_crossattn_query",
         "causal_cnb_soft_band_query",
         "causal_cnb_crossattn_query",
+        "causal_cnb_balanced_soft_band_query",
+        "causal_cnb_balanced_crossattn_query",
+        "adaptive_mel_loco_cnb_soft_band_query",
+        "adaptive_mel_loco_cnb_crossattn_query",
     ):
-        model = build_band_sfc_net_npu_preset(preset, n_freq=512, n_src=3, n_chan=1).eval()
+        model = build_band_sfc_net_npu_preset(
+            preset, n_freq=512, n_fft=1022, sample_rate=44100, n_src=3, n_chan=1
+        ).eval()
         params = sum(p.numel() for p in model.parameters())
         state_kib = model.state_size_bytes(dtype=torch.float16) / 1024.0
         assert params < 7_000_000, f"{preset} params too large: {params}"
@@ -125,7 +133,12 @@ def test_query_variant_deployable_state_budgets_fp512() -> None:
 
 def test_causal_cnb_query_variants_forward_stream_matches_full() -> None:
     torch.manual_seed(0)
-    for preset in ("causal_cnb_soft_band_query", "causal_cnb_crossattn_query"):
+    for preset in (
+        "causal_cnb_soft_band_query",
+        "causal_cnb_crossattn_query",
+        "causal_cnb_balanced_soft_band_query",
+        "causal_cnb_balanced_crossattn_query",
+    ):
         model = build_band_sfc_net_npu_preset(preset, n_freq=65, n_src=3, n_chan=1).eval()
         x = torch.randn(1, 2, 4, 65)
         with torch.no_grad():
@@ -170,6 +183,185 @@ def test_balanced_query_variants_have_useful_capacity() -> None:
         assert model.channels == 40
         assert model.n_bands == 64
         assert len(model.stages) == 4
+
+
+def test_causal_cnb_balanced_variants_have_useful_capacity() -> None:
+    for preset in ("causal_cnb_balanced_soft_band_query", "causal_cnb_balanced_crossattn_query"):
+        model = build_band_sfc_net_npu_preset(preset, n_freq=512, n_src=3, n_chan=1).eval()
+        params = sum(p.numel() for p in model.parameters())
+        state_kib = model.state_size_bytes(dtype=torch.float16) / 1024.0
+        assert 2_000_000 <= params <= 7_000_000, f"{preset} params outside useful target: {params}"
+        assert state_kib < 192.0, f"{preset} fp512 state too large: {state_kib:.2f} KiB"
+        assert model.stage_type == "causal_cnb"
+        assert model.channels == 32
+        assert model.n_bands == 48
+        assert len(model.stages) == 5
+        assert model.stages[0].pooled_mixer.hidden_channels == 8192
+
+
+def test_adaptive_mel_loco_cnb_variants_have_strong_capacity_and_state_budget() -> None:
+    for preset in ("adaptive_mel_loco_cnb_soft_band_query", "adaptive_mel_loco_cnb_crossattn_query"):
+        model = build_band_sfc_net_npu_preset(
+            preset,
+            n_freq=512,
+            n_fft=1022,
+            sample_rate=44100,
+            n_src=3,
+            n_chan=1,
+        ).eval()
+        params = sum(p.numel() for p in model.parameters())
+        state_kib = model.state_size_bytes(dtype=torch.float16) / 1024.0
+        assert 5_000_000 <= params <= 7_000_000, f"{preset} params outside strong target: {params}"
+        assert state_kib < 192.0, f"{preset} fp512 state too large: {state_kib:.2f} KiB"
+        assert model.stage_type == "loco_cnb"
+        assert model.band_spec_type == "adaptive_mel"
+        assert isinstance(model.band_spec, AdaptiveMelBandSpec2d)
+        assert model.channels == 32
+        assert model.n_bands == 48
+        assert len(model.stages) == 5
+        assert isinstance(model.stages[0], CausalLocoCNBBlock)
+        assert model.stages[0].narrow_band.kernel_t == 4
+        assert model.stages[0].narrow_band.dilation_schedule == (1, 2, 3)
+        assert model.stages[0].local.time_kernel == 3
+        assert model.encoder_capacity_mixer_layers == 2
+        assert model.decoder_capacity_mixer_layers == 2
+        assert model.residual_head is True
+
+
+def test_adaptive_mel_loco_cnb_streaming_matches_full() -> None:
+    torch.manual_seed(0)
+    for preset in ("adaptive_mel_loco_cnb_soft_band_query", "adaptive_mel_loco_cnb_crossattn_query"):
+        model = build_band_sfc_net_npu_preset(
+            preset,
+            n_freq=65,
+            n_fft=128,
+            sample_rate=8000,
+            n_src=3,
+            n_chan=1,
+        ).eval()
+        x = torch.randn(1, 2, 4, 65)
+        with torch.no_grad():
+            y_full = model(x)
+            state = model.init_stream_state(batch_size=1, dtype=x.dtype)
+            frames = []
+            for t in range(x.shape[2]):
+                y_t, state = model.forward_stream(x[:, :, t : t + 1, :], state)
+                frames.append(y_t)
+            y_stream = torch.cat(frames, dim=2)
+        assert tuple(y_full.shape) == (1, 6, 4, 65)
+        _assert_close(f"{preset} Loco-CNB streaming parity", y_full, y_stream, atol=5e-5)
+
+
+def test_adaptive_mel_loco_cnb_stream_state_omits_empty_encoder_cache() -> None:
+    model = build_band_sfc_net_npu_preset(
+        "adaptive_mel_loco_cnb_soft_band_query",
+        n_freq=512,
+        n_fft=1022,
+        sample_rate=44100,
+        n_src=3,
+        n_chan=1,
+    ).eval()
+    state = model.init_stream_state(batch_size=1, dtype=torch.float16)
+    flat = []
+
+    def collect(tree) -> None:
+        if isinstance(tree, torch.Tensor):
+            flat.append(tree)
+            return
+        for item in tree:
+            collect(item)
+
+    collect(state)
+    assert len(flat) == 10
+    assert all(t.numel() > 0 for t in flat)
+    assert model.state_size_bytes(dtype=torch.float16) == 168960
+
+
+def test_training_builder_threads_loco_cnb_overrides() -> None:
+    system = build_band_sfc_net_npu_system(
+        n_fft=128,
+        hop_length=32,
+        fs=16000,
+        n_src=3,
+        n_chan=1,
+        preset="adaptive_mel_loco_cnb_soft_band_query",
+        transport="soft_band_query",
+        band_spec_type="adaptive_mel",
+        low_freq_hz=900.0,
+        low_freq_band_fraction=0.5,
+        overlap_factor=1.25,
+        low_freq_overlap_factor=2.25,
+        encoder_capacity_mixer_hidden=1024,
+        encoder_capacity_mixer_layers=1,
+        decoder_capacity_mixer_hidden=1024,
+        decoder_capacity_mixer_layers=1,
+        loco_expansion=1,
+        loco_ffn_expansion=1,
+        loco_time_kernel=3,
+        loco_band_kernel=5,
+        loco_time_dilation=1,
+        residual_head=True,
+        freq_preprocess_enabled=False,
+        css_segment_size=1,
+        css_shift_size=1,
+    )
+    core = system.model.core
+    assert core.stage_type == "loco_cnb"
+    assert core.band_spec_type == "adaptive_mel"
+    assert isinstance(core.band_spec, AdaptiveMelBandSpec2d)
+    assert core.band_spec.low_freq_hz == 900.0
+    assert core.band_spec.low_freq_band_fraction == 0.5
+    assert core.band_spec.overlap_factor == 1.25
+    assert core.band_spec.low_freq_overlap_factor == 2.25
+    assert core.encoder_capacity_mixer_layers == 1
+    assert core.decoder_capacity_mixer_layers == 1
+    assert core.stages[0].local.hidden == core.channels
+    assert core.stages[0].local.ffn_hidden == core.channels
+    assert core.stages[0].local.band_kernel == 5
+    assert core.residual_head is True
+
+
+def test_training_builder_uses_hybrid_bin_frequencies_for_adaptive_mel_prior() -> None:
+    system = build_band_sfc_net_npu_system(
+        n_fft=2048,
+        hop_length=512,
+        fs=44100,
+        n_src=3,
+        n_chan=1,
+        preset="adaptive_mel_loco_cnb_soft_band_query",
+        channels=8,
+        n_bands=12,
+        num_stages=1,
+        pooled_mixer_hidden=0,
+        pooled_mixer_hidden_schedule=[0],
+        encoder_capacity_mixer_hidden=16,
+        encoder_capacity_mixer_layers=1,
+        decoder_capacity_mixer_hidden=16,
+        decoder_capacity_mixer_layers=1,
+        freq_preprocess_enabled=True,
+        freq_preprocess_keep_bins=475,
+        freq_preprocess_target_bins=512,
+        css_segment_size=1,
+        css_shift_size=1,
+    )
+    core = system.model.core
+    assert core.n_freq == 512
+    assert isinstance(core.band_spec, AdaptiveMelBandSpec2d)
+    assert core.band_spec.explicit_bin_frequencies is True
+    # 1000 Hz is around original 2048-FFT bin 46, not projected-axis bin 23.
+    freqs = core.band_spec.bin_frequencies_hz
+    assert float(freqs[46]) < 1000.0 < float(freqs[47])
+    assert float(freqs[23]) < 600.0
+
+    expected = build_hybrid_frequency_bin_frequencies(
+        1025,
+        keep_bins=475,
+        target_bins=512,
+        n_fft=2048,
+        sample_rate=44100,
+        mode="triangular",
+    )
+    torch.testing.assert_close(freqs, expected)
 
 
 def test_training_builder_threads_capacity_overrides() -> None:
@@ -296,6 +488,12 @@ def main() -> None:
         test_causal_cnb_literal_document_schedule_is_rejected_by_npu_validator,
         test_causal_fsmn_zero_context_keeps_empty_stream_state,
         test_balanced_query_variants_have_useful_capacity,
+        test_causal_cnb_balanced_variants_have_useful_capacity,
+        test_adaptive_mel_loco_cnb_variants_have_strong_capacity_and_state_budget,
+        test_adaptive_mel_loco_cnb_streaming_matches_full,
+        test_adaptive_mel_loco_cnb_stream_state_omits_empty_encoder_cache,
+        test_training_builder_threads_loco_cnb_overrides,
+        test_training_builder_uses_hybrid_bin_frequencies_for_adaptive_mel_prior,
         test_training_builder_threads_capacity_overrides,
         test_training_builder_threads_query_type,
         test_training_builder_threads_core_band_prior_metadata,

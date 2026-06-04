@@ -101,7 +101,7 @@ def get_concrete_base_path(path: Path) -> Path | None:
         key, value = raw_line.split(":", 1)
         if key.strip() != "_base_":
             continue
-        base_value = value.strip().strip('"\'')
+        base_value = value.strip().strip("\"'")
         if base_value and "${" not in base_value:
             base_path = (path.parent / base_value).resolve()
             return base_path if base_path.exists() else None
@@ -177,26 +177,32 @@ def export_recipe_variant(
     out_dir: Path,
     py: Path,
     env: dict[str, str],
+    *,
+    streaming: bool = False,
 ) -> tuple[int, str, Path]:
     assert variant.recipe_cfg is not None
     export_script = ROOT / "tools" / "online" / "export_onnx_online_model.py"
     onnx_path = out_dir / "model.onnx"
     manifest_path = out_dir / "manifest.json"
+    state_meta_path = out_dir / "state_meta.json"
+    streaming_args = f' --streaming --state-meta-out "{state_meta_path}"' if streaming else ""
     n_chan = infer_n_chan(variant.recipe_cfg)
     export_cmd = (
         f'"{py}" "{export_script}" "{variant.recipe_cfg}" '
         f'--out "{onnx_path}" --n-chan {n_chan} --frames 1 --opset 14 '
-        f'--disable-masking --deploy-manifest-out "{manifest_path}"'
+        f'--disable-masking{streaming_args} --deploy-manifest-out "{manifest_path}"'
     )
     rc, out = sh(export_cmd, env=env)
-    mismatch = ("expected input[1, 4" in out and "to have 2 channels" in out) or (
-        "expected 2 packed channels, got 4" in out
-    ) or "Export n_chan mismatch" in out
+    mismatch = (
+        ("expected input[1, 4" in out and "to have 2 channels" in out)
+        or ("expected 2 packed channels, got 4" in out)
+        or "Export n_chan mismatch" in out
+    )
     if rc != 0 and mismatch and n_chan != 1:
         retry_cmd = (
             f'"{py}" "{export_script}" "{variant.recipe_cfg}" '
             f'--out "{onnx_path}" --n-chan 1 --frames 1 --opset 14 '
-            f'--disable-masking --deploy-manifest-out "{manifest_path}"'
+            f'--disable-masking{streaming_args} --deploy-manifest-out "{manifest_path}"'
         )
         rrc, rout = sh(retry_cmd, env=env)
         out += "\n\n=== EXPORT RETRY (--n-chan 1) ===\n" + rout
@@ -282,8 +288,7 @@ def run_onnxsim(
         first = vis[0]
         shape = ",".join(str(v) for v in onnx_shape_from_vi(first))
         cmd = (
-            f'"{py}" -m onnxsim "{onnx_in}" "{onnx_out}" '
-            f'--overwrite-input-shape {first.name}:{shape} --no-large-tensor'
+            f'"{py}" -m onnxsim "{onnx_in}" "{onnx_out}" --overwrite-input-shape {first.name}:{shape} --no-large-tensor'
         )
         rc, out = sh(cmd, env=env)
         if rc == 0:
@@ -480,9 +485,7 @@ def rewrite_matmul_stack_lhs3_rhs2_flatten(onnx_path: Path) -> int:
 
     existing_ini = {i.name for i in graph.initializer}
     touched = 0
-    for run_id, (idx, node, (batch0, batch1, k, bout)) in enumerate(
-        sorted(specs, key=lambda x: x[0], reverse=True)
-    ):
+    for run_id, (idx, node, (batch0, batch1, k, bout)) in enumerate(sorted(specs, key=lambda x: x[0], reverse=True)):
         stem = _sanitize_onnx_identity(node.name or "matmul")
         a, b = node.input[0], node.input[1]
         out_name = node.output[0]
@@ -500,12 +503,8 @@ def rewrite_matmul_stack_lhs3_rhs2_flatten(onnx_path: Path) -> int:
 
         graph.initializer.extend(
             [
-                onnx.numpy_helper.from_array(
-                    np.array([flat_leading, k], dtype=np.int64), name=lh_shape_name
-                ),
-                onnx.numpy_helper.from_array(
-                    np.array([batch0, batch1, bout], dtype=np.int64), name=oh_name
-                ),
+                onnx.numpy_helper.from_array(np.array([flat_leading, k], dtype=np.int64), name=lh_shape_name),
+                onnx.numpy_helper.from_array(np.array([batch0, batch1, bout], dtype=np.int64), name=oh_name),
             ]
         )
 
@@ -591,18 +590,12 @@ def generate_calibration_from_onnx(onnx_path: Path, out_dir: Path, env: dict[str
     list_path = out_dir / "calib_list.txt"
     list_path.write_text(" ".join(npy_paths) + "\n", encoding="utf-8")
     calib_h5 = out_dir / "calib.h5"
-    ds_cmd = (
-        f'one-create-quant-dataset -i numpy '
-        f'-l "{list_path}" '
-        f'-p "{calib_h5}"'
-    )
+    ds_cmd = f'one-create-quant-dataset -i numpy -l "{list_path}" -p "{calib_h5}"'
     rc, out = sh(ds_cmd, env=env)
     return rc, out, calib_h5
 
 
-def write_onecc_cfg(
-    out_dir: Path, onnx_path: Path, calib_h5: Path, granularity: str = "channel"
-) -> Path:
+def write_onecc_cfg(out_dir: Path, onnx_path: Path, calib_h5: Path, granularity: str = "channel") -> Path:
     circle_path = out_dir / "model.circle"
     opt_path = out_dir / "model.opt.circle"
     q_path = out_dir / "model.q.circle"
@@ -662,6 +655,7 @@ def run_one_variant(
     *,
     quantize_layer_fallback: bool = False,
     force_onnxsim_large_shape_ops: bool = False,
+    streaming: bool = False,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     log_parts: list[str] = []
@@ -675,7 +669,13 @@ def run_one_variant(
     quant_retry_layer = False
 
     if variant.kind == "recipe":
-        export_rc, export_out, onnx_path = export_recipe_variant(variant, out_dir, py, env)
+        export_rc, export_out, onnx_path = export_recipe_variant(
+            variant,
+            out_dir,
+            py,
+            env,
+            streaming=streaming,
+        )
     else:
         try:
             export_rc, export_out, onnx_path = export_tf_variant(variant, out_dir)
@@ -727,11 +727,7 @@ def run_one_variant(
         onecc_rc, onecc_out = sh(f'cd "{out_dir}" && onecc -C "{onecc_cfg}"', env=env)
         log_parts.append("\n=== ONECC ===\n")
         log_parts.append(onecc_out + "\n")
-        if (
-            quantize_layer_fallback
-            and onecc_rc != 0
-            and "Non-channel dimension of const node must be 1" in onecc_out
-        ):
+        if quantize_layer_fallback and onecc_rc != 0 and "Non-channel dimension of const node must be 1" in onecc_out:
             quant_retry_layer = True
             quant_granularity_used = "layer"
             onecc_cfg = write_onecc_cfg(out_dir, sim_path, calib_h5, granularity="layer")
@@ -811,9 +807,7 @@ def write_summary(results: list[dict[str, Any]], out_root: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="General end-to-end NPU verifier for recipe and TF-MLPNet variants."
-    )
+    p = argparse.ArgumentParser(description="General end-to-end NPU verifier for recipe and TF-MLPNet variants.")
     p.add_argument("--mode", choices=["all", "recipe", "tf"], default="all")
     p.add_argument(
         "--recipe-root",
@@ -839,7 +833,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "If channel-wise quantization fails with "
-            "\"Non-channel dimension of const node must be 1\", retry once with "
+            '"Non-channel dimension of const node must be 1", retry once with '
             "granularity=layer (hurts accuracy vs channel-wise; prefer ONNX/model fixes)."
         ),
     )
@@ -850,6 +844,11 @@ def parse_args() -> argparse.Namespace:
             "Run onnxsim even when the graph contains Tile or ConstantOfShape. "
             "This can be slow but is useful for diagnosing older TIGER graphs."
         ),
+    )
+    p.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Export recipe variants with flattened forward_stream state inputs/outputs before ONE verification.",
     )
     return p.parse_args()
 
@@ -897,6 +896,7 @@ def main() -> int:
             env,
             quantize_layer_fallback=args.quantize_layer_fallback,
             force_onnxsim_large_shape_ops=args.force_onnxsim_large_shape_ops,
+            streaming=args.streaming,
         )
         results.append(result)
         status = result["status"]

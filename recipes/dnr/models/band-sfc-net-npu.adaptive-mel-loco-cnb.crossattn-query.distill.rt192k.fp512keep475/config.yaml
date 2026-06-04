@@ -1,0 +1,5 @@
+_base_: ../band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.distill.rt192k.fp512keep475/config.yaml
+
+# Distilled cross-attention-query ablation for the adaptive-mel Loco-CNB student.
+band_sfc_preset: adaptive_mel_loco_cnb_crossattn_query
+band_sfc_transport: crossattn_query

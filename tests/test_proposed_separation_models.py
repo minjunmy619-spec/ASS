@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 
 from BandSFCNetNPU.presets import build_band_sfc_net_npu_preset
@@ -13,6 +15,7 @@ from spectral_feature_compression.core.model.foa_event_query_prompted_sfc import
 )
 from spectral_feature_compression.core.model.prompted_asymmetric_sfc_2d import OnlinePromptedAsymmetricSFC2D
 from spectral_feature_compression.core.model.proposed_separation_models import (
+    build_adaptive_mel_loco_cnb_npu_system,
     build_adaptive_mel_locoformer_lite_system,
     build_adaptive_mel_sfc_ablation_system,
     build_edgefusion_sfc_distilled_system,
@@ -28,6 +31,12 @@ from spectral_feature_compression.core.model.residual_refinement_sfc_2d import O
 from spectral_feature_compression.core.model.source_split_sfc_2d import OnlineSourceSplitSFC2D
 from spectral_feature_compression.core.model.sparse_unet_mel_sfc_2d import SparseUNetMelSFC2D
 from spectral_feature_compression.core.tasks.distillation_task import TeacherStudentDistillationTask
+from tools.online.export_onnx_online_model import (
+    build_model_system_from_recipe_config,
+    merge_task_model_mapping,
+    merge_top_level_scalars,
+    resolve_value,
+)
 
 
 def test_band_sfc_rt_plus_forward_and_streaming_shape() -> None:
@@ -373,6 +382,92 @@ def test_adaptive_mel_sfc_builder_exposes_low_frequency_overlap_controls() -> No
     deploy_params = sum(p.numel() for p in deploy_core.parameters())
     assert 2_000_000 <= deploy_params <= 7_000_000
     assert deploy_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+
+def test_adaptive_mel_loco_cnb_builder_forward_shape() -> None:
+    torch.manual_seed(0)
+    model = build_adaptive_mel_loco_cnb_npu_system(
+        n_fft=64,
+        hop_length=16,
+        fs=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        channels=8,
+        num_stages=1,
+        time_kernel=1,
+        freq_kernel=3,
+        dilation_cycle=(1,),
+        stage_type="loco_cnb",
+        cnb_kernel=4,
+        cnb_dilation_schedule=(1, 2, 3),
+        routing_normalization="softmax",
+        use_attn=False,
+        attn_window=8,
+        num_heads=2,
+        head_dim=4,
+        pooled_mixer_hidden=0,
+        pooled_mixer_hidden_schedule=(0,),
+        encoder_capacity_mixer_hidden=16,
+        encoder_capacity_mixer_layers=1,
+        decoder_capacity_mixer_hidden=16,
+        decoder_capacity_mixer_layers=1,
+        low_freq_hz=1000.0,
+        low_freq_band_fraction=0.5,
+        freq_preprocess_enabled=False,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 256)
+    with torch.no_grad():
+        est = model(wav)
+    assert tuple(est.shape) == (1, 2, 1, 256)
+    assert model.model.core.stage_type == "loco_cnb"
+    assert model.model.core.band_spec_type == "adaptive_mel"
+    assert model.model.core.encoder_capacity_mixer_layers == 1
+    assert model.model.core.decoder_capacity_mixer_layers == 1
+    assert model.model.core.cnb_kernel == 4
+    assert model.model.core.num_heads == 2
+    assert model.model.core.head_dim == 4
+
+
+def test_adaptive_mel_loco_cnb_recipe_config_resolves_and_instantiates() -> None:
+    config_path = Path(
+        "recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.rt192k.fp512keep475/config.yaml"
+    )
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert resolve_value(model_cfg["preset"], context) == "adaptive_mel_loco_cnb_soft_band_query"
+    assert resolve_value(model_cfg["stage_type"], context) == "loco_cnb"
+    assert resolve_value(model_cfg["band_spec_type"], context) == "adaptive_mel"
+    assert resolve_value(model_cfg["freq_preprocess_keep_bins"], context) == 475
+    assert resolve_value(model_cfg["freq_preprocess_target_bins"], context) == 512
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    core = system.model.core
+    assert core.n_freq == 512
+    assert core.stage_type == "loco_cnb"
+    assert core.band_spec_type == "adaptive_mel"
+    assert core.band_spec.explicit_bin_frequencies is True
+    assert sum(p.numel() for p in core.parameters()) < 7_000_000
+    assert core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+
+def test_adaptive_mel_loco_cnb_distill_recipe_declares_teacher_task() -> None:
+    config_path = Path(
+        "recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.distill.rt192k.fp512keep475/config.yaml"
+    )
+    task_cfg = merge_task_model_mapping(config_path)
+    top = merge_top_level_scalars(config_path)
+    assert top["teacher_checkpoint_path"] is None
+    # `merge_task_model_mapping` intentionally extracts only task.model.  Check
+    # the raw file to avoid instantiating a distillation task without a teacher.
+    text = config_path.read_text(encoding="utf-8")
+    assert "TeacherStudentDistillationTask" in text
+    assert "require_teacher_checkpoint: true" in text
+    assert "build_sfc_locoformer_lite_plus_system" in text
+    assert resolve_value(task_cfg["preset"], {**top, **task_cfg}) == "adaptive_mel_loco_cnb_soft_band_query"
 
 
 def test_adaptive_mel_locoformer_lite_builder_forward_and_streaming_shape() -> None:

@@ -112,6 +112,49 @@ def build_hybrid_frequency_matrices(
     return analysis, synthesis
 
 
+def build_hybrid_frequency_bin_frequencies(
+    n_freq_in: int,
+    *,
+    keep_bins: int,
+    target_bins: int,
+    n_fft: int,
+    sample_rate: int,
+    mode: str = "triangular",
+    dc_bypass_enabled: bool = False,
+) -> torch.Tensor:
+    """Return physical bin-center frequencies after hybrid preprocessing.
+
+    The hybrid projector keeps the low-frequency bins exactly and projects the
+    high-frequency tail into fewer slots.  A plain ``torch.linspace`` over the
+    projected axis is therefore wrong: the first ``keep_bins`` positions still
+    correspond to original FFT bins, while each high projected slot corresponds
+    to a weighted average of original high-bin centers.  Adaptive/mel priors
+    should use this vector when the core sees preprocessed frequency bins.
+    """
+
+    n_freq_in = int(n_freq_in)
+    n_fft = int(n_fft)
+    sample_rate = int(sample_rate)
+    if n_freq_in <= 0:
+        raise ValueError(f"n_freq_in must be positive, got {n_freq_in}")
+    if n_fft <= 0 or sample_rate <= 0:
+        raise ValueError(f"n_fft and sample_rate must be positive, got {n_fft}, {sample_rate}")
+    full_n_freq = (n_fft // 2) + 1
+    if n_freq_in not in {full_n_freq, full_n_freq - 1}:
+        raise ValueError(f"n_freq_in={n_freq_in} is not compatible with n_fft={n_fft}")
+    first_bin = 1 if dc_bypass_enabled else 0
+    original_bin_indices = torch.arange(first_bin, first_bin + n_freq_in, dtype=torch.float32)
+    original_freqs = original_bin_indices * (float(sample_rate) / float(n_fft))
+    analysis, _synthesis = build_hybrid_frequency_matrices(
+        n_freq_in=n_freq_in,
+        keep_bins=keep_bins,
+        target_bins=target_bins,
+        mode=mode,
+    )
+    weights = analysis / analysis.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    return weights @ original_freqs
+
+
 class HybridFrequencyProjector2d(nn.Module):
     """
     Stateless frequency-axis preprocessing/postprocessing for online models.
@@ -389,8 +432,7 @@ class FrequencyPreprocessedOnlineModel(nn.Module):
         self.core_n_src = int(getattr(core, "n_src", self.n_src - 1 if self.residual_source_enabled else self.n_src))
         if self.residual_source_enabled and self.core_n_src != self.n_src - 1:
             raise ValueError(
-                f"Residual source reconstruction expects core_n_src=n_src-1={self.n_src - 1}, "
-                f"got {self.core_n_src}."
+                f"Residual source reconstruction expects core_n_src=n_src-1={self.n_src - 1}, got {self.core_n_src}."
             )
         if not self.residual_source_enabled and self.core_n_src != self.n_src:
             raise ValueError(f"Core n_src={self.core_n_src} does not match wrapper n_src={self.n_src}.")
@@ -400,16 +442,13 @@ class FrequencyPreprocessedOnlineModel(nn.Module):
         if dc_policy not in {"zero", "mixture_equal"}:
             raise ValueError(f"Unsupported dc_policy={dc_policy!r}; expected 'zero' or 'mixture_equal'.")
         self.dc_policy = dc_policy
-        self.body_input_n_freq = (
-            freq_preprocessor.n_freq_in if freq_preprocessor is not None else int(core.n_freq)
-        )
+        self.body_input_n_freq = freq_preprocessor.n_freq_in if freq_preprocessor is not None else int(core.n_freq)
         self.input_n_freq = self.body_input_n_freq + 1 if self.dc_bypass_enabled else self.body_input_n_freq
         self.core_n_freq = int(core.n_freq)
         expected_core_n_freq = freq_preprocessor.n_freq_out if freq_preprocessor is not None else self.body_input_n_freq
         if self.core_n_freq != int(expected_core_n_freq):
             raise ValueError(
-                f"Core n_freq={self.core_n_freq} does not match wrapper core input bins "
-                f"{int(expected_core_n_freq)}."
+                f"Core n_freq={self.core_n_freq} does not match wrapper core input bins {int(expected_core_n_freq)}."
             )
         if hasattr(core, "n_chan") and int(core.n_chan) != self.n_chan:
             raise ValueError(f"Core n_chan={int(core.n_chan)} does not match wrapper n_chan={self.n_chan}.")
@@ -423,8 +462,7 @@ class FrequencyPreprocessedOnlineModel(nn.Module):
             raise ValueError(f"Expected {expected_channels} explicit output channels, got {channels}")
         if mixture2d.shape != (batch, 2 * self.n_chan, frames, n_freq):
             raise ValueError(
-                f"Expected mixture shape {(batch, 2 * self.n_chan, frames, n_freq)}, "
-                f"got {tuple(mixture2d.shape)}"
+                f"Expected mixture shape {(batch, 2 * self.n_chan, frames, n_freq)}, got {tuple(mixture2d.shape)}"
             )
 
         explicit = y2d.reshape(batch, self.core_n_src, self.n_chan, 2, frames, n_freq)

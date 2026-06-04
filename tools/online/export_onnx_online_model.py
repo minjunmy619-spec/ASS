@@ -61,6 +61,8 @@ def parse_scalar(value: str):
         return True
     if value in {"false", "False"}:
         return False
+    if value in {"null", "Null", "NULL", "None", "~"}:
+        return None
     if value.startswith('"') and value.endswith('"'):
         return value[1:-1]
     if value.startswith("'") and value.endswith("'"):
@@ -162,21 +164,6 @@ def resolve_value(value, context: dict[str, object], *, stack: tuple[str, ...] =
     return value
 
 
-def resolve_model_top_level_value(
-    key: str,
-    model_cfg: dict[str, object],
-    top_level: dict[str, object],
-    context: dict[str, object],
-    default=None,
-):
-    value = model_cfg.get(key, top_level.get(key, default))
-    if isinstance(value, str):
-        match = INTERPOLATION_RE.fullmatch(value)
-        if match is not None and match.group(1) == key and key in top_level:
-            value = top_level[key]
-    return resolve_value(value, context)
-
-
 def build_model_system_from_recipe_config(config_path: Path):
     try:
         from hydra.utils import instantiate
@@ -261,11 +248,7 @@ def load_frequency_preprocess_metadata(model_path: Path) -> dict[str, object] | 
         return None
     top_level = merge_top_level_scalars(config_path)
     model_cfg = merge_task_model_mapping(config_path)
-    # Model entries often mirror top-level recipe values, e.g.
-    # ``freq_preprocess_enabled: ${freq_preprocess_enabled}``.  Keep top-level
-    # values last so those self-named interpolations do not resolve to the model
-    # entry itself.
-    context = {**model_cfg, **top_level}
+    context = {**top_level, **model_cfg}
     enabled = resolve_value(
         model_cfg.get("freq_preprocess_enabled", top_level.get("online_freq_preprocess_enabled", False)),
         context,
@@ -300,7 +283,7 @@ def load_dc_bypass_metadata(model_path: Path) -> dict[str, object] | None:
         return None
     top_level = merge_top_level_scalars(config_path)
     model_cfg = merge_task_model_mapping(config_path)
-    context = {**model_cfg, **top_level}
+    context = {**top_level, **model_cfg}
     enabled = resolve_value(model_cfg.get("dc_bypass_enabled", False), context)
     if not bool(enabled):
         return None
@@ -314,77 +297,12 @@ def load_dc_bypass_metadata(model_path: Path) -> dict[str, object] | None:
     }
 
 
-def load_pcen_preprocess_metadata(model_path: Path) -> dict[str, object] | None:
-    config_path = infer_recipe_config_path(model_path)
-    if config_path is None:
-        return None
-    top_level = merge_top_level_scalars(config_path)
-    model_cfg = merge_task_model_mapping(config_path)
-    context = {**model_cfg, **top_level}
-    enabled = resolve_value(model_cfg.get("pcen_preprocess_enabled", False), context)
-    if not bool(enabled):
-        return None
-    n_chan = int(resolve_model_top_level_value("n_chan", model_cfg, top_level, context, 1))
-    n_fft = int(resolve_value(top_level.get("n_fft", 0), context)) if "n_fft" in top_level else None
-    full_n_freq = (n_fft // 2 + 1) if n_fft is not None else None
-    dc_enabled = bool(resolve_value(model_cfg.get("dc_bypass_enabled", False), context))
-    freq_enabled = bool(
-        resolve_value(
-            model_cfg.get("freq_preprocess_enabled", top_level.get("online_freq_preprocess_enabled", False)),
-            context,
-        )
-    )
-    pcen_n_freq = None
-    if freq_enabled:
-        target_bins = resolve_value(
-            model_cfg.get("freq_preprocess_target_bins", top_level.get("online_freq_preprocess_target_bins")),
-            context,
-        )
-        pcen_n_freq = int(target_bins) if target_bins is not None else None
-    elif full_n_freq is not None:
-        pcen_n_freq = full_n_freq - 1 if dc_enabled else full_n_freq
-    return {
-        "enabled": True,
-        "n_chan": n_chan,
-        "state_shape": [1, n_chan, 1, pcen_n_freq] if pcen_n_freq is not None else None,
-        "smooth_coef": resolve_value(model_cfg.get("pcen_smooth_coef", 0.98), context),
-        "alpha": resolve_value(model_cfg.get("pcen_alpha", 0.5), context),
-        "delta": resolve_value(model_cfg.get("pcen_delta", 2.0), context),
-        "root": resolve_value(model_cfg.get("pcen_root", 0.5), context),
-        "eps": resolve_value(model_cfg.get("pcen_eps", 1e-6), context),
-        "gain_floor": resolve_value(model_cfg.get("pcen_gain_floor", 0.05), context),
-        "gain_ceiling": resolve_value(model_cfg.get("pcen_gain_ceiling", 20.0), context),
-    }
-
-
-def load_residual_source_metadata(model_path: Path) -> dict[str, object] | None:
-    config_path = infer_recipe_config_path(model_path)
-    if config_path is None:
-        return None
-    top_level = merge_top_level_scalars(config_path)
-    model_cfg = merge_task_model_mapping(config_path)
-    context = {**model_cfg, **top_level}
-    enabled = resolve_value(model_cfg.get("residual_source_enabled", False), context)
-    if not bool(enabled):
-        return None
-    n_src = int(resolve_model_top_level_value("n_src", model_cfg, top_level, context, 3))
-    core_n_src = int(resolve_value(model_cfg.get("core_n_src", n_src - 1), context))
-    residual_source_index = int(resolve_value(model_cfg.get("residual_source_index", n_src - 1), context))
-    return {
-        "enabled": True,
-        "mode": "mixture_minus_explicit_sources",
-        "explicit_n_src": core_n_src,
-        "output_n_src": n_src,
-        "residual_source_index": residual_source_index,
-    }
-
-
 def infer_export_freq_bins(config_path: Path) -> int:
     """Infer ONNX spectral bin count ``F`` for ``[B, 2*n_chan, T, F]`` exports."""
     top_level = merge_top_level_scalars(config_path)
     meta = load_frequency_preprocess_metadata(config_path)
-    if meta is not None and meta.get("target_bins") is not None:
-        return int(meta["target_bins"])  # type: ignore[arg-type]
+    if meta is not None and meta.get("keep_bins") is not None:
+        return int(meta["keep_bins"])  # type: ignore[arg-type]
     n_fft = int(top_level.get("n_fft", 2048))
     return n_fft // 2 + 1
 
@@ -409,10 +327,7 @@ class _TigerCellOnnxExportWrapper(torch.nn.Module):
                 states[4],
                 states[5],
             )
-        raise ValueError(
-            "TIGER export expects init_streaming_state to return 3 or 6 tensors, "
-            f"got {len(states)}"
-        )
+        raise ValueError(f"TIGER export expects init_streaming_state to return 3 or 6 tensors, got {len(states)}")
 
 
 def get_export_core(task):
@@ -428,9 +343,7 @@ def get_export_core_from_model_system(model_system):
     online_model = getattr(model_system, "model", model_system)
     core = getattr(online_model, "core", None)
     if core is None:
-        raise ValueError(
-            f"Expected an online wrapper/model with a .core module, got {type(model_system).__name__}"
-        )
+        raise ValueError(f"Expected an online wrapper/model with a .core module, got {type(model_system).__name__}")
     return core
 
 
@@ -459,9 +372,7 @@ def load_export_core(model_path: Path, device: str):
         mode = "config_only_merged" if model_path.name == "merged_config.yaml" else "config_only_recipe"
         return get_export_core_from_model_system(model_system), mode
 
-    raise ValueError(
-        "model_path must be a checkpoint, a model directory, or a config.yaml / merged_config.yaml file."
-    )
+    raise ValueError("model_path must be a checkpoint, a model directory, or a config.yaml / merged_config.yaml file.")
 
 
 def get_allowed_ops(preset: str) -> set[str]:
@@ -617,21 +528,12 @@ def main():
 
     args = parser.parse_args()
     if args.opset < 11 or args.opset > 14:
-        raise ValueError(
-            f"Unsupported opset {args.opset}. Current NPU compilation supports ONNX opset 11~14 only."
-        )
+        raise ValueError(f"Unsupported opset {args.opset}. Current NPU compilation supports ONNX opset 11~14 only.")
 
     core, source_mode = load_export_core(args.model_path, args.device)
     frequency_preprocess_meta = load_frequency_preprocess_metadata(args.model_path)
     dc_bypass_meta = load_dc_bypass_metadata(args.model_path)
-    pcen_preprocess_meta = load_pcen_preprocess_metadata(args.model_path)
-    residual_source_meta = load_residual_source_metadata(args.model_path)
     core = core.to(args.device)
-    actual_n_chan = int(getattr(core, "n_chan", args.n_chan))
-    if actual_n_chan != int(args.n_chan):
-        raise ValueError(f"Export n_chan mismatch: --n-chan={args.n_chan}, but core expects n_chan={actual_n_chan}.")
-    core_masking_enabled = bool(getattr(core, "masking", False))
-    core_mask_activation = getattr(core, "mask_activation", None)
     if args.disable_masking and hasattr(core, "masking"):
         core = copy.deepcopy(core)
         core.masking = False
@@ -648,9 +550,7 @@ def main():
 
     state_meta: dict[str, object] | None = None
     all_constant_bindings = collect_external_constant_bindings(core)
-    all_constant_tensors = (
-        get_external_constant_tensors(core, all_constant_bindings) if all_constant_bindings else ()
-    )
+    all_constant_tensors = get_external_constant_tensors(core, all_constant_bindings) if all_constant_bindings else ()
     constant_bindings = all_constant_bindings if args.externalize_band_constants else ()
     constant_tensors = all_constant_tensors if args.externalize_band_constants else ()
     constant_meta = (
@@ -688,9 +588,7 @@ def main():
             )
         if args.externalize_band_constants:
             raise ValueError("--externalize-band-constants is not supported for TIGER cell exports.")
-        init_pack = tuple(
-            core.init_streaming_state(batch_size=1, device=device_torch, dtype=dtype_torch)
-        )
+        init_pack = tuple(core.init_streaming_state(batch_size=1, device=device_torch, dtype=dtype_torch))
         n_pack = len(init_pack)
         if n_pack == 3:
             input_names = ["subband_spec_RIs", "past_kvs", "past_valid_mask", "time_ctx"]
@@ -715,9 +613,7 @@ def main():
                 "new_global_states",
             ]
         else:
-            raise ValueError(
-                f"Unsupported TIGER streaming state arity {n_pack} (expected 3 or 6 tensors)."
-            )
+            raise ValueError(f"Unsupported TIGER streaming state arity {n_pack} (expected 3 or 6 tensors).")
 
         enc = int(core.enc_dim)
         export_freqs = enc
@@ -731,9 +627,7 @@ def main():
         if export_freqs is None:
             raise ValueError("Could not infer export frequency bins. Please pass --freqs explicitly.")
         if core_freqs is not None and int(export_freqs) != int(core_freqs):
-            raise ValueError(
-                f"Export freqs mismatch: --freqs={export_freqs}, but core expects n_freq={core_freqs}."
-            )
+            raise ValueError(f"Export freqs mismatch: --freqs={export_freqs}, but core expects n_freq={core_freqs}.")
 
         dummy = torch.randn(
             1,
@@ -794,7 +688,7 @@ def main():
         output_names=output_names,
         dynamic_axes=None,
         keep_initializers_as_inputs=args.keep_initializers_as_inputs,
-        dynamo=False
+        dynamo=False,
     )
 
     onnx_model = onnx.load(args.out)
@@ -859,22 +753,12 @@ def main():
             "core_type": type(core).__name__,
             "streaming": args.streaming,
             "masking_inside_graph": not args.disable_masking,
-            "mask_postprocess": {
-                "trained_masking_enabled": core_masking_enabled,
-                "inside_graph": core_masking_enabled and not args.disable_masking,
-                "activation": core_mask_activation,
-                "external_postprocess_required": core_masking_enabled and args.disable_masking,
-            },
             "keep_initializers_as_inputs": args.keep_initializers_as_inputs,
             "frames": args.frames,
             "freqs": export_freqs,
-            "n_chan": actual_n_chan,
-            "core_n_src": int(getattr(core, "n_src", 0)) if hasattr(core, "n_src") else None,
+            "n_chan": args.n_chan,
             "frequency_preprocessing": frequency_preprocess_meta,
             "dc_bypass": dc_bypass_meta,
-            "pcen_preprocessing": pcen_preprocess_meta,
-            "residual_source": residual_source_meta,
-            "prompt_conditioning": core.prompt_manifest() if hasattr(core, "prompt_manifest") else None,
             "input_names": input_names,
             "output_names": output_names,
             "dynamic_inputs": (
@@ -889,9 +773,7 @@ def main():
             ),
             "state_meta_file": str(args.state_meta_out) if args.state_meta_out is not None else None,
             "state_meta_inline": state_meta,
-            "band_constants_mode": (
-                "external_inputs" if args.externalize_band_constants else "embedded_initializers"
-            ),
+            "band_constants_mode": ("external_inputs" if args.externalize_band_constants else "embedded_initializers"),
             "embedded_band_constants": embedded_constant_meta,
             "persistent_constant_inputs": constant_meta if args.externalize_band_constants else None,
             "constants_file": str(args.constants_out) if args.constants_out is not None else None,
@@ -916,8 +798,6 @@ def main():
     print("Dynamo exporter: False")
     print(f"Streaming export: {args.streaming}")
     print(f"Masking inside graph: {not args.disable_masking}")
-    if core_mask_activation is not None:
-        print(f"Mask activation: {core_mask_activation}")
     print(f"Keep initializers as inputs: {args.keep_initializers_as_inputs}")
     print(f"Externalize band constants: {args.externalize_band_constants}")
     if tiger_like:
@@ -935,13 +815,8 @@ def main():
         print("Output: band_masked_output + updated streaming tensors")
     else:
         print("Output shape: (1, 2*N*M, T, F) or raw masks if masking is disabled")
-    if hasattr(core, "prompt_manifest"):
-        print(f"Prompt conditioning: {core.prompt_manifest()}")
     print(f"ONNX ops: {', '.join(audit['ops'])}")
-    print(
-        "Initializers: "
-        f"{audit['initializer_count']} tensors, {int(audit['initializer_bytes'])} bytes"
-    )
+    print(f"Initializers: {audit['initializer_count']} tensors, {int(audit['initializer_bytes'])} bytes")
     if args.check:
         print("ONNX checker: passed")
     if args.op_preset != "none":

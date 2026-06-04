@@ -55,8 +55,11 @@ Added preset configs in `BandSFCNetNPU/presets.py`:
 - `causal_cnb_soft_query`
 - `causal_cnb_soft_band_query`
 - `causal_cnb_crossattn_query`
+- `causal_cnb_balanced_soft_query`
+- `causal_cnb_balanced_soft_band_query`
+- `causal_cnb_balanced_crossattn_query`
 
-Current deployable shape:
+Current compile-smoke shape:
 
 ```text
 n_bands=48
@@ -72,15 +75,35 @@ cnb_dilation_schedule=(1, 2, 3)
 The lower channel/band count is intentional for the first strict-state smoke
 target because each CNB stage carries a 12-frame causal FSMN cache.
 
+Useful-capacity balanced shape:
+
+```text
+n_bands=48
+channels=32
+num_stages=5
+time_kernel=1
+freq_kernel=3
+stage_type=causal_cnb
+cnb_kernel=5
+cnb_dilation_schedule=(1, 2, 3)
+pooled_mixer_hidden=8192 per CNB stage
+```
+
+The balanced shape uses state-free pooled channel mixers after each CNB block to
+reach the useful 2-7M parameter range without increasing persistent streaming
+cache.
+
 ## New recipes
 
 Added DnR recipe overlays:
 
 - `recipes/dnr/models/band-sfc-net-npu.causal-cnb.soft-query.rt192k.fp512/config.yaml`
 - `recipes/dnr/models/band-sfc-net-npu.causal-cnb.crossattn-query.rt192k.fp512/config.yaml`
+- `recipes/dnr/models/band-sfc-net-npu.causal-cnb.balanced.soft-query.rt192k.fp512/config.yaml`
+- `recipes/dnr/models/band-sfc-net-npu.causal-cnb.balanced.crossattn-query.rt192k.fp512/config.yaml`
 
-The soft-query recipe is the safer default.  The cross-attention-query recipe is
-an expressiveness/quality ablation.
+The balanced soft-query recipe is the recommended CNB training target.  The
+cross-attention-query recipe is an expressiveness/quality ablation.
 
 ## Code-review fixes
 
@@ -103,10 +126,12 @@ Current strict fp512 CNB smoke targets:
 |---|---:|---:|---:|
 | `causal_cnb_soft_band_query` | 37,260 | 138,240 B | 60 frames |
 | `causal_cnb_crossattn_query` | 43,307 | 138,240 B | 60 frames |
+| `causal_cnb_balanced_soft_band_query` | 4,070,812 | 184,320 B | 60 frames |
+| `causal_cnb_balanced_crossattn_query` | 4,081,963 | 184,320 B | 60 frames |
 
-These are exact-structure / compile-smoke CNB variants, not yet useful-capacity
-training targets.  The 60-frame context comes from five CNB stages, each with a
-12-frame FSMN cache.
+The first two are exact-structure / compile-smoke CNB variants.  The balanced
+variants are the useful-capacity training targets.  The 60-frame context comes
+from five CNB stages, each with a 12-frame FSMN cache.
 
 ## ONNX audit
 
@@ -128,6 +153,18 @@ causal_cnb_crossattn_query:
   Add=54, Concat=1, Conv=69, Div=21, MatMul=15, Mul=79,
   ReduceMean=21, Reshape=34, Sigmoid=15, Slice=39, Softmax=7,
   Sqrt=21, Sub=3, Transpose=37
+
+causal_cnb_balanced_soft_band_query:
+  nodes=448
+  Add=62, Concat=2, Conv=71, Div=25, MatMul=13, Mul=85,
+  ReduceMean=29, ReduceSum=1, Reshape=28, Sigmoid=20, Slice=43,
+  Softmax=6, Sqrt=24, Sub=3, Transpose=36
+
+causal_cnb_balanced_crossattn_query:
+  nodes=486
+  Add=64, Concat=1, Conv=79, Div=26, MatMul=15, Mul=94,
+  ReduceMean=31, Reshape=34, Sigmoid=20, Slice=49, Softmax=7,
+  Sqrt=26, Sub=3, Transpose=37
 ```
 
 ## Validation commands

@@ -88,6 +88,7 @@ class AdaptiveMelBandSpec2d(nn.Module):
         low_freq_band_fraction: float = 0.45,
         overlap_factor: float = 1.5,
         low_freq_overlap_factor: float = 2.0,
+        bin_frequencies_hz: torch.Tensor | Sequence[float] | None = None,
     ):
         super().__init__()
         if n_freq <= 0:
@@ -97,7 +98,20 @@ class AdaptiveMelBandSpec2d(nn.Module):
         nyquist = 0.5 * float(sample_rate)
         if nyquist <= 0.0:
             raise ValueError(f"sample_rate must be positive, got {sample_rate}.")
-        f_max = nyquist if f_max_hz is None else min(float(f_max_hz), nyquist)
+        if bin_frequencies_hz is None:
+            freqs_hz = torch.linspace(0.0, nyquist, steps=n_freq, dtype=torch.float32)
+            explicit_bin_frequencies = False
+        else:
+            freqs_hz = torch.as_tensor(bin_frequencies_hz, dtype=torch.float32).flatten()
+            if int(freqs_hz.numel()) != int(n_freq):
+                raise ValueError(f"bin_frequencies_hz must have {n_freq} entries, got {int(freqs_hz.numel())}.")
+            if torch.any(freqs_hz < 0.0):
+                raise ValueError("bin_frequencies_hz must be non-negative.")
+            if torch.any(freqs_hz[1:] < freqs_hz[:-1]):
+                raise ValueError("bin_frequencies_hz must be sorted in non-decreasing order.")
+            explicit_bin_frequencies = True
+        axis_max = min(float(freqs_hz[-1].item()), nyquist)
+        f_max = axis_max if f_max_hz is None else min(float(f_max_hz), axis_max)
         f_min = max(0.0, min(float(f_min_hz), f_max - 1.0))
         low_freq = max(f_min + 1.0, min(float(low_freq_hz), f_max - 1.0))
         if not (0.0 < low_freq_band_fraction < 1.0):
@@ -115,6 +129,7 @@ class AdaptiveMelBandSpec2d(nn.Module):
             low_freq_band_fraction=low_freq_band_fraction,
             overlap_factor=overlap_factor,
             low_freq_overlap_factor=low_freq_overlap_factor,
+            freqs_hz=freqs_hz,
         )
         starts, ends = self._basis_bounds(basis)
 
@@ -127,9 +142,11 @@ class AdaptiveMelBandSpec2d(nn.Module):
         self.low_freq_band_fraction = float(low_freq_band_fraction)
         self.overlap_factor = float(overlap_factor)
         self.low_freq_overlap_factor = float(low_freq_overlap_factor)
+        self.explicit_bin_frequencies = bool(explicit_bin_frequencies)
         self.register_buffer("starts", starts)
         self.register_buffer("ends", ends)
         self.register_buffer("centers_hz", centers_hz)
+        self.register_buffer("bin_frequencies_hz", freqs_hz)
         self.register_buffer("basis", basis.view(1, n_bands, 1, n_freq))
 
     @staticmethod
@@ -144,6 +161,7 @@ class AdaptiveMelBandSpec2d(nn.Module):
         low_freq_band_fraction: float,
         overlap_factor: float,
         low_freq_overlap_factor: float,
+        freqs_hz: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n_low = int(round(n_bands * low_freq_band_fraction))
         n_low = min(max(n_low, 1), n_bands - 1)
@@ -157,7 +175,9 @@ class AdaptiveMelBandSpec2d(nn.Module):
         centers_mel = torch.cat([low_centers, high_centers], dim=0)
 
         center_hz = _mel_to_hz(centers_mel).clamp(f_min_hz, f_max_hz)
-        freqs_hz = torch.linspace(0.0, nyquist, steps=n_freq, dtype=torch.float32)
+        del nyquist
+        if int(freqs_hz.numel()) != int(n_freq):
+            raise ValueError(f"Expected {n_freq} frequency positions, got {int(freqs_hz.numel())}")
         freqs_mel = _hz_to_mel(freqs_hz)
 
         midpoint_left = torch.empty_like(centers_mel)
@@ -217,6 +237,7 @@ class AdaptiveMelBandSpec2d(nn.Module):
             "low_freq_band_fraction": self.low_freq_band_fraction,
             "overlap_factor": self.overlap_factor,
             "low_freq_overlap_factor": self.low_freq_overlap_factor,
+            "explicit_bin_frequencies": self.explicit_bin_frequencies,
         }
 
 

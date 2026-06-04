@@ -1,0 +1,7 @@
+_base_: ../band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.rt192k.fp512keep475/config.yaml
+
+# Strong Loco-CNB ablation with cross-attention-query SFC transport.
+# Use this after the soft-query recipe passes ONNX/ONE audits, because it has a
+# larger MatMul/Softmax graph but a more expressive adaptive encoder/decoder.
+band_sfc_preset: adaptive_mel_loco_cnb_crossattn_query
+band_sfc_transport: crossattn_query

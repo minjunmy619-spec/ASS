@@ -1,0 +1,85 @@
+_base_: ../band-sfc-net-npu.causal-cnb.balanced.soft-query.rt192k.fp512/config.yaml
+
+# Strong strict-NPU follow-up to the balanced CNB branch.
+# Addresses the observed under-performance of existing BandSFC variants by:
+# - improving features before SFC compression,
+# - using overlapped adaptive/mel band priors,
+# - adding local TF-Locoformer-style detail modeling around CNB/FSMN,
+# - strengthening full-frequency reconstruction after SFC expansion,
+# - keeping the recurrent cache under 192 KiB at fp512.
+band_sfc_preset: adaptive_mel_loco_cnb_soft_band_query
+band_sfc_transport: soft_band_query
+band_sfc_n_bands: 48
+band_sfc_channels: 32
+band_sfc_num_stages: 5
+band_sfc_time_kernel: 1
+band_sfc_freq_kernel: 3
+band_sfc_dilation_cycle: [1, 1, 1, 1, 1]
+band_sfc_stage_type: loco_cnb
+band_sfc_cnb_kernel: 4
+band_sfc_cnb_dilation_schedule: [1, 2, 3]
+band_sfc_routing_normalization: softmax
+band_sfc_use_attn: false
+band_sfc_attn_window: 16
+band_sfc_num_heads: 4
+band_sfc_head_dim: 8
+band_sfc_pooled_mixer_hidden: 8192
+band_sfc_pooled_mixer_hidden_schedule: [8192, 8192, 8192, 8192, 8192]
+band_sfc_encoder_capacity_mixer_hidden: 4096
+band_sfc_encoder_capacity_mixer_layers: 2
+band_sfc_decoder_capacity_mixer_hidden: 4096
+band_sfc_decoder_capacity_mixer_layers: 2
+band_sfc_band_spec_type: adaptive_mel
+band_sfc_low_freq_hz: 1000.0
+band_sfc_low_freq_band_fraction: 0.45
+band_sfc_overlap_factor: 1.5
+band_sfc_low_freq_overlap_factor: 2.0
+band_sfc_loco_expansion: 1
+band_sfc_loco_ffn_expansion: 2
+band_sfc_loco_time_kernel: 3
+band_sfc_loco_band_kernel: 3
+band_sfc_loco_time_dilation: 1
+band_sfc_residual_head: true
+band_sfc_query_type: adaptive
+
+# Keep the existing fp512 front-end convention from the parent recipe.  These
+# are the inherited variable names consumed by task.model.freq_preprocess_*.
+band_sfc_freq_preprocess_keep_bins: 475
+band_sfc_freq_preprocess_target_bins: 512
+
+task:
+  model:
+    preset: ${band_sfc_preset}
+    transport: ${band_sfc_transport}
+    n_bands: ${band_sfc_n_bands}
+    channels: ${band_sfc_channels}
+    num_stages: ${band_sfc_num_stages}
+    time_kernel: ${band_sfc_time_kernel}
+    freq_kernel: ${band_sfc_freq_kernel}
+    dilation_cycle: ${band_sfc_dilation_cycle}
+    stage_type: ${band_sfc_stage_type}
+    cnb_kernel: ${band_sfc_cnb_kernel}
+    cnb_dilation_schedule: ${band_sfc_cnb_dilation_schedule}
+    routing_normalization: ${band_sfc_routing_normalization}
+    use_attn: ${band_sfc_use_attn}
+    attn_window: ${band_sfc_attn_window}
+    num_heads: ${band_sfc_num_heads}
+    head_dim: ${band_sfc_head_dim}
+    pooled_mixer_hidden: ${band_sfc_pooled_mixer_hidden}
+    pooled_mixer_hidden_schedule: ${band_sfc_pooled_mixer_hidden_schedule}
+    encoder_capacity_mixer_hidden: ${band_sfc_encoder_capacity_mixer_hidden}
+    encoder_capacity_mixer_layers: ${band_sfc_encoder_capacity_mixer_layers}
+    decoder_capacity_mixer_hidden: ${band_sfc_decoder_capacity_mixer_hidden}
+    decoder_capacity_mixer_layers: ${band_sfc_decoder_capacity_mixer_layers}
+    band_spec_type: ${band_sfc_band_spec_type}
+    low_freq_hz: ${band_sfc_low_freq_hz}
+    low_freq_band_fraction: ${band_sfc_low_freq_band_fraction}
+    overlap_factor: ${band_sfc_overlap_factor}
+    low_freq_overlap_factor: ${band_sfc_low_freq_overlap_factor}
+    loco_expansion: ${band_sfc_loco_expansion}
+    loco_ffn_expansion: ${band_sfc_loco_ffn_expansion}
+    loco_time_kernel: ${band_sfc_loco_time_kernel}
+    loco_band_kernel: ${band_sfc_loco_band_kernel}
+    loco_time_dilation: ${band_sfc_loco_time_dilation}
+    residual_head: ${band_sfc_residual_head}
+    query_type: ${band_sfc_query_type}

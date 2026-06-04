@@ -1,0 +1,5 @@
+_base_: ../band-sfc-net-npu.causal-cnb.balanced.soft-query.rt192k.fp512/config.yaml
+
+# Useful-capacity Proposal B CNB ablation with cross-attention-query SFC transport.
+band_sfc_preset: causal_cnb_balanced_crossattn_query
+band_sfc_transport: crossattn_query
