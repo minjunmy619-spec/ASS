@@ -387,3 +387,32 @@ Dedicated distillation recipes are now available. Recommended loss mix:
 The new architecture is designed to make distillation more useful than in the
 older balanced CNB branch because it has trainable capacity before compression,
 inside local/CNB stages, and after expansion.
+
+## 2026-06-05 supervised stability follow-up
+
+After the first supervised run of
+`band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.rt192k.fp512keep475` peaked
+around `validation/snr ~= 3.6 dB` and then dropped, the preset was reviewed for
+capacity balance.  The main issue was structural: most parameters were in giant
+frequency-pooled mixers and `residual_head=true` enabled an unbounded additive
+residual branch during supervised stage-1.
+
+Added stability-first follow-up recipes:
+
+```text
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475/config.yaml
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-crossattn-query.rt192k.fp512keep475/config.yaml
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.band56-soft-query.rt192k.fp512keep475/config.yaml
+```
+
+Recommended next run:
+
+```text
+band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475
+```
+
+Detailed notes and commands are in:
+
+```text
+adaptive_mel_loco_cnb_stability_fix_20260605_operation.md
+```

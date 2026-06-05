@@ -1,0 +1,58 @@
+_base_: ../band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.rt192k.fp512keep475/config.yaml
+
+# Stability-first fix for the initial adaptive-mel Loco-CNB training run.
+# The previous 5.7M preset concentrated most parameters in giant pooled mixers
+# and enabled an unbounded residual head.  This variant shifts budget into the
+# actual local/CNB channel width, reduces pooled global MLP dominance, and keeps
+# stage-1 supervised training mask-only.
+band_sfc_preset: adaptive_mel_loco_cnb_stable_soft_band_query
+band_sfc_transport: soft_band_query
+band_sfc_n_bands: 48
+band_sfc_channels: 36
+band_sfc_pooled_mixer_hidden: 4096
+band_sfc_pooled_mixer_hidden_schedule: [2048, 4096, 4096, 4096, 2048]
+band_sfc_encoder_capacity_mixer_hidden: 2048
+band_sfc_encoder_capacity_mixer_layers: 2
+band_sfc_decoder_capacity_mixer_hidden: 2048
+band_sfc_decoder_capacity_mixer_layers: 2
+band_sfc_residual_head: false
+
+# Use a less aggressive supervised stage-1 schedule.  The inherited 1e-3 LR
+# reaches full strength near epoch 4 and was likely too high for this larger
+# adaptive-mel Loco-CNB family.
+trainer:
+  limit_val_batches: 30
+
+datamodule:
+  crop_retry: 24
+  source_activity_threshold: 1.0e-4
+  p_source_dropout: 0.08
+  source_gain_db_min: -12.0
+  source_gain_db_max: 12.0
+  train_augmentations:
+    p_gain: 0.45
+    gain_db_min: -3.0
+    gain_db_max: 3.0
+    p_polarity: 0.2
+    p_channel_swap: 0.0
+    p_time_shift: 0.2
+    max_time_shift_samples: 2048
+    p_pitch_time: 0.1
+    pitch_time_scale_min: 0.99
+    pitch_time_scale_max: 1.01
+    p_random_eq: 0.3
+    eq_bands: 8
+    eq_gain_db_min: -2.0
+    eq_gain_db_max: 2.0
+    p_band_dropout: 0.08
+    band_dropout_width: 0.04
+
+task:
+  optimizer_config:
+    optimizer_generator:
+      lr: 3.e-4
+      weight_decay: 1.e-3
+    scheduler_generator:
+      warmup_steps: 10000
+      decay_start_step: 40000
+      decay_stop_step: 120000

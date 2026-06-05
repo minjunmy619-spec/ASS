@@ -454,6 +454,51 @@ def test_adaptive_mel_loco_cnb_recipe_config_resolves_and_instantiates() -> None
     assert core.state_size_bytes(dtype=torch.float16) < 192 * 1024
 
 
+def test_adaptive_mel_loco_cnb_stability_fix_recipes_resolve_and_instantiate() -> None:
+    checks = [
+        (
+            "recipes/dnr/models/"
+            "band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475/config.yaml",
+            "adaptive_mel_loco_cnb_stable_soft_band_query",
+            36,
+            48,
+        ),
+        (
+            "recipes/dnr/models/"
+            "band-sfc-net-npu.adaptive-mel-loco-cnb.stable-crossattn-query.rt192k.fp512keep475/config.yaml",
+            "adaptive_mel_loco_cnb_stable_crossattn_query",
+            36,
+            48,
+        ),
+        (
+            "recipes/dnr/models/"
+            "band-sfc-net-npu.adaptive-mel-loco-cnb.band56-soft-query.rt192k.fp512keep475/config.yaml",
+            "adaptive_mel_loco_cnb_band56_soft_band_query",
+            28,
+            56,
+        ),
+    ]
+    for raw_path, preset, channels, n_bands in checks:
+        config_path = Path(raw_path)
+        top = merge_top_level_scalars(config_path)
+        model_cfg = merge_task_model_mapping(config_path)
+        context = {**top, **model_cfg}
+        assert resolve_value(model_cfg["preset"], context) == preset
+        assert resolve_value(model_cfg["channels"], context) == channels
+        assert resolve_value(model_cfg["n_bands"], context) == n_bands
+        assert resolve_value(model_cfg["residual_head"], context) is False
+
+        system = build_model_system_from_recipe_config(config_path).eval()
+        core = system.model.core
+        assert core.stage_type == "loco_cnb"
+        assert core.band_spec_type == "adaptive_mel"
+        assert core.channels == channels
+        assert core.n_bands == n_bands
+        assert core.residual_head is False
+        assert sum(p.numel() for p in core.parameters()) < 4_000_000
+        assert core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+
 def test_adaptive_mel_loco_cnb_distill_recipe_declares_teacher_task() -> None:
     config_path = Path(
         "recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.distill.rt192k.fp512keep475/config.yaml"

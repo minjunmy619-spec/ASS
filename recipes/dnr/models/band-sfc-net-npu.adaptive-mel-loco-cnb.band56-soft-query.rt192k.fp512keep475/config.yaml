@@ -1,0 +1,9 @@
+_base_: ../band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475/config.yaml
+
+# Bottleneck ablation: trade channel width for more compressed bands to check
+# whether the 48-band adaptive-mel bottleneck was too coarse for DnR Effects and
+# high-frequency detail.  Keeps the same stability training schedule.
+band_sfc_preset: adaptive_mel_loco_cnb_band56_soft_band_query
+band_sfc_transport: soft_band_query
+band_sfc_n_bands: 56
+band_sfc_channels: 28

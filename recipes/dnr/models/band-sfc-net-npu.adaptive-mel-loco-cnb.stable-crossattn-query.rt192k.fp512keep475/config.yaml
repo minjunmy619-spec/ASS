@@ -1,0 +1,7 @@
+_base_: ../band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475/config.yaml
+
+# Expressive SFC transport ablation after the stable soft-query baseline is
+# confirmed.  Keeps the same stability fixes: reduced pooled capacity, no
+# residual head for stage-1, lower LR, and fuller validation.
+band_sfc_preset: adaptive_mel_loco_cnb_stable_crossattn_query
+band_sfc_transport: crossattn_query

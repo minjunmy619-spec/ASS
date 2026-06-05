@@ -519,6 +519,11 @@ _PRESETS = {
     "adaptive_mel_loco_cnb_soft_query": None,
     "adaptive_mel_loco_cnb_soft_band_query": None,
     "adaptive_mel_loco_cnb_crossattn_query": None,
+    "adaptive_mel_loco_cnb_stable_soft_query": None,
+    "adaptive_mel_loco_cnb_stable_soft_band_query": None,
+    "adaptive_mel_loco_cnb_stable_crossattn_query": None,
+    "adaptive_mel_loco_cnb_band56_soft_query": None,
+    "adaptive_mel_loco_cnb_band56_soft_band_query": None,
 }
 
 _PRESET_CONFIGS: dict[str, dict[str, object]] = {
@@ -770,6 +775,105 @@ _PRESET_CONFIGS: dict[str, dict[str, object]] = {
         loco_time_dilation=1,
         residual_head=True,
     ),
+    # Stability-first fix for the first adaptive-mel Loco-CNB run.  The
+    # original 5.7M preset put most trainable capacity in giant frequency-pooled
+    # mixers and enabled an unbounded residual head.  This shape shifts budget
+    # into actual local/CNB channels, reduces pooled global MLP dominance, and
+    # disables residual correction for supervised stage-1 training while staying
+    # under the 192 KiB fp16 state target.
+    "adaptive_mel_loco_cnb_stable_soft_query": dict(
+        n_bands=48,
+        channels=36,
+        num_stages=5,
+        dilation_cycle=(1, 1, 1, 1, 1),
+        transport="soft_band_query",
+        use_attn=False,
+        pooled_mixer_hidden=4096,
+        pooled_mixer_hidden_schedule=(2048, 4096, 4096, 4096, 2048),
+        encoder_capacity_mixer_hidden=2048,
+        encoder_capacity_mixer_layers=2,
+        decoder_capacity_mixer_hidden=2048,
+        decoder_capacity_mixer_layers=2,
+        time_kernel=1,
+        freq_kernel=3,
+        stage_type="loco_cnb",
+        cnb_kernel=4,
+        cnb_dilation_schedule=(1, 2, 3),
+        band_spec_type="adaptive_mel",
+        low_freq_hz=1000.0,
+        low_freq_band_fraction=0.45,
+        overlap_factor=1.5,
+        low_freq_overlap_factor=2.0,
+        loco_expansion=1,
+        loco_ffn_expansion=2,
+        loco_time_kernel=3,
+        loco_band_kernel=3,
+        loco_time_dilation=1,
+        residual_head=False,
+    ),
+    "adaptive_mel_loco_cnb_stable_crossattn_query": dict(
+        n_bands=48,
+        channels=36,
+        num_stages=5,
+        dilation_cycle=(1, 1, 1, 1, 1),
+        transport="crossattn_query",
+        use_attn=False,
+        pooled_mixer_hidden=4096,
+        pooled_mixer_hidden_schedule=(2048, 4096, 4096, 4096, 2048),
+        encoder_capacity_mixer_hidden=2048,
+        encoder_capacity_mixer_layers=2,
+        decoder_capacity_mixer_hidden=2048,
+        decoder_capacity_mixer_layers=2,
+        time_kernel=1,
+        freq_kernel=3,
+        stage_type="loco_cnb",
+        cnb_kernel=4,
+        cnb_dilation_schedule=(1, 2, 3),
+        band_spec_type="adaptive_mel",
+        low_freq_hz=1000.0,
+        low_freq_band_fraction=0.45,
+        overlap_factor=1.5,
+        low_freq_overlap_factor=2.0,
+        loco_expansion=1,
+        loco_ffn_expansion=2,
+        loco_time_kernel=3,
+        loco_band_kernel=3,
+        loco_time_dilation=1,
+        residual_head=False,
+    ),
+    # Frequency-detail ablation: more compressed bands and fewer channels.  This
+    # tests whether the original 48-band bottleneck was too coarse while keeping
+    # state close to the stable preset and pooled capacity moderate.
+    "adaptive_mel_loco_cnb_band56_soft_query": dict(
+        n_bands=56,
+        channels=28,
+        num_stages=5,
+        dilation_cycle=(1, 1, 1, 1, 1),
+        transport="soft_band_query",
+        use_attn=False,
+        pooled_mixer_hidden=4096,
+        pooled_mixer_hidden_schedule=(2048, 4096, 4096, 4096, 2048),
+        encoder_capacity_mixer_hidden=2048,
+        encoder_capacity_mixer_layers=2,
+        decoder_capacity_mixer_hidden=2048,
+        decoder_capacity_mixer_layers=2,
+        time_kernel=1,
+        freq_kernel=3,
+        stage_type="loco_cnb",
+        cnb_kernel=4,
+        cnb_dilation_schedule=(1, 2, 3),
+        band_spec_type="adaptive_mel",
+        low_freq_hz=1000.0,
+        low_freq_band_fraction=0.45,
+        overlap_factor=1.5,
+        low_freq_overlap_factor=2.0,
+        loco_expansion=1,
+        loco_ffn_expansion=2,
+        loco_time_kernel=3,
+        loco_band_kernel=3,
+        loco_time_dilation=1,
+        residual_head=False,
+    ),
 }
 
 _PRESET_CONFIGS["safe_soft_band_query"] = _PRESET_CONFIGS["safe_soft_query"]
@@ -783,6 +887,12 @@ _PRESET_CONFIGS["rt_plus_soft_band_query"] = _PRESET_CONFIGS["rt_plus_soft_query
 _PRESET_CONFIGS["causal_cnb_soft_band_query"] = _PRESET_CONFIGS["causal_cnb_soft_query"]
 _PRESET_CONFIGS["causal_cnb_balanced_soft_band_query"] = _PRESET_CONFIGS["causal_cnb_balanced_soft_query"]
 _PRESET_CONFIGS["adaptive_mel_loco_cnb_soft_band_query"] = _PRESET_CONFIGS["adaptive_mel_loco_cnb_soft_query"]
+_PRESET_CONFIGS["adaptive_mel_loco_cnb_stable_soft_band_query"] = _PRESET_CONFIGS[
+    "adaptive_mel_loco_cnb_stable_soft_query"
+]
+_PRESET_CONFIGS["adaptive_mel_loco_cnb_band56_soft_band_query"] = _PRESET_CONFIGS[
+    "adaptive_mel_loco_cnb_band56_soft_query"
+]
 
 
 def build_band_sfc_net_npu_from_config(

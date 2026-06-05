@@ -121,6 +121,9 @@ def test_query_variant_deployable_state_budgets_fp512() -> None:
         "causal_cnb_balanced_crossattn_query",
         "adaptive_mel_loco_cnb_soft_band_query",
         "adaptive_mel_loco_cnb_crossattn_query",
+        "adaptive_mel_loco_cnb_stable_soft_band_query",
+        "adaptive_mel_loco_cnb_stable_crossattn_query",
+        "adaptive_mel_loco_cnb_band56_soft_band_query",
     ):
         model = build_band_sfc_net_npu_preset(
             preset, n_freq=512, n_fft=1022, sample_rate=44100, n_src=3, n_chan=1
@@ -228,9 +231,50 @@ def test_adaptive_mel_loco_cnb_variants_have_strong_capacity_and_state_budget() 
         assert model.residual_head is True
 
 
+def test_adaptive_mel_loco_cnb_stability_fix_presets() -> None:
+    stable = build_band_sfc_net_npu_preset(
+        "adaptive_mel_loco_cnb_stable_soft_band_query",
+        n_freq=512,
+        n_fft=1022,
+        sample_rate=44100,
+        n_src=3,
+        n_chan=1,
+    ).eval()
+    stable_params = sum(p.numel() for p in stable.parameters())
+    assert 2_000_000 <= stable_params < 4_000_000
+    assert stable.state_size_bytes(dtype=torch.float16) / 1024.0 < 192.0
+    assert stable.channels == 36
+    assert stable.n_bands == 48
+    assert stable.residual_head is False
+    assert stable.stages[0].pooled_mixer.hidden_channels == 2048
+    assert stable.stages[1].pooled_mixer.hidden_channels == 4096
+    assert stable.encoder_capacity_mixers[0].hidden_channels == 2048
+    assert stable.decoder_capacity_mixers[0].hidden_channels == 2048
+
+    band56 = build_band_sfc_net_npu_preset(
+        "adaptive_mel_loco_cnb_band56_soft_band_query",
+        n_freq=512,
+        n_fft=1022,
+        sample_rate=44100,
+        n_src=3,
+        n_chan=1,
+    ).eval()
+    band56_params = sum(p.numel() for p in band56.parameters())
+    assert 2_000_000 <= band56_params < 4_000_000
+    assert band56.state_size_bytes(dtype=torch.float16) / 1024.0 < 192.0
+    assert band56.channels == 28
+    assert band56.n_bands == 56
+    assert band56.residual_head is False
+
+
 def test_adaptive_mel_loco_cnb_streaming_matches_full() -> None:
     torch.manual_seed(0)
-    for preset in ("adaptive_mel_loco_cnb_soft_band_query", "adaptive_mel_loco_cnb_crossattn_query"):
+    for preset in (
+        "adaptive_mel_loco_cnb_soft_band_query",
+        "adaptive_mel_loco_cnb_crossattn_query",
+        "adaptive_mel_loco_cnb_stable_soft_band_query",
+        "adaptive_mel_loco_cnb_band56_soft_band_query",
+    ):
         model = build_band_sfc_net_npu_preset(
             preset,
             n_freq=65,
@@ -490,6 +534,7 @@ def main() -> None:
         test_balanced_query_variants_have_useful_capacity,
         test_causal_cnb_balanced_variants_have_useful_capacity,
         test_adaptive_mel_loco_cnb_variants_have_strong_capacity_and_state_budget,
+        test_adaptive_mel_loco_cnb_stability_fix_presets,
         test_adaptive_mel_loco_cnb_streaming_matches_full,
         test_adaptive_mel_loco_cnb_stream_state_omits_empty_encoder_cache,
         test_training_builder_threads_loco_cnb_overrides,
