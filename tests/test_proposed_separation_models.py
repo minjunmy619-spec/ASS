@@ -462,6 +462,7 @@ def test_adaptive_mel_loco_cnb_stability_fix_recipes_resolve_and_instantiate() -
             "adaptive_mel_loco_cnb_stable_soft_band_query",
             36,
             48,
+            "pooled",
         ),
         (
             "recipes/dnr/models/"
@@ -469,6 +470,7 @@ def test_adaptive_mel_loco_cnb_stability_fix_recipes_resolve_and_instantiate() -
             "adaptive_mel_loco_cnb_stable_crossattn_query",
             36,
             48,
+            "pooled",
         ),
         (
             "recipes/dnr/models/"
@@ -476,9 +478,18 @@ def test_adaptive_mel_loco_cnb_stability_fix_recipes_resolve_and_instantiate() -
             "adaptive_mel_loco_cnb_band56_soft_band_query",
             28,
             56,
+            "pooled",
+        ),
+        (
+            "recipes/dnr/models/"
+            "band-sfc-net-npu.adaptive-mel-loco-cnb.clean-soft-query.rt192k.fp512keep475/config.yaml",
+            "adaptive_mel_loco_cnb_clean_soft_band_query",
+            36,
+            48,
+            "pointwise",
         ),
     ]
-    for raw_path, preset, channels, n_bands in checks:
+    for raw_path, preset, channels, n_bands, stage_mixer_type in checks:
         config_path = Path(raw_path)
         top = merge_top_level_scalars(config_path)
         model_cfg = merge_task_model_mapping(config_path)
@@ -495,6 +506,7 @@ def test_adaptive_mel_loco_cnb_stability_fix_recipes_resolve_and_instantiate() -
         assert core.channels == channels
         assert core.n_bands == n_bands
         assert core.residual_head is False
+        assert core.stage_mixer_type == stage_mixer_type
         assert sum(p.numel() for p in core.parameters()) < 4_000_000
         assert core.state_size_bytes(dtype=torch.float16) < 192 * 1024
 

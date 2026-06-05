@@ -91,6 +91,47 @@ params = 2,210,395
 fp16 state = 168.44 KiB
 ```
 
+### Clean pointwise structural diagnostic
+
+After further review, even the stable recipe still contains frequency-pooled
+stage capacity.  Added a cleaner alternative:
+
+```text
+adaptive_mel_loco_cnb_clean_soft_band_query
+```
+
+This variant removes frequency-pooled IO capacity and replaces stage pooled
+mixers with pointwise per-band channel mixers:
+
+```text
+stage_mixer_type = pointwise
+pooled_mixer_hidden_schedule = [512, 1024, 1024, 1024, 512]
+encoder_capacity_mixer_layers = 0
+decoder_capacity_mixer_layers = 0
+loco_ffn_expansion = 16
+residual_head = false
+```
+
+Measured:
+
+```text
+channels = 36
+bands = 48
+params = 876,604
+fp16 state = 185.62 KiB
+```
+
+Rationale:
+
+- no mean-over-band global correction path,
+- stage capacity is applied independently at each compressed band,
+- wider local FFN keeps some per-band current-frame capacity,
+- no additional streaming cache.
+
+This is much smaller than the stable recipe, so it should be treated as a clean
+structure diagnostic and/or distillation student, not necessarily the final
+highest-quality supervised model.
+
 ## New recipes
 
 Added supervised recipes:
@@ -99,9 +140,12 @@ Added supervised recipes:
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475/config.yaml
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-crossattn-query.rt192k.fp512keep475/config.yaml
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.band56-soft-query.rt192k.fp512keep475/config.yaml
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.clean-soft-query.rt192k.fp512keep475/config.yaml
 ```
 
-The stable soft-query recipe is the recommended next run.
+If the concern is only training instability of the original high-capacity run,
+use the stable soft-query recipe.  If the concern is the pooled-mixer structure
+itself, use the clean soft-query recipe first.
 
 Training stability changes in the primary recipe:
 
@@ -235,6 +279,43 @@ Result:
 PASS: model.circle, model.opt.circle, model.q.circle
 ```
 
+Stateless verifier for clean pointwise recipe:
+
+```bash
+cd /home/cmj/works/ASS
+.venv/bin/python tools/online/verify_npu_variants.py \
+  --mode recipe \
+  --recipe-name-contains adaptive-mel-loco-cnb.clean-soft-query \
+  --run-name band_sfc_adaptive_mel_loco_cnb_clean_soft_query_20260605 \
+  --force-onnxsim-large-shape-ops \
+  --quantize-layer-fallback
+```
+
+Result:
+
+```text
+PASS: model.circle, model.opt.circle, model.q.circle
+```
+
+Stateful streaming verifier for clean pointwise recipe:
+
+```bash
+cd /home/cmj/works/ASS
+.venv/bin/python tools/online/verify_npu_variants.py \
+  --mode recipe \
+  --recipe-name-contains adaptive-mel-loco-cnb.clean-soft-query \
+  --run-name band_sfc_adaptive_mel_loco_cnb_clean_soft_query_streaming_20260605 \
+  --force-onnxsim-large-shape-ops \
+  --quantize-layer-fallback \
+  --streaming
+```
+
+Result:
+
+```text
+PASS: model.circle, model.opt.circle, model.q.circle
+```
+
 Artifact roots:
 
 ```text
@@ -242,11 +323,20 @@ logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_stable_soft_query_2026060
 logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_stable_soft_query_streaming_20260605
 logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_stable_crossattn_query_20260605
 logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_band56_soft_query_20260605
+logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_clean_soft_query_20260605
+logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_clean_soft_query_streaming_20260605
 ```
 
 ## Recommendation
 
-Use this next:
+If you agree the pooled-mixer structure still looks bad, use this next:
+
+```text
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.clean-soft-query.rt192k.fp512keep475/config.yaml
+```
+
+Use the stable recipe only if you want a higher-parameter supervised run while
+still reducing the original over-capacity problem:
 
 ```text
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475/config.yaml

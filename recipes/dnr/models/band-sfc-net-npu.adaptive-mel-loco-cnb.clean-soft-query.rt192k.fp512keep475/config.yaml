@@ -1,0 +1,23 @@
+_base_: ../band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475/config.yaml
+
+# Cleaner structural fix after reviewing the stable recipe: remove
+# frequency-pooled stage/IO capacity instead of merely shrinking it.  This uses
+# pointwise per-band capacity mixers and a wider local FFN so capacity remains
+# band-preserving and state-free.
+band_sfc_preset: adaptive_mel_loco_cnb_clean_soft_band_query
+band_sfc_transport: soft_band_query
+band_sfc_n_bands: 48
+band_sfc_channels: 36
+band_sfc_stage_mixer_type: pointwise
+band_sfc_pooled_mixer_hidden: 1024
+band_sfc_pooled_mixer_hidden_schedule: [512, 1024, 1024, 1024, 512]
+band_sfc_encoder_capacity_mixer_hidden: 0
+band_sfc_encoder_capacity_mixer_layers: 0
+band_sfc_decoder_capacity_mixer_hidden: 0
+band_sfc_decoder_capacity_mixer_layers: 0
+band_sfc_loco_ffn_expansion: 16
+band_sfc_residual_head: false
+
+task:
+  model:
+    stage_mixer_type: ${band_sfc_stage_mixer_type}

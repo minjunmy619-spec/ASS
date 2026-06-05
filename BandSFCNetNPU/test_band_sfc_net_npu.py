@@ -124,6 +124,7 @@ def test_query_variant_deployable_state_budgets_fp512() -> None:
         "adaptive_mel_loco_cnb_stable_soft_band_query",
         "adaptive_mel_loco_cnb_stable_crossattn_query",
         "adaptive_mel_loco_cnb_band56_soft_band_query",
+        "adaptive_mel_loco_cnb_clean_soft_band_query",
     ):
         model = build_band_sfc_net_npu_preset(
             preset, n_freq=512, n_fft=1022, sample_rate=44100, n_src=3, n_chan=1
@@ -266,6 +267,27 @@ def test_adaptive_mel_loco_cnb_stability_fix_presets() -> None:
     assert band56.n_bands == 56
     assert band56.residual_head is False
 
+    clean = build_band_sfc_net_npu_preset(
+        "adaptive_mel_loco_cnb_clean_soft_band_query",
+        n_freq=512,
+        n_fft=1022,
+        sample_rate=44100,
+        n_src=3,
+        n_chan=1,
+    ).eval()
+    clean_params = sum(p.numel() for p in clean.parameters())
+    assert 500_000 <= clean_params < 1_500_000
+    assert clean.state_size_bytes(dtype=torch.float16) / 1024.0 < 192.0
+    assert clean.channels == 36
+    assert clean.n_bands == 48
+    assert clean.stage_mixer_type == "pointwise"
+    assert clean.stages[0].pooled_mixer.__class__.__name__ == "PointwiseChannelMixer"
+    assert clean.stages[0].pooled_mixer.hidden_channels == 512
+    assert len(clean.encoder_capacity_mixers) == 0
+    assert len(clean.decoder_capacity_mixers) == 0
+    assert clean.loco_ffn_expansion == 16
+    assert clean.residual_head is False
+
 
 def test_adaptive_mel_loco_cnb_streaming_matches_full() -> None:
     torch.manual_seed(0)
@@ -274,6 +296,7 @@ def test_adaptive_mel_loco_cnb_streaming_matches_full() -> None:
         "adaptive_mel_loco_cnb_crossattn_query",
         "adaptive_mel_loco_cnb_stable_soft_band_query",
         "adaptive_mel_loco_cnb_band56_soft_band_query",
+        "adaptive_mel_loco_cnb_clean_soft_band_query",
     ):
         model = build_band_sfc_net_npu_preset(
             preset,

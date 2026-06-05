@@ -63,6 +63,7 @@ adaptive_mel_loco_cnb_crossattn_query   # stronger transport ablation for the hi
 adaptive_mel_loco_cnb_stable_soft_band_query  # recommended supervised stage-1 fix
 adaptive_mel_loco_cnb_stable_crossattn_query  # stable cross-attn transport ablation
 adaptive_mel_loco_cnb_band56_soft_band_query  # 56-band bottleneck ablation
+adaptive_mel_loco_cnb_clean_soft_band_query   # no frequency-pooled stage/IO capacity
 ```
 
 `balanced_*` is the preferred starting point for training: it uses 40 latent
@@ -88,6 +89,11 @@ state path to 36 channels, reduces pooled mixer hidden sizes, disables the
 unbounded residual head, and keeps fp16 state below 192 KiB.  Use
 `adaptive_mel_loco_cnb_band56_soft_band_query` as the bottleneck/detail ablation
 if the stable 48-band recipe still underfits Effects or high-frequency detail.
+If the pooled-mixer idea itself looks too risky, use
+`adaptive_mel_loco_cnb_clean_soft_band_query`: it replaces stage pooled mixers
+with pointwise per-band mixers and removes frequency-pooled IO capacity.  It is
+much smaller, so treat it as the clean structural diagnostic or distillation
+student rather than the highest-capacity supervised target.
 
 `quality6m_*` query variants are available for research, but at fp512 they are
 above the current deployment budget (~9.1M params and ~218 KiB fp16 state), so
@@ -115,6 +121,7 @@ do not use them as strict NPU targets without resizing.
 | `adaptive_mel_loco_cnb_stable_soft_band_query` | adaptive-mel soft-query + wider Loco-CNB + reduced pooled capacity | 36 | 48 | 5 | local 2 + FSMN 1,2,3 | recommended supervised stage-1 fix |
 | `adaptive_mel_loco_cnb_stable_crossattn_query` | adaptive-mel cross-attn-query + stable Loco-CNB shape | 36 | 48 | 5 | local 2 + FSMN 1,2,3 | stable transport ablation |
 | `adaptive_mel_loco_cnb_band56_soft_band_query` | adaptive-mel soft-query + 56-band bottleneck ablation | 28 | 56 | 5 | local 2 + FSMN 1,2,3 | detail/bottleneck ablation |
+| `adaptive_mel_loco_cnb_clean_soft_band_query` | adaptive-mel soft-query + pointwise per-band stage mixers | 36 | 48 | 5 | local 2 + FSMN 1,2,3 | clean structural diagnostic/distill student |
 | `quality6m` | cross-attn-query | 40 | 64 | 4 | 1,2,4,6 | high-capacity probe, not strict fp512 deploy |
 
 ## Smoke
@@ -171,6 +178,7 @@ Validated local artifacts on 2026-05-20:
 | `band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475` | 701 non-Constant simplified nodes | 2,852,491 | 185.62 KiB | stateless and stateful `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
 | `band-sfc-net-npu.adaptive-mel-loco-cnb.stable-crossattn-query.rt192k.fp512keep475` | audited by verifier | 2,866,770 | 185.62 KiB | stateless `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
 | `band-sfc-net-npu.adaptive-mel-loco-cnb.band56-soft-query.rt192k.fp512keep475` | 701 non-Constant simplified nodes | 2,210,395 | 168.44 KiB | stateless `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
+| `band-sfc-net-npu.adaptive-mel-loco-cnb.clean-soft-query.rt192k.fp512keep475` | 637 non-Constant simplified nodes | 876,604 | 185.62 KiB | stateless and stateful `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
 
 The stateful adaptive-mel Loco-CNB exports use 10 state tensors and also pass
 channel-wise uint8 quantization.  Artifact roots are listed below.
@@ -193,6 +201,8 @@ logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_stable_soft_query_2026060
 logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_stable_soft_query_streaming_20260605
 logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_stable_crossattn_query_20260605
 logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_band56_soft_query_20260605
+logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_clean_soft_query_20260605
+logs/npu_verify_general/band_sfc_adaptive_mel_loco_cnb_clean_soft_query_streaming_20260605
 ```
 
 ## Recipes
@@ -218,6 +228,7 @@ recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.crossattn-query.distil
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-crossattn-query.rt192k.fp512keep475
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.band56-soft-query.rt192k.fp512keep475
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.clean-soft-query.rt192k.fp512keep475
 recipes/dnr/models/band-sfc-net-npu.quality6m.fp256
 ```
 

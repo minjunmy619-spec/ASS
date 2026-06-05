@@ -392,6 +392,7 @@ class CausalCNBBlock(nn.Module):
         num_heads: int = 4,
         head_dim: int = 8,
         pooled_mixer_hidden: int = 0,
+        stage_mixer_type: str = "pooled",
     ):
         super().__init__()
         self.cross_band = CrossBandMixer(d_model, grouped=True, freq_kernel=freq_kernel)
@@ -401,9 +402,7 @@ class CausalCNBBlock(nn.Module):
             dilation_schedule=dilation_schedule,
         )
         self.csa = CompressedSelfAttentionFusion(d_model, num_heads=num_heads, head_dim=head_dim)
-        self.pooled_mixer = (
-            PooledChannelMixer(d_model, pooled_mixer_hidden) if pooled_mixer_hidden > 0 else nn.Identity()
-        )
+        self.pooled_mixer = _make_stage_capacity_mixer(d_model, pooled_mixer_hidden, stage_mixer_type)
 
     def forward(self, z: torch.Tensor, state: torch.Tensor | None = None):
         if state is not None:
@@ -556,6 +555,43 @@ class LocalTFLocoMixer(nn.Module):
         return x + self.ffn_out(y) * self.ffn_scale, new_state
 
 
+class PointwiseChannelMixer(nn.Module):
+    """Band-preserving state-free channel mixer.
+
+    Unlike ``PooledChannelMixer``, this block does not average over the
+    compressed band axis.  It adds current-frame channel capacity independently
+    at every compressed band, preserving local TF detail while adding no
+    persistent streaming cache.
+    """
+
+    def __init__(self, channels: int, hidden_channels: int):
+        super().__init__()
+        if hidden_channels <= 0:
+            raise ValueError(f"hidden_channels must be positive, got {hidden_channels}")
+        self.channels = int(channels)
+        self.hidden_channels = int(hidden_channels)
+        self.norm = RMSNorm2d(channels)
+        self.expand = nn.Conv2d(channels, 2 * hidden_channels, kernel_size=1, bias=True)
+        self.project = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=True)
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _runtime_assert(x.ndim == 4, f"Expected 4D input, got {tuple(x.shape)}")
+        value, gate = self.expand(self.norm(x)).chunk(2, dim=1)
+        y = value * torch.sigmoid(gate)
+        return x + self.project(y) * self.residual_scale
+
+
+def _make_stage_capacity_mixer(channels: int, hidden_channels: int, mixer_type: str) -> nn.Module:
+    if hidden_channels <= 0:
+        return nn.Identity()
+    if mixer_type == "pooled":
+        return PooledChannelMixer(channels, hidden_channels)
+    if mixer_type == "pointwise":
+        return PointwiseChannelMixer(channels, hidden_channels)
+    raise ValueError(f"stage_mixer_type must be 'pooled' or 'pointwise', got {mixer_type!r}")
+
+
 class CausalLocoCNBBlock(nn.Module):
     """Stronger CNB stage with local TF modeling plus causal FSMN memory.
 
@@ -581,6 +617,7 @@ class CausalLocoCNBBlock(nn.Module):
         loco_time_kernel: int = 3,
         loco_band_kernel: int = 3,
         loco_time_dilation: int = 1,
+        stage_mixer_type: str = "pooled",
     ):
         super().__init__()
         self.local = LocalTFLocoMixer(
@@ -598,9 +635,7 @@ class CausalLocoCNBBlock(nn.Module):
             dilation_schedule=cnb_dilation_schedule,
         )
         self.csa = CompressedSelfAttentionFusion(d_model, num_heads=num_heads, head_dim=head_dim)
-        self.pooled_mixer = (
-            PooledChannelMixer(d_model, pooled_mixer_hidden) if pooled_mixer_hidden > 0 else nn.Identity()
-        )
+        self.pooled_mixer = _make_stage_capacity_mixer(d_model, pooled_mixer_hidden, stage_mixer_type)
 
     def forward(self, z: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor] | None = None):
         if state is not None:
@@ -661,6 +696,7 @@ class BandSFCStage(nn.Module):
         num_heads: int,
         head_dim: int,
         pooled_mixer_hidden: int,
+        stage_mixer_type: str = "pooled",
     ):
         super().__init__()
         self.cross = CrossBandBlock(channels, freq_kernel=freq_kernel)
@@ -673,9 +709,7 @@ class BandSFCStage(nn.Module):
             num_heads=num_heads,
             head_dim=head_dim,
         )
-        self.pooled_mixer = (
-            PooledChannelMixer(channels, pooled_mixer_hidden) if pooled_mixer_hidden > 0 else nn.Identity()
-        )
+        self.pooled_mixer = _make_stage_capacity_mixer(channels, pooled_mixer_hidden, stage_mixer_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.cross(x)
@@ -766,6 +800,7 @@ class BandSFCNetNPU(nn.Module):
         head_dim: int = 8,
         pooled_mixer_hidden: int = 0,
         pooled_mixer_hidden_schedule: tuple[int, ...] | list[int] | None = None,
+        stage_mixer_type: str = "pooled",
         encoder_capacity_mixer_hidden: int = 0,
         encoder_capacity_mixer_layers: int = 0,
         decoder_capacity_mixer_hidden: int = 0,
@@ -806,6 +841,8 @@ class BandSFCNetNPU(nn.Module):
             raise ValueError("residual_head requires masking=True so mask and residual estimates can be fused")
         if stage_type not in {"band_sfc", "causal_cnb", "loco_cnb"}:
             raise ValueError(f"stage_type must be 'band_sfc', 'causal_cnb', or 'loco_cnb', got {stage_type!r}")
+        if stage_mixer_type not in {"pooled", "pointwise"}:
+            raise ValueError(f"stage_mixer_type must be 'pooled' or 'pointwise', got {stage_mixer_type!r}")
         if band_spec_type not in {"soft", "static", "adaptive_mel", "adaptive-mel"}:
             raise ValueError(f"band_spec_type must be 'soft'/'static' or 'adaptive_mel', got {band_spec_type!r}")
 
@@ -827,6 +864,7 @@ class BandSFCNetNPU(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.pooled_mixer_hidden = pooled_mixer_hidden
+        self.stage_mixer_type = stage_mixer_type
         self.encoder_capacity_mixer_hidden = int(encoder_capacity_mixer_hidden)
         self.encoder_capacity_mixer_layers = int(encoder_capacity_mixer_layers)
         self.decoder_capacity_mixer_hidden = int(decoder_capacity_mixer_hidden)
@@ -942,6 +980,7 @@ class BandSFCNetNPU(nn.Module):
                         num_heads=num_heads,
                         head_dim=head_dim,
                         pooled_mixer_hidden=stage_pooled_hidden,
+                        stage_mixer_type=self.stage_mixer_type,
                     )
                     for stage_pooled_hidden in self.pooled_mixer_hidden_schedule
                 ]
@@ -962,6 +1001,7 @@ class BandSFCNetNPU(nn.Module):
                         loco_time_kernel=self.loco_time_kernel,
                         loco_band_kernel=self.loco_band_kernel,
                         loco_time_dilation=self.loco_time_dilation,
+                        stage_mixer_type=self.stage_mixer_type,
                     )
                     for stage_pooled_hidden in self.pooled_mixer_hidden_schedule
                 ]
@@ -979,6 +1019,7 @@ class BandSFCNetNPU(nn.Module):
                         num_heads=num_heads,
                         head_dim=head_dim,
                         pooled_mixer_hidden=stage_pooled_hidden,
+                        stage_mixer_type=self.stage_mixer_type,
                     )
                     for dilation, stage_pooled_hidden in zip(self.dilation_schedule, self.pooled_mixer_hidden_schedule)
                 ]

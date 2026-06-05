@@ -29,6 +29,7 @@ def _build_preset(
     head_dim: int = 8,
     pooled_mixer_hidden: int = 0,
     pooled_mixer_hidden_schedule: tuple[int, ...] | None = None,
+    stage_mixer_type: str = "pooled",
     encoder_capacity_mixer_hidden: int = 0,
     encoder_capacity_mixer_layers: int = 0,
     decoder_capacity_mixer_hidden: int = 0,
@@ -73,6 +74,7 @@ def _build_preset(
         head_dim=head_dim,
         pooled_mixer_hidden=pooled_mixer_hidden,
         pooled_mixer_hidden_schedule=pooled_mixer_hidden_schedule,
+        stage_mixer_type=stage_mixer_type,
         encoder_capacity_mixer_hidden=encoder_capacity_mixer_hidden,
         encoder_capacity_mixer_layers=encoder_capacity_mixer_layers,
         decoder_capacity_mixer_hidden=decoder_capacity_mixer_hidden,
@@ -524,6 +526,8 @@ _PRESETS = {
     "adaptive_mel_loco_cnb_stable_crossattn_query": None,
     "adaptive_mel_loco_cnb_band56_soft_query": None,
     "adaptive_mel_loco_cnb_band56_soft_band_query": None,
+    "adaptive_mel_loco_cnb_clean_soft_query": None,
+    "adaptive_mel_loco_cnb_clean_soft_band_query": None,
 }
 
 _PRESET_CONFIGS: dict[str, dict[str, object]] = {
@@ -874,6 +878,41 @@ _PRESET_CONFIGS: dict[str, dict[str, object]] = {
         loco_time_dilation=1,
         residual_head=False,
     ),
+    # Cleaner structural fix: no frequency-pooled stage or IO capacity.  Stage
+    # capacity is pointwise per compressed band, so it preserves local band
+    # detail instead of learning a broadcast global correction.  The local FFN
+    # is widened to keep useful per-band capacity without adding stream state.
+    "adaptive_mel_loco_cnb_clean_soft_query": dict(
+        n_bands=48,
+        channels=36,
+        num_stages=5,
+        dilation_cycle=(1, 1, 1, 1, 1),
+        transport="soft_band_query",
+        use_attn=False,
+        pooled_mixer_hidden=1024,
+        pooled_mixer_hidden_schedule=(512, 1024, 1024, 1024, 512),
+        stage_mixer_type="pointwise",
+        encoder_capacity_mixer_hidden=0,
+        encoder_capacity_mixer_layers=0,
+        decoder_capacity_mixer_hidden=0,
+        decoder_capacity_mixer_layers=0,
+        time_kernel=1,
+        freq_kernel=3,
+        stage_type="loco_cnb",
+        cnb_kernel=4,
+        cnb_dilation_schedule=(1, 2, 3),
+        band_spec_type="adaptive_mel",
+        low_freq_hz=1000.0,
+        low_freq_band_fraction=0.45,
+        overlap_factor=1.5,
+        low_freq_overlap_factor=2.0,
+        loco_expansion=1,
+        loco_ffn_expansion=16,
+        loco_time_kernel=3,
+        loco_band_kernel=3,
+        loco_time_dilation=1,
+        residual_head=False,
+    ),
 }
 
 _PRESET_CONFIGS["safe_soft_band_query"] = _PRESET_CONFIGS["safe_soft_query"]
@@ -892,6 +931,9 @@ _PRESET_CONFIGS["adaptive_mel_loco_cnb_stable_soft_band_query"] = _PRESET_CONFIG
 ]
 _PRESET_CONFIGS["adaptive_mel_loco_cnb_band56_soft_band_query"] = _PRESET_CONFIGS[
     "adaptive_mel_loco_cnb_band56_soft_query"
+]
+_PRESET_CONFIGS["adaptive_mel_loco_cnb_clean_soft_band_query"] = _PRESET_CONFIGS[
+    "adaptive_mel_loco_cnb_clean_soft_query"
 ]
 
 
@@ -920,6 +962,7 @@ def build_band_sfc_net_npu_from_config(
     head_dim: int | None = None,
     pooled_mixer_hidden: int | None = None,
     pooled_mixer_hidden_schedule: tuple[int, ...] | list[int] | None = None,
+    stage_mixer_type: str | None = None,
     encoder_capacity_mixer_hidden: int | None = None,
     encoder_capacity_mixer_layers: int | None = None,
     decoder_capacity_mixer_hidden: int | None = None,
@@ -961,6 +1004,7 @@ def build_band_sfc_net_npu_from_config(
         "pooled_mixer_hidden_schedule": (
             tuple(pooled_mixer_hidden_schedule) if pooled_mixer_hidden_schedule is not None else None
         ),
+        "stage_mixer_type": stage_mixer_type,
         "encoder_capacity_mixer_hidden": encoder_capacity_mixer_hidden,
         "encoder_capacity_mixer_layers": encoder_capacity_mixer_layers,
         "decoder_capacity_mixer_hidden": decoder_capacity_mixer_hidden,

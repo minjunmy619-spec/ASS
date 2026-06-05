@@ -403,9 +403,16 @@ Added stability-first follow-up recipes:
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475/config.yaml
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-crossattn-query.rt192k.fp512keep475/config.yaml
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.band56-soft-query.rt192k.fp512keep475/config.yaml
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.clean-soft-query.rt192k.fp512keep475/config.yaml
 ```
 
-Recommended next run:
+Recommended clean structural diagnostic if pooled mixers are the concern:
+
+```text
+band-sfc-net-npu.adaptive-mel-loco-cnb.clean-soft-query.rt192k.fp512keep475
+```
+
+Recommended higher-parameter stabilized supervised run:
 
 ```text
 band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475
