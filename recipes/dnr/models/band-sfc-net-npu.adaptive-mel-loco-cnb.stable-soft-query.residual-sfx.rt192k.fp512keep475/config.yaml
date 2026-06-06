@@ -1,0 +1,12 @@
+_base_: ../band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475/config.yaml
+
+# Controlled follow-up for low supervised validation SNR.  The stable
+# adaptive-mel Loco-CNB core predicts only Speech and Music masks; Effects/SFX
+# is reconstructed wrapper-side as mixture - speech - music.  This enforces
+# mixture consistency and removes the hardest/noisiest stem from the explicit
+# NPU mask head while keeping the public DnR output order [speech, music, sfx].
+task:
+  model:
+    core_n_src: 2
+    residual_source_enabled: true
+    residual_source_index: 2

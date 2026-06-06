@@ -25,9 +25,11 @@ from spectral_feature_compression.core.model.proposed_separation_models import (
     build_sfc_locoformer_lite_plus_system,
     build_sfc_residual_refinement_system,
     build_sfc_sepreformer_multistem_system,
+    build_source_aware_residual_sfc_system,
     build_sparse_unet_mel_sfc_music_system,
 )
 from spectral_feature_compression.core.model.residual_refinement_sfc_2d import OnlineResidualRefinementSFC2D
+from spectral_feature_compression.core.model.source_aware_residual_sfc_2d import OnlineSourceAwareResidualSFC2D
 from spectral_feature_compression.core.model.source_split_sfc_2d import OnlineSourceSplitSFC2D
 from spectral_feature_compression.core.model.sparse_unet_mel_sfc_2d import SparseUNetMelSFC2D
 from spectral_feature_compression.core.tasks.distillation_task import TeacherStudentDistillationTask
@@ -233,6 +235,109 @@ def test_sfc_sepreformer_source_split_builder_forward_and_streaming_shape() -> N
     deploy_params = sum(p.numel() for p in deploy_core.parameters())
     assert 2_000_000 <= deploy_params <= 7_000_000
     assert deploy_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+
+def test_source_aware_residual_sfc_builder_forward_streaming_and_recipe() -> None:
+    torch.manual_seed(0)
+    model = build_source_aware_residual_sfc_system(
+        n_fft=64,
+        hop_length=16,
+        fs=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=8,
+        n_shared_layers=1,
+        n_source_layers=1,
+        long_branch_layers=1,
+        correction_layers=1,
+        correction_channels=4,
+        shared_capacity_layers=0,
+        freq_preprocess_enabled=False,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 256)
+    with torch.no_grad():
+        est = model(wav)
+    assert tuple(est.shape) == (1, 2, 1, 256)
+
+    core = OnlineSourceAwareResidualSFC2D(
+        n_freq=33,
+        n_bands=8,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        d_model=8,
+        n_shared_layers=1,
+        n_source_layers=1,
+        long_branch_layers=1,
+        correction_layers=1,
+        correction_channels=4,
+        shared_capacity_layers=0,
+    ).eval()
+    x = torch.randn(1, 2, 4, 33)
+    with torch.no_grad():
+        y = core(x)
+        state = core.init_stream_state(batch_size=1, dtype=x.dtype)
+        frames = []
+        for frame_idx in range(x.shape[2]):
+            frame, state = core.forward_stream(x[:, :, frame_idx : frame_idx + 1, :], state)
+            frames.append(frame)
+        y_stream = torch.cat(frames, dim=2)
+    assert tuple(y.shape) == (1, 4, 4, 33)
+    assert tuple(y_stream.shape) == tuple(y.shape)
+    torch.testing.assert_close(y_stream, y, rtol=1e-5, atol=1e-5)
+    assert len(core.init_stream_state(batch_size=1, dtype=x.dtype)) == 5
+    assert core.state_size_bytes(dtype=torch.float16) < 32 * 1024
+
+    deploy_core = OnlineSourceAwareResidualSFC2D(
+        n_freq=512,
+        n_bands=56,
+        sample_rate=44100,
+        n_src=3,
+        n_chan=1,
+        d_model=28,
+        n_shared_layers=2,
+        n_source_layers=2,
+        long_branch_layers=1,
+        correction_layers=1,
+        correction_channels=12,
+        shared_capacity_hidden=8192,
+        shared_capacity_layers=4,
+    ).eval()
+    deploy_params = sum(p.numel() for p in deploy_core.parameters())
+    assert 2_000_000 <= deploy_params <= 7_000_000
+    assert deploy_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+    config_path = Path("recipes/dnr/models/source-aware-residual-sfc.rt192k.fp512keep475/config.yaml")
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert resolve_value(model_cfg["d_model"], context) == 28
+    assert resolve_value(model_cfg["n_bands"], context) == 56
+    assert resolve_value(model_cfg["correction_channels"], context) == 12
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    recipe_core = system.model.core
+    assert recipe_core.n_freq == 512
+    assert recipe_core.n_bands == 56
+    assert recipe_core.d_model == 28
+    assert recipe_core.correction_channels == 12
+    assert sum(p.numel() for p in recipe_core.parameters()) == deploy_params
+    assert recipe_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+    distill_path = Path("recipes/dnr/models/source-aware-residual-sfc.distill.rt192k.fp512keep475/config.yaml")
+    distill_top = merge_top_level_scalars(distill_path)
+    distill_model_cfg = merge_task_model_mapping(distill_path)
+    assert distill_top["teacher_checkpoint_path"] is None
+    assert resolve_value(distill_model_cfg["_target_"], {**distill_top, **distill_model_cfg}).endswith(
+        "build_source_aware_residual_sfc_system"
+    )
+    distill_text = distill_path.read_text(encoding="utf-8")
+    assert "TeacherStudentDistillationTask" in distill_text
+    assert "require_teacher_checkpoint: true" in distill_text
+    assert "build_sfc_locoformer_lite_plus_system" in distill_text
 
 
 def test_sfc_residual_refinement_builder_forward_and_streaming_shape() -> None:
@@ -488,6 +593,14 @@ def test_adaptive_mel_loco_cnb_stability_fix_recipes_resolve_and_instantiate() -
             48,
             "pointwise",
         ),
+        (
+            "recipes/dnr/models/"
+            "band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.residual-sfx.rt192k.fp512keep475/config.yaml",
+            "adaptive_mel_loco_cnb_stable_soft_band_query",
+            36,
+            48,
+            "pooled",
+        ),
     ]
     for raw_path, preset, channels, n_bands, stage_mixer_type in checks:
         config_path = Path(raw_path)
@@ -509,22 +622,43 @@ def test_adaptive_mel_loco_cnb_stability_fix_recipes_resolve_and_instantiate() -
         assert core.stage_mixer_type == stage_mixer_type
         assert sum(p.numel() for p in core.parameters()) < 4_000_000
         assert core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+        if "residual-sfx" in raw_path:
+            assert system.model.residual_source_enabled is True
+            assert system.model.n_src == 3
+            assert core.n_src == 2
+            wav = torch.randn(1, 1, 4096)
+            with torch.no_grad():
+                est = system(wav)
+            assert tuple(est.shape) == (1, 3, 1, 4096)
+        else:
+            assert core.n_src == 3
 
 
 def test_adaptive_mel_loco_cnb_distill_recipe_declares_teacher_task() -> None:
-    config_path = Path(
-        "recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.distill.rt192k.fp512keep475/config.yaml"
-    )
-    task_cfg = merge_task_model_mapping(config_path)
-    top = merge_top_level_scalars(config_path)
-    assert top["teacher_checkpoint_path"] is None
-    # `merge_task_model_mapping` intentionally extracts only task.model.  Check
-    # the raw file to avoid instantiating a distillation task without a teacher.
-    text = config_path.read_text(encoding="utf-8")
-    assert "TeacherStudentDistillationTask" in text
-    assert "require_teacher_checkpoint: true" in text
-    assert "build_sfc_locoformer_lite_plus_system" in text
-    assert resolve_value(task_cfg["preset"], {**top, **task_cfg}) == "adaptive_mel_loco_cnb_soft_band_query"
+    checks = [
+        (
+            "recipes/dnr/models/"
+            "band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.distill.rt192k.fp512keep475/config.yaml",
+            "adaptive_mel_loco_cnb_soft_band_query",
+        ),
+        (
+            "recipes/dnr/models/"
+            "band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.residual-sfx.distill.rt192k.fp512keep475/config.yaml",
+            "adaptive_mel_loco_cnb_stable_soft_band_query",
+        ),
+    ]
+    for raw_path, preset in checks:
+        config_path = Path(raw_path)
+        task_cfg = merge_task_model_mapping(config_path)
+        top = merge_top_level_scalars(config_path)
+        assert top["teacher_checkpoint_path"] is None
+        # `merge_task_model_mapping` intentionally extracts only task.model.  Check
+        # the raw file to avoid instantiating a distillation task without a teacher.
+        text = config_path.read_text(encoding="utf-8")
+        assert "TeacherStudentDistillationTask" in text
+        assert "require_teacher_checkpoint: true" in text
+        assert "build_sfc_locoformer_lite_plus_system" in text
+        assert resolve_value(task_cfg["preset"], {**top, **task_cfg}) == preset
 
 
 def test_adaptive_mel_locoformer_lite_builder_forward_and_streaming_shape() -> None:

@@ -1,0 +1,60 @@
+_base_: ../online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml
+
+# Source-aware residual SFC: a stronger strict-online DnR student candidate.
+# Design intent:
+# - adaptive SFC compression keeps F=512 deployment tractable;
+# - dilated shared analysis models long causal context on compressed bands;
+# - early source split gives Speech/Music/Effects dedicated token streams;
+# - low-rank full-band correction repairs residual mask artifacts without
+#   spending the main token width on a 512-bin recurrent cache.
+source_aware_residual_d_model: 28
+source_aware_residual_n_bands: 56
+source_aware_residual_shared_layers: 2
+source_aware_residual_source_layers: 2
+source_aware_residual_long_branch_layers: 1
+source_aware_residual_correction_layers: 1
+source_aware_residual_correction_channels: 12
+source_aware_residual_shared_capacity_hidden: 8192
+source_aware_residual_shared_capacity_layers: 4
+source_aware_residual_kernel_size: [3, 3]
+source_aware_residual_routing_kernel_size: [1, 3]
+source_aware_residual_dilation_cycle: [1, 2, 4]
+source_aware_residual_long_branch_dilation_cycle: [1, 2, 4]
+source_aware_residual_band_config: musical
+source_aware_residual_routing_normalization: softmax
+
+trainer:
+  gradient_clip_val: 2.0
+
+task:
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_source_aware_residual_sfc_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    scaling: false
+    css_segment_size: 12
+    css_shift_size: 6
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    n_bands: ${source_aware_residual_n_bands}
+    band_config: ${source_aware_residual_band_config}
+    d_model: ${source_aware_residual_d_model}
+    n_shared_layers: ${source_aware_residual_shared_layers}
+    n_source_layers: ${source_aware_residual_source_layers}
+    long_branch_layers: ${source_aware_residual_long_branch_layers}
+    correction_layers: ${source_aware_residual_correction_layers}
+    correction_channels: ${source_aware_residual_correction_channels}
+    shared_capacity_hidden: ${source_aware_residual_shared_capacity_hidden}
+    shared_capacity_layers: ${source_aware_residual_shared_capacity_layers}
+    kernel_size: ${source_aware_residual_kernel_size}
+    routing_kernel_size: ${source_aware_residual_routing_kernel_size}
+    dilation_cycle: ${source_aware_residual_dilation_cycle}
+    long_branch_dilation_cycle: ${source_aware_residual_long_branch_dilation_cycle}
+    causal: true
+    masking: true
+    routing_normalization: ${source_aware_residual_routing_normalization}
+    freq_preprocess_enabled: true
+    freq_preprocess_keep_bins: 475
+    freq_preprocess_target_bins: 512
+    freq_preprocess_mode: triangular

@@ -176,6 +176,7 @@ Validated local artifacts on 2026-05-20:
 | `band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.rt192k.fp512keep475` | 701 non-Constant simplified nodes | 5,741,397 | 165.00 KiB | stateless and stateful `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
 | `band-sfc-net-npu.adaptive-mel-loco-cnb.crossattn-query.rt192k.fp512keep475` | 739 non-Constant simplified nodes | 5,752,548 | 165.00 KiB | stateless and stateful `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
 | `band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475` | 701 non-Constant simplified nodes | 2,852,491 | 185.62 KiB | stateless and stateful `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
+| `band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.residual-sfx.rt192k.fp512keep475` | 687 non-Constant simplified nodes | 2,852,417 | 185.62 KiB | stateless and stateful `model.circle`, `model.opt.circle`, `model.q.circle` PASS; distill recipe uses same deploy graph |
 | `band-sfc-net-npu.adaptive-mel-loco-cnb.stable-crossattn-query.rt192k.fp512keep475` | audited by verifier | 2,866,770 | 185.62 KiB | stateless `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
 | `band-sfc-net-npu.adaptive-mel-loco-cnb.band56-soft-query.rt192k.fp512keep475` | 701 non-Constant simplified nodes | 2,210,395 | 168.44 KiB | stateless `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
 | `band-sfc-net-npu.adaptive-mel-loco-cnb.clean-soft-query.rt192k.fp512keep475` | 637 non-Constant simplified nodes | 876,604 | 185.62 KiB | stateless and stateful `model.circle`, `model.opt.circle`, `model.q.circle` PASS |
@@ -226,6 +227,8 @@ recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.crossattn-query.rt192k
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.soft-query.distill.rt192k.fp512keep475
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.crossattn-query.distill.rt192k.fp512keep475
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.rt192k.fp512keep475
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.residual-sfx.rt192k.fp512keep475
+recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-soft-query.residual-sfx.distill.rt192k.fp512keep475
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.stable-crossattn-query.rt192k.fp512keep475
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.band56-soft-query.rt192k.fp512keep475
 recipes/dnr/models/band-sfc-net-npu.adaptive-mel-loco-cnb.clean-soft-query.rt192k.fp512keep475
