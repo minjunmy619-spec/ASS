@@ -1,0 +1,301 @@
+task_name: modified_deft_uss_sc_tse_joint_two_stage_spatial
+# Full joint USS + SC + TSE finetuning.  This is single-process model
+# parallelism: keep trainer devices=1 and assign submodel devices below.
+# If fewer than three GPUs are available, colocate two model devices manually
+# (for example uss_device: cuda:0, sc_device: cuda:1, tse_device: cuda:0).
+
+deterministic: true
+manual_seed: 0
+
+datamodule:
+    module: src.datamodules.datamodule
+    main: DataModule
+    args:
+        train_dataloader:
+            batch_size: 1
+            num_workers: 4
+            persistent_workers: false
+            dataset:
+                module: src.datamodules.uss_dataset
+                main: USSDataset
+                args:
+                    base_dataset:
+                        args:
+                            config:
+                                mode: generate
+                                spatial_sound_scene:
+                                    duration: 6.0
+                                    sr: 32000
+                                    max_event_overlap: 3
+                                    max_event_dur: 6.0
+                                    ref_db: -55
+                                    foreground_dir: data/dev_set/sound_event/train
+                                    background_dir: data/dev_set/noise/train
+                                    interference_dir: data/dev_set/interference/train
+                                    room_config:
+                                        module: src.modules.spatial_audio_synthesizer.room
+                                        main: SofaRoom
+                                        args:
+                                            path: data/dev_set/room_ir/train
+                                            direct_range_ms: [6, 50]
+                                dupse_rate: 0.5
+                                dupse_min_angle: 60.0
+                                max_n_dupse: 2
+                                dupse_exclusion_folder_depth: 1
+                                snr_range: [5, 20]
+                                nevent_range: [0, 3]
+                                ninterference_range: [0, 2]
+                                inteference_snr_range: [0, 15]
+                                dataset_length: 10112
+                                shuffle_label: true
+                                fg_return:
+                                    {
+                                        dry: true,
+                                        dry_channel: 0,
+                                        metadata: true,
+                                    }
+                                int_return:
+                                    {
+                                        dry: true,
+                                        dry_channel: 0,
+                                        metadata: true,
+                                    }
+                                bg_return: { waveform: true }
+                            n_sources: 3
+                            label_set: dcase2026t4
+                            return_source: true
+                            label_vector_mode: stack
+                            silence_label_mode: zeros
+                            return_meta: true
+        val_dataloader:
+            batch_size: 1
+            num_workers: 4
+            persistent_workers: false
+            dataset:
+                module: src.datamodules.uss_dataset
+                main: USSDataset
+                args:
+                    base_dataset:
+                        args:
+                            config:
+                                mode: metadata
+                                metadata_list: data/dev_set/metadata/valid.json
+                                fg_return:
+                                    dry: true
+                                    dry_channel: 0
+                                    metadata: true
+                                sr: 32000
+                                int_return:
+                                    dry: true
+                                    dry_channel: 0
+                                    metadata: true
+                                bg_return:
+                                    waveform: true
+                            n_sources: 3
+                            label_set: dcase2026t4
+                            return_source: true
+                            label_vector_mode: stack
+                            silence_label_mode: zeros
+                            return_meta: true
+
+lightning_module:
+    module: src.training.lightningmodule.uss_sc_tse_joint_model_parallel
+    main: USSScTSEJointModelParallelLightning
+    args:
+        uss_device: cuda:0
+        sc_device: cuda:1
+        tse_device: cuda:2
+        loss_device: cuda:0
+
+        uss_pretrained_ckpt: checkpoint/modified_deft_uss_lite_6s_unified_all_features.ckpt
+        sc_pretrained_ckpt: checkpoint/m2d_sc_stage3_estimated_pretrainedsed_fusion.ckpt
+        # Set this to your best existing TSE checkpoint for true finetuning.
+        # Leaving it empty trains the two-stage TSE component from random init.
+        tse_pretrained_ckpt:
+        uss_pretrained_strict: true
+        sc_pretrained_strict: true
+        tse_pretrained_strict: false
+
+        uss_output_key: foreground_waveform
+        match_metric: sa_sdr
+        min_match_score: -10.0
+        min_match_margin: -1000000000.0
+        min_energy_db: -60.0
+        clean_match_score: 0.0
+        clean_match_margin: 2.0
+        uncertain_weight: 0.35
+        use_uncertain_matches: false
+        bad_match_silence_weight: 0.0
+        unmatched_estimated_silence_weight: 0.0
+
+        min_tse_match_score: -20.0
+        min_estimate_energy_db: -80.0
+        require_sc_active_for_tse_loss: false
+        require_sc_class_match_for_tse_loss: false
+        tse_use_match_quality_weight: false
+
+        # Safe default: TSE sees SC uncertainty but TSE error does not yet update SC.
+        # After the tri-loss run is stable, try:
+        #   tse_label_mode: soft_grad
+        #   tse_label_grad_scale: 0.02
+        tse_label_mode: soft_detached
+        tse_label_temperature: 1.0
+        tse_label_grad_scale: 0.0
+        tse_label_silence_gate: none
+        tse_label_silence_temperature: 0.5
+
+        query_condition_enabled: true
+        temporal_conditioning_source: auto
+
+        lambda_uss: 1.0
+        lambda_sc_uss: 0.05
+        lambda_tse: 1.0
+        lambda_sc_tse: 0.0
+        lambda_uss_sc_consistency: 0.01
+        consistency_temperature: 1.0
+
+        sc_uss_to_uss_grad_scale: 0.0
+        tse_to_uss_enrollment_grad_scale: 0.0
+        tse_to_uss_condition_grad_scale: 0.0
+        sc_tse_to_tse_grad_scale: 0.0
+
+        uss_model:
+            from_training_config: modified_deft_sc_primary_frozenuss_pretrainedsed_fusion.yaml
+            key: lightning_module.args.uss_model
+        sc_model:
+            from_training_config: ../label/m2d_sc_stage3_estimated_pretrainedsed_fusion.yaml
+            key: lightning_module.args.model
+        tse_model:
+            from_training_config: modified_deft_tse_lite_6s_online_teacher_two_stage_spatial_uss_sc.yaml
+            key: lightning_module.args.model
+
+        uss_loss:
+            from_training_config: modified_deft_uss_sc_joint_universal_pretrainedsed_fusion.yaml
+            key: lightning_module.args.uss_loss
+        sc_loss:
+            from_training_config: modified_deft_uss_sc_joint_universal_pretrainedsed_fusion.yaml
+            key: lightning_module.args.sc_loss
+        tse_loss:
+            from_training_config: modified_deft_tse_lite_6s_temporal.yaml
+            key: lightning_module.args.loss
+
+        optimizer_uss:
+            module: torch.optim
+            main: AdamW
+            args:
+                params:
+                lr: 0.000005
+                betas: [0.9, 0.999]
+                eps: 0.00000001
+                weight_decay: 0.0
+                amsgrad: true
+        optimizer_sc:
+            module: torch.optim
+            main: AdamW
+            args:
+                params:
+                lr: 0.00001
+                betas: [0.9, 0.999]
+                eps: 0.00000001
+                weight_decay: 0.01
+                amsgrad: true
+        optimizer_tse:
+            module: torch.optim
+            main: AdamW
+            args:
+                params:
+                lr: 0.00005
+                betas: [0.9, 0.999]
+                eps: 0.00000001
+                weight_decay: 0.0
+                amsgrad: true
+        # Epoch-based warmup cosine LR schedules.  With max_epochs=30 below,
+        # epoch 0 starts at 10% of each base LR, reaches the base LR after
+        # two epochs, then cosine-anneals to 10% by the end of training.
+        uss_lr_scheduler:
+            interval: epoch
+            frequency: 1
+            scheduler:
+                main: warmup_cosine
+                args:
+                    warmup_epochs: 2
+                    max_epochs: 30
+                    start_lr_scale: 0.1
+                    min_lr_scale: 0.1
+        sc_lr_scheduler:
+            interval: epoch
+            frequency: 1
+            scheduler:
+                main: warmup_cosine
+                args:
+                    warmup_epochs: 2
+                    max_epochs: 30
+                    start_lr_scale: 0.1
+                    min_lr_scale: 0.1
+        tse_lr_scheduler:
+            interval: epoch
+            frequency: 1
+            scheduler:
+                main: warmup_cosine
+                args:
+                    warmup_epochs: 2
+                    max_epochs: 30
+                    start_lr_scale: 0.1
+                    min_lr_scale: 0.1
+        is_validation: true
+
+train:
+    callbacks:
+        - name: checkpoint
+          module: lightning.pytorch.callbacks
+          main: ModelCheckpoint
+          args:
+              every_n_epochs: 1
+              filename: "{epoch}"
+              save_top_k: 1
+              save_last: true
+              monitor: epoch_val/loss
+              mode: min
+              verbose: false
+              dirpath:
+        - name: tqdm
+          module: lightning.pytorch.callbacks
+          main: TQDMProgressBar
+          args:
+              refresh_rate: 60
+              process_position: 0
+        - name: robust_tse_condition_curriculum
+          module: src.training.callbacks.robust_tse_condition_curriculum
+          main: RobustTSEConditionCurriculum
+          args:
+              model_attr: tse_model
+              warmup_epochs: 5
+              ramp_epochs: 25
+              start_condition_dropout: 0.8
+              end_condition_dropout: 0.3
+              start_temporal_condition_dropout: 0.8
+              end_temporal_condition_dropout: 0.4
+              start_spatial_condition_dropout: 1.0
+              end_spatial_condition_dropout: 0.5
+              start_condition_noise_std: 0.05
+              end_condition_noise_std: 0.02
+              start_spatial_condition_noise_std: 0.10
+              end_spatial_condition_noise_std: 0.05
+              strict: true
+    trainer:
+        module: lightning.pytorch
+        main: Trainer
+        args:
+            accelerator: gpu
+            devices: 1
+            strategy: auto
+            precision: bf16-mixed
+            max_epochs: 30
+            log_every_n_steps: 50
+            use_distributed_sampler: false
+            sync_batchnorm: false
+            num_sanity_val_steps: 0
+            enable_checkpointing: true
+            enable_progress_bar: true
+            enable_model_summary: false
+            gradient_clip_val: 0.5
