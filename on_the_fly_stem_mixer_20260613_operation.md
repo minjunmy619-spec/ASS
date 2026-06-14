@@ -42,6 +42,7 @@ The dataset supports config-controlled:
 - stem sampling weights
 - number of clips per active stem
 - same-stem concatenation/placement with configurable gaps and overlap
+- mixed `pad_or_concatenate` short-clip policy with global or per-stem pad probability
 - independent stem gain ranges
 - optional relative stem SNR scaling
 - final peak normalization while preserving mixture consistency
@@ -132,6 +133,36 @@ Validation:
   tests/test_on_the_fly_stem_datamodule.py
 ```
 
+## Mixed pad/concatenate short-clip policy
+
+Use `short_clip_policy: pad_or_concatenate` to choose per active stem between:
+
+- `pad`: one clip placed at a random valid offset, with silence before/after
+- `concatenate`: one or more same-stem clips placed using `same_stem_placement`
+
+The probability controls how often the pad branch is used:
+
+```yaml
+synthesis:
+  short_clip_policy: pad_or_concatenate
+  short_clip_pad_probability: 0.35  # global probability
+```
+
+It can also be configured per stem:
+
+```yaml
+synthesis:
+  short_clip_policy: pad_or_concatenate
+  short_clip_pad_probability:
+    speech: 0.25
+    music: 0.05
+    effects: 0.50
+```
+
+`0.0` behaves like always-concatenate; `1.0` behaves like always-pad.
+Unknown stem names in the probability mapping are rejected so typos such as
+`sfx` vs `effects` fail during dataset setup.
+
 ## CSV manifest source lists
 
 As an alternative to recursive folder scanning, pass one or more CSV manifests:
@@ -209,6 +240,7 @@ for example:
   "active_stem_count": {"mode": "weighted", "weights": {"1": 0.2, "2": 0.35, "3": 0.45}},
   "clips_per_active_stem": {"speech": [1, 2], "music": [1, 1], "effects": [1, 4]},
   "short_clip_policy": "concatenate",
+  "short_clip_pad_probability": 0.5,
   "stem_gain_db": {"speech": [-6, 6], "music": [-8, 4], "effects": [-10, 6]},
   "stem_snr_db": {"enabled": true, "anchor": "random_active", "range": {"speech": [-3, 9], "music": [-6, 6], "effects": [-9, 6]}},
   "peak_norm_db": -1.0,

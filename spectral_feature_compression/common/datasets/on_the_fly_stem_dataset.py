@@ -68,6 +68,25 @@ def _range_for_key(mapping: Mapping[str, Any] | None, key: str, default: tuple[f
     return _as_float_range(mapping.get(key, default), default=default)
 
 
+def _as_probability(value: Any, *, name: str) -> float:
+    probability = float(value)
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {probability}")
+    return probability
+
+
+def _probability_for_key(value: Any, key: str, default: float) -> float:
+    if isinstance(value, Mapping):
+        return _as_probability(value.get(key, default), name=f"probability for {key!r}")
+    return _as_probability(default if value is None else value, name="probability")
+
+
+def _validate_mapping_keys(mapping: Mapping[str, Any], valid_keys: Sequence[str], *, name: str) -> None:
+    unknown = sorted(set(mapping) - set(valid_keys))
+    if unknown:
+        raise ValueError(f"{name} contains unknown stem names: {unknown}. Valid stems are: {list(valid_keys)}")
+
+
 def _sample_uniform(rng: random.Random, value_range: tuple[float, float]) -> float:
     lo, hi = value_range
     if lo == hi:
@@ -125,6 +144,7 @@ class OnTheFlyStemDataset(Dataset):
         stem_sampling_weights: Mapping[str, float] | None = None,
         clips_per_active_stem: Mapping[str, Any] | int | Sequence[int] | None = None,
         short_clip_policy: str = "concatenate",
+        short_clip_pad_probability: float | Mapping[str, float] = 0.5,
         same_stem_placement: Mapping[str, Any] | None = None,
         stem_gain_db: Mapping[str, Any] | None = None,
         stem_snr_db: Mapping[str, Any] | None = None,
@@ -156,11 +176,22 @@ class OnTheFlyStemDataset(Dataset):
         self.seed = seed
         self.return_metadata = bool(return_metadata)
         self.short_clip_policy = str(short_clip_policy)
-        if self.short_clip_policy not in {"pad", "loop", "concatenate", "random_place"}:
+        valid_short_clip_policies = {"pad", "loop", "concatenate", "random_place", "pad_or_concatenate"}
+        if self.short_clip_policy not in valid_short_clip_policies:
             raise ValueError(
-                "short_clip_policy must be one of 'pad', 'loop', 'concatenate', or 'random_place', "
-                f"got {short_clip_policy!r}"
+                "short_clip_policy must be one of 'pad', 'loop', 'concatenate', 'random_place', "
+                f"or 'pad_or_concatenate', got {short_clip_policy!r}"
             )
+        self.short_clip_pad_probability = short_clip_pad_probability
+        if self.short_clip_policy == "pad_or_concatenate":
+            if isinstance(self.short_clip_pad_probability, Mapping):
+                _validate_mapping_keys(
+                    self.short_clip_pad_probability,
+                    self.source_order,
+                    name="short_clip_pad_probability",
+                )
+            for stem in self.source_order:
+                _probability_for_key(self.short_clip_pad_probability, stem, 0.5)
         self.peak_norm_db = None if peak_norm_db is None else float(peak_norm_db)
         self.peak_norm_mode = str(peak_norm_mode)
         if self.peak_norm_mode not in {"scale_down", "normalize"}:
@@ -425,16 +456,23 @@ class OnTheFlyStemDataset(Dataset):
             current_sec = max(0.0, current_sec + clip_sec + gap - overlap)
         return stem
 
+    def _build_padded_stem(self, stem_name: str, rng: random.Random) -> tuple[torch.Tensor, list[str]]:
+        clip, path = self._sample_audio(stem_name, rng)
+        stem = torch.zeros(self.n_samples, dtype=torch.float32)
+        length = min(int(clip.numel()), self.n_samples)
+        if length > 0:
+            max_start = self.n_samples - length
+            start = rng.randint(0, max_start) if max_start > 0 else 0
+            stem[start : start + length] = clip[:length].float()
+        return stem, [str(path)]
+
     def _build_stem(self, stem_name: str, rng: random.Random) -> tuple[torch.Tensor, list[str]]:
         if self.short_clip_policy == "pad":
-            clip, path = self._sample_audio(stem_name, rng)
-            stem = torch.zeros(self.n_samples, dtype=torch.float32)
-            length = min(int(clip.numel()), self.n_samples)
-            if length > 0:
-                max_start = self.n_samples - length
-                start = rng.randint(0, max_start) if max_start > 0 else 0
-                stem[start : start + length] = clip[:length].float()
-            return stem, [str(path)]
+            return self._build_padded_stem(stem_name, rng)
+        if self.short_clip_policy == "pad_or_concatenate":
+            pad_probability = _probability_for_key(self.short_clip_pad_probability, stem_name, 0.5)
+            if rng.random() < pad_probability:
+                return self._build_padded_stem(stem_name, rng)
         if self.short_clip_policy == "loop":
             clip, path = self._sample_audio(stem_name, rng)
             if clip.numel() == 0:

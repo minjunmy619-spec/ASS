@@ -189,6 +189,55 @@ def test_on_the_fly_stem_dataset_pad_policy_randomly_places_one_clip(tmp_path: P
     assert any(start > 0 for start in starts)
 
 
+def test_on_the_fly_stem_dataset_pad_or_concatenate_policy_uses_configured_probability(tmp_path: Path) -> None:
+    pools = _make_source_pools(tmp_path)
+    dataset = OnTheFlyStemDataset(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=2,
+        active_stem_count={"mode": "fixed", "value": 3},
+        clips_per_active_stem={"speech": [2, 2], "music": [2, 2], "effects": [2, 2]},
+        short_clip_policy="pad_or_concatenate",
+        short_clip_pad_probability={"speech": 1.0, "music": 0.0, "effects": 1.0},
+        stem_gain_db={"speech": [0.0, 0.0], "music": [0.0, 0.0], "effects": [0.0, 0.0]},
+        peak_norm_db=None,
+        seed=123,
+        return_metadata=True,
+    )
+
+    wav, ref, metadata = cast(tuple[torch.Tensor, torch.Tensor, dict[str, Any]], dataset[0])
+
+    assert tuple(wav.shape) == (1, 4000)
+    assert tuple(ref.shape) == (3, 1, 4000)
+    torch.testing.assert_close(wav, ref.sum(dim=0), rtol=0.0, atol=0.0)
+    assert len(metadata["source_paths"]["speech"]) == 1
+    assert len(metadata["source_paths"]["music"]) == 2
+    assert len(metadata["source_paths"]["effects"]) == 1
+
+
+def test_on_the_fly_stem_dataset_pad_or_concatenate_rejects_bad_probability_config(tmp_path: Path) -> None:
+    pools = _make_source_pools(tmp_path)
+    base_kwargs = dict(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=2,
+        active_stem_count={"mode": "fixed", "value": 3},
+        short_clip_policy="pad_or_concatenate",
+        peak_norm_db=None,
+        seed=123,
+    )
+
+    with pytest.raises(ValueError, match="unknown stem names"):
+        OnTheFlyStemDataset(**base_kwargs, short_clip_pad_probability={"sfx": 0.5})
+
+    with pytest.raises(ValueError, match="must be in \\[0, 1\\]"):
+        OnTheFlyStemDataset(**base_kwargs, short_clip_pad_probability={"effects": 1.5})
+
+
 def test_on_the_fly_stem_dataset_allows_zero_or_single_active_stem(tmp_path: Path) -> None:
     pools = _make_source_pools(tmp_path)
     zero_dataset = OnTheFlyStemDataset(
