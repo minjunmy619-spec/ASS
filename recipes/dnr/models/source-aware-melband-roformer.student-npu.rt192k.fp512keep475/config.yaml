@@ -1,0 +1,110 @@
+_base_: ../online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml
+
+# NPU-compilable student for the SourceAwareMelBandRoFormer teacher.
+# Design intent:
+# - keep the teacher's adaptive overlapped mel-band tokenization;
+# - replace axial RoFormer attention with causal dilated Conv2d time mixing and
+#   stateless local band mixing;
+# - pack source streams in channels and run repeated source competition/fusion;
+# - reconstruct source-shared complex masks plus a narrow full-band mask delta;
+# - apply mixture consistency in the online core for a teacher-like output prior.
+melband_student_n_bands: 80
+melband_student_d_model: 40
+melband_student_encoder_layers: 2
+melband_student_decoder_layers: 3
+melband_student_long_branch_layers: 1
+melband_student_correction_layers: 1
+melband_student_correction_channels: 16
+melband_student_encoder_expansion: 2
+melband_student_decoder_expansion: 2
+melband_student_decoder_fusion_hidden: 96
+melband_student_kernel_size: [3, 3]
+melband_student_decoder_kernel_size: [1, 3]
+melband_student_routing_kernel_size: [1, 3]
+melband_student_encoder_dilation_cycle: [1, 2]
+melband_student_decoder_dilation_cycle: [1, 2, 4]
+melband_student_long_branch_dilation_cycle: [1, 2, 4]
+melband_student_low_freq_hz: 1000.0
+melband_student_low_freq_band_fraction: 0.45
+melband_student_overlap_factor: 1.5
+melband_student_low_freq_overlap_factor: 2.0
+melband_student_include_magnitude_features: true
+melband_student_include_logmag_features: false
+melband_student_mixture_consistency: true
+melband_student_routing_normalization: softmax
+
+trainer:
+  gradient_clip_val: 2.0
+
+task:
+  _target_: spectral_feature_compression.core.tasks.composite_sup_task.CompositeSupTask
+  fs: ${sr}
+  mixture_consistency_weight: 0.1
+  low_frequency_weight: 0.2
+  low_frequency_hz: 300.0
+  complex_ri_weight: 0.4
+  log_magnitude_weight: 0.15
+  multi_resolution_stft_weight: 0.2
+  multi_resolution_stft_resolutions:
+    - [512, 128]
+    - [1024, 256]
+    - [2048, 512]
+  transient_weight: 0.05
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_source_aware_melband_roformer_student_npu_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    scaling: false
+    css_segment_size: 12
+    css_shift_size: 6
+    css_batch_size: 1
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    n_bands: ${melband_student_n_bands}
+    d_model: ${melband_student_d_model}
+    n_layers: null
+    n_encoder_layers: ${melband_student_encoder_layers}
+    n_decoder_layers: ${melband_student_decoder_layers}
+    long_branch_layers: ${melband_student_long_branch_layers}
+    correction_layers: ${melband_student_correction_layers}
+    correction_channels: ${melband_student_correction_channels}
+    encoder_expansion: ${melband_student_encoder_expansion}
+    decoder_expansion: ${melband_student_decoder_expansion}
+    decoder_fusion_hidden: ${melband_student_decoder_fusion_hidden}
+    kernel_size: ${melband_student_kernel_size}
+    decoder_kernel_size: ${melband_student_decoder_kernel_size}
+    routing_kernel_size: ${melband_student_routing_kernel_size}
+    encoder_dilation_cycle: ${melband_student_encoder_dilation_cycle}
+    decoder_dilation_cycle: ${melband_student_decoder_dilation_cycle}
+    long_branch_dilation_cycle: ${melband_student_long_branch_dilation_cycle}
+    low_freq_hz: ${melband_student_low_freq_hz}
+    low_freq_band_fraction: ${melband_student_low_freq_band_fraction}
+    overlap_factor: ${melband_student_overlap_factor}
+    low_freq_overlap_factor: ${melband_student_low_freq_overlap_factor}
+    include_magnitude_features: ${melband_student_include_magnitude_features}
+    include_logmag_features: ${melband_student_include_logmag_features}
+    causal: true
+    masking: true
+    mixture_consistency: ${melband_student_mixture_consistency}
+    routing_normalization: ${melband_student_routing_normalization}
+    freq_preprocess_enabled: true
+    freq_preprocess_keep_bins: 475
+    freq_preprocess_target_bins: 512
+    freq_preprocess_mode: triangular
+  optimizer_config:
+    optimizer_generator:
+        _partial_: True
+        _target_: torch.optim.AdamW
+        lr: 5.e-4
+        weight_decay: 1.e-2
+        betas: [0.9, 0.999]
+    scheduler_generator:
+        _partial_: True
+        _target_: spectral_feature_compression.common.lr_schedulers.warmup.WarmUpStepLR
+        warmup_steps: 8000
+        decay_start_step: 150000
+        decay_stop_step: 240000
+        step_size: 1354
+        decay: 0.98
+    scheduler_interval: step

@@ -1,0 +1,69 @@
+# Opt-in dry on-the-fly 3-stem mixer for DnR-style source separation.
+# Include/copy this datamodule block into a model recipe to replace the HDF5
+# datamodule.  It returns (wav, ref) batches where ref order is
+# [speech, music, effects] and wav == ref.sum(dim=0).
+# For curated CSV source lists instead of recursive folder scanning, see
+# recipes/dnr/datamodules/on-the-fly-stem-dry-csv.yaml.
+
+datamodule:
+  _target_: spectral_feature_compression.common.datamodules.on_the_fly_stem_datamodule.OnTheFlyStemDataModule
+  sr: ${sr}
+  duration: 6.0
+  batch_size: 4
+  val_batch_size: 1
+  num_workers: 4
+  dataset_length: 200000
+  val_dataset_length: 2000
+  train_seed: null
+  val_seed: 2026
+  source_order: [speech, music, effects]
+  source_pools:
+    speech:
+      - /data1/speech1
+      - /data1/speech2
+    music:
+      - /data1/music1
+      - /data1/music2
+    effects:
+      - /data1/effects1
+      - /data1/effects2
+      - /data1/effects3
+  synthesis:
+    backend: dry_mix
+    mixture_duration: ${datamodule.duration}
+    active_stem_count:
+      mode: weighted
+      weights:
+        0: 0.01
+        1: 0.20
+        2: 0.35
+        3: 0.44
+    stem_sampling_weights:
+      speech: 1.0
+      music: 1.0
+      effects: 1.2
+    clips_per_active_stem:
+      speech: [1, 2]
+      music: [1, 1]
+      effects: [1, 4]
+    short_clip_policy: concatenate
+    same_stem_placement:
+      mode: random_sequential
+      initial_offset_sec_range: [0.0, 0.5]
+      gap_sec_range: [0.0, 0.5]
+      overlap_sec_range: [0.0, 0.25]
+      allow_self_overlap: true
+      max_self_overlap: 2
+    stem_gain_db:
+      speech: [-6, 6]
+      music: [-8, 4]
+      effects: [-10, 6]
+    stem_snr_db:
+      enabled: true
+      anchor: random_active
+      range:
+        speech: [-3, 9]
+        music: [-6, 6]
+        effects: [-9, 6]
+    peak_norm_db: -1.0
+    peak_norm_mode: scale_down

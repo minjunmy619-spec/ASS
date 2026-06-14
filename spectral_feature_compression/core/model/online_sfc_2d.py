@@ -186,6 +186,7 @@ class OnlineConvBlock(nn.Module):
     def __init__(self, ch: int, expansion: int = 2, kernel_size: tuple[int, int] = (3, 3), causal: bool = True):
         super().__init__()
         hidden = ch * expansion
+        self.hidden = int(hidden)
         Conv = CausalConv2d if causal else SameConv2d
 
         self.norm1 = RMSNorm2d(ch)
@@ -196,7 +197,7 @@ class OnlineConvBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.norm1(x)
-        a, b = self.pw1(y).chunk(2, dim=1)
+        a, b = torch.split(self.pw1(y), self.hidden, dim=1)
         y = a * torch.sigmoid(b)
         y = self.dw(y)
         y = F.silu(y)
@@ -225,7 +226,7 @@ class OnlineConvBlock(nn.Module):
             raise RuntimeError("forward_stream is only supported when causal=True.")
 
         y = self.norm1(x)
-        a, b = self.pw1(y).chunk(2, dim=1)
+        a, b = torch.split(self.pw1(y), self.hidden, dim=1)
         y = a * torch.sigmoid(b)
         y, new_state = self.dw.forward_stream(y, state)
         y = F.silu(y)
@@ -658,13 +659,17 @@ class OnlineSFC2D(nn.Module):
     def layer_cache_numel(self, batch_size: int = 1) -> int:
         if not self.causal:
             return 0
-        states = self.init_stream_state(batch_size=batch_size, device=self.out_proj.weight.device, dtype=self.out_proj.weight.dtype)
+        states = self.init_stream_state(
+            batch_size=batch_size, device=self.out_proj.weight.device, dtype=self.out_proj.weight.dtype
+        )
         return sum(int(s.numel()) for s in states)
 
     def input_history_numel(self, batch_size: int = 1) -> int:
         return batch_size * 2 * self.n_chan * self.stream_context_frames() * self.n_freq
 
-    def state_size_bytes(self, *, batch_size: int = 1, dtype: torch.dtype = torch.float16, mode: str = "layer_cache") -> int:
+    def state_size_bytes(
+        self, *, batch_size: int = 1, dtype: torch.dtype = torch.float16, mode: str = "layer_cache"
+    ) -> int:
         element_size = torch.tensor([], dtype=dtype).element_size()
         if mode == "layer_cache":
             return self.layer_cache_numel(batch_size=batch_size) * element_size

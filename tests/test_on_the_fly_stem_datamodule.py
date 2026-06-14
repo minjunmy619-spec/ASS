@@ -1,0 +1,443 @@
+from __future__ import annotations
+
+from typing import Any, cast
+
+import csv
+from pathlib import Path
+
+import numpy as np
+
+import torch
+
+import pytest
+
+import soundfile as sf
+
+from spectral_feature_compression.common.datamodules.on_the_fly_stem_datamodule import OnTheFlyStemDataModule
+from spectral_feature_compression.common.datasets.on_the_fly_stem_dataset import (
+    FixedStemMixDataset,
+    OnTheFlyStemDataset,
+)
+from tools.export_fixed_stem_mixes import export_fixed_stem_mixes
+
+_STEMS = ("speech", "music", "effects")
+
+
+def _write_wav(path: Path, value: float, *, sr: int = 8000, n_samples: int = 1600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(path, np.full(n_samples, value, dtype=np.float32), sr)
+
+
+def _make_source_pools(tmp_path: Path, *, sr: int = 8000) -> dict[str, list[str]]:
+    values = {"speech": 0.1, "music": 0.2, "effects": 0.3}
+    pools: dict[str, list[str]] = {}
+    for stem in _STEMS:
+        stem_dir = tmp_path / stem
+        pools[stem] = [str(stem_dir)]
+        _write_wav(stem_dir / f"{stem}_a.wav", values[stem], sr=sr, n_samples=1200)
+        _write_wav(stem_dir / f"{stem}_b.wav", values[stem] * 0.5, sr=sr, n_samples=1000)
+    return pools
+
+
+def _write_source_manifest(path: Path, rows: list[dict[str, str]]) -> Path:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["filename", "split", "type", "filepath", "sample_rate", "channels"])
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def _manifest_rows(tmp_path: Path, split: str, suffix: str) -> list[dict[str, str]]:
+    rows = []
+    for stem in _STEMS:
+        wav_path = tmp_path / stem / f"{stem}_{suffix}.wav"
+        rows.append(
+            {
+                "filename": wav_path.name,
+                "split": split,
+                "type": stem,
+                "filepath": str(wav_path),
+                "sample_rate": "8000",
+                "channels": "1",
+            }
+        )
+    return rows
+
+
+def _base_synthesis() -> dict[str, Any]:
+    return {
+        "backend": "dry_mix",
+        "active_stem_count": {"mode": "fixed", "value": 3},
+        "clips_per_active_stem": {"speech": [2, 2], "music": [1, 1], "effects": [2, 2]},
+        "short_clip_policy": "concatenate",
+        "same_stem_placement": {
+            "mode": "sequential",
+            "initial_offset_sec_range": [0.0, 0.0],
+            "gap_sec_range": [0.0, 0.0],
+            "overlap_sec_range": [0.0, 0.0],
+            "allow_self_overlap": False,
+        },
+        "stem_gain_db": {"speech": [0.0, 0.0], "music": [0.0, 0.0], "effects": [0.0, 0.0]},
+        "peak_norm_db": None,
+        "return_metadata": True,
+    }
+
+
+def test_on_the_fly_stem_dataset_returns_fixed_duration_and_consistent_mix(tmp_path: Path) -> None:
+    pools = _make_source_pools(tmp_path)
+    dataset = OnTheFlyStemDataset(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=1.0,
+        dataset_length=8,
+        seed=123,
+        **_base_synthesis(),
+    )
+
+    wav, ref, metadata = cast(tuple[torch.Tensor, torch.Tensor, dict[str, Any]], dataset[0])
+
+    assert tuple(wav.shape) == (1, 8000)
+    assert tuple(ref.shape) == (3, 1, 8000)
+    torch.testing.assert_close(wav, ref.sum(dim=0), rtol=0.0, atol=0.0)
+    assert metadata["active_stems"] == list(_STEMS)
+    assert len(metadata["source_paths"]["speech"]) == 2
+    assert len(metadata["source_paths"]["effects"]) == 2
+    assert torch.count_nonzero(ref[:, 0].abs().sum(dim=-1)).item() == 3
+
+
+def test_on_the_fly_stem_dataset_loads_sources_from_manifest_csv(tmp_path: Path) -> None:
+    _make_source_pools(tmp_path)
+    for stem in _STEMS:
+        _write_wav(tmp_path / stem / f"{stem}_bad.wav", 0.9, n_samples=1200)
+    manifest_path = _write_source_manifest(
+        tmp_path / "sources.csv",
+        _manifest_rows(tmp_path, "train", "a")
+        + _manifest_rows(tmp_path, "validation", "b")
+        + [
+            {
+                "filename": "ignored.wav",
+                "split": "train",
+                "type": "ignored_type",
+                "filepath": str(tmp_path / "ignored.wav"),
+                "sample_rate": "8000",
+                "channels": "1",
+            }
+        ],
+    )
+    dataset = OnTheFlyStemDataset(
+        source_manifest_csv=manifest_path,
+        manifest_split="train",
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=2,
+        active_stem_count={"mode": "fixed", "value": 3},
+        clips_per_active_stem=1,
+        stem_gain_db={"speech": [0.0, 0.0], "music": [0.0, 0.0], "effects": [0.0, 0.0]},
+        peak_norm_db=None,
+        seed=123,
+        return_metadata=True,
+    )
+
+    wav, ref, metadata = cast(tuple[torch.Tensor, torch.Tensor, dict[str, Any]], dataset[0])
+
+    assert tuple(wav.shape) == (1, 4000)
+    assert tuple(ref.shape) == (3, 1, 4000)
+    torch.testing.assert_close(wav, ref.sum(dim=0), rtol=0.0, atol=0.0)
+    for stem in _STEMS:
+        assert len(metadata["source_paths"][stem]) == 1
+        assert Path(metadata["source_paths"][stem][0]).name == f"{stem}_a.wav"
+
+
+def test_on_the_fly_stem_dataset_pad_policy_randomly_places_one_clip(tmp_path: Path) -> None:
+    pools = _make_source_pools(tmp_path)
+    dataset = OnTheFlyStemDataset(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=2,
+        active_stem_count={"mode": "fixed", "value": 3},
+        clips_per_active_stem={"speech": [2, 2], "music": [2, 2], "effects": [2, 2]},
+        short_clip_policy="pad",
+        stem_gain_db={"speech": [0.0, 0.0], "music": [0.0, 0.0], "effects": [0.0, 0.0]},
+        peak_norm_db=None,
+        seed=123,
+        return_metadata=True,
+    )
+
+    wav, ref, metadata = cast(tuple[torch.Tensor, torch.Tensor, dict[str, Any]], dataset[0])
+
+    assert tuple(wav.shape) == (1, 4000)
+    assert tuple(ref.shape) == (3, 1, 4000)
+    torch.testing.assert_close(wav, ref.sum(dim=0), rtol=0.0, atol=0.0)
+    starts = []
+    for stem_idx, stem in enumerate(_STEMS):
+        paths = metadata["source_paths"][stem]
+        assert len(paths) == 1
+        expected_clip_len = 1200 if Path(paths[0]).name.endswith("_a.wav") else 1000
+        active_indices = torch.nonzero(ref[stem_idx, 0], as_tuple=False).flatten()
+        assert active_indices.numel() == expected_clip_len
+        start = int(active_indices[0].item())
+        end = int(active_indices[-1].item()) + 1
+        starts.append(start)
+        assert end - start == expected_clip_len
+        torch.testing.assert_close(active_indices, torch.arange(start, end), rtol=0.0, atol=0.0)
+        assert torch.count_nonzero(ref[stem_idx, 0, :start]) == 0
+        assert torch.count_nonzero(ref[stem_idx, 0, end:]) == 0
+    assert any(start > 0 for start in starts)
+
+
+def test_on_the_fly_stem_dataset_allows_zero_or_single_active_stem(tmp_path: Path) -> None:
+    pools = _make_source_pools(tmp_path)
+    zero_dataset = OnTheFlyStemDataset(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=2,
+        active_stem_count={"mode": "fixed", "value": 0},
+        peak_norm_db=None,
+        seed=1,
+    )
+    wav, ref = cast(tuple[torch.Tensor, torch.Tensor], zero_dataset[0])
+    assert torch.count_nonzero(wav) == 0
+    assert torch.count_nonzero(ref) == 0
+
+    single_dataset = OnTheFlyStemDataset(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=2,
+        active_stem_count={"mode": "fixed", "value": 1},
+        clips_per_active_stem=1,
+        peak_norm_db=None,
+        seed=2,
+    )
+    wav, ref = cast(tuple[torch.Tensor, torch.Tensor], single_dataset[0])
+    active = ref[:, 0].abs().sum(dim=-1) > 0
+    assert int(active.sum().item()) == 1
+    torch.testing.assert_close(wav, ref.sum(dim=0), rtol=0.0, atol=0.0)
+
+
+def test_on_the_fly_stem_datamodule_rejects_metadata_batches(tmp_path: Path) -> None:
+    pools = _make_source_pools(tmp_path)
+    datamodule = OnTheFlyStemDataModule(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=4,
+        val_dataset_length=2,
+        batch_size=2,
+        num_workers=0,
+        synthesis={"return_metadata": True},
+    )
+
+    with pytest.raises(ValueError, match="return_metadata=True"):
+        datamodule.setup("fit")
+
+
+def test_on_the_fly_stem_datamodule_builds_csv_train_val_test_batches(tmp_path: Path) -> None:
+    _make_source_pools(tmp_path)
+    train_csv = _write_source_manifest(tmp_path / "train.csv", _manifest_rows(tmp_path, "train", "a"))
+    val_csv = _write_source_manifest(tmp_path / "val.csv", _manifest_rows(tmp_path, "validation", "b"))
+    test_csv = _write_source_manifest(tmp_path / "test.csv", _manifest_rows(tmp_path, "test", "b"))
+    datamodule = OnTheFlyStemDataModule(
+        source_manifest_csv=train_csv,
+        val_source_manifest_csv=val_csv,
+        test_source_manifest_csv=test_csv,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=4,
+        val_dataset_length=2,
+        test_dataset_length=2,
+        batch_size=2,
+        val_batch_size=1,
+        test_batch_size=1,
+        num_workers=0,
+        train_seed=10,
+        val_seed=20,
+        test_seed=30,
+        train_drop_last=False,
+        synthesis={
+            "active_stem_count": {"mode": "fixed", "value": 3},
+            "clips_per_active_stem": 1,
+            "peak_norm_db": None,
+        },
+    )
+
+    datamodule.setup("fit")
+    wav, ref = next(iter(datamodule.train_dataloader()))
+    val_wav, val_ref = next(iter(datamodule.val_dataloader()))
+    datamodule.setup("test")
+    test_wav, test_ref = next(iter(datamodule.test_dataloader()))
+
+    assert tuple(wav.shape) == (2, 1, 4000)
+    assert tuple(ref.shape) == (2, 3, 1, 4000)
+    assert tuple(val_wav.shape) == (1, 1, 4000)
+    assert tuple(val_ref.shape) == (1, 3, 1, 4000)
+    assert tuple(test_wav.shape) == (1, 1, 4000)
+    assert tuple(test_ref.shape) == (1, 3, 1, 4000)
+    torch.testing.assert_close(wav, ref.sum(dim=1), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(val_wav, val_ref.sum(dim=1), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(test_wav, test_ref.sum(dim=1), rtol=0.0, atol=0.0)
+
+
+def test_fixed_stem_mix_exporter_outputs_datamodule_manifest(tmp_path: Path) -> None:
+    _make_source_pools(tmp_path)
+    source_csv = _write_source_manifest(
+        tmp_path / "sources.csv",
+        _manifest_rows(tmp_path, "train", "a") + _manifest_rows(tmp_path, "validation", "b"),
+    )
+    fixed_csv = export_fixed_stem_mixes(
+        output_csv=tmp_path / "fixed_validation.csv",
+        output_audio_dir=tmp_path / "fixed_audio",
+        output_split="validation",
+        num_examples=3,
+        sr=8000,
+        duration=0.5,
+        seed=123,
+        source_order=_STEMS,
+        source_manifest_csv=source_csv,
+        source_manifest_split="validation",
+        synthesis={
+            "active_stem_count": {"mode": "fixed", "value": 3},
+            "clips_per_active_stem": 1,
+            "stem_gain_db": {"speech": [0.0, 0.0], "music": [0.0, 0.0], "effects": [0.0, 0.0]},
+            "peak_norm_db": None,
+        },
+        export_mixtures=True,
+    )
+
+    with fixed_csv.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 3
+    assert all(Path(row["mixture_filepath"]).is_file() for row in rows)
+    assert all(Path(row[f"{stem}_filepath"]).is_file() for row in rows for stem in _STEMS)
+
+    dataset = FixedStemMixDataset(fixed_mix_manifest_csv=fixed_csv, source_order=_STEMS, sr=8000, duration=0.5)
+    wav, ref = cast(tuple[torch.Tensor, torch.Tensor], dataset[0])
+    assert tuple(wav.shape) == (1, 4000)
+    assert tuple(ref.shape) == (3, 1, 4000)
+    torch.testing.assert_close(wav, ref.sum(dim=0), rtol=0.0, atol=0.0)
+
+    datamodule = OnTheFlyStemDataModule(
+        source_manifest_csv=source_csv,
+        val_fixed_mix_manifest_csv=fixed_csv,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=2,
+        batch_size=1,
+        val_batch_size=1,
+        num_workers=0,
+        synthesis={
+            "active_stem_count": {"mode": "fixed", "value": 3},
+            "clips_per_active_stem": 1,
+            "peak_norm_db": None,
+        },
+    )
+    datamodule.setup("fit")
+    val_wav, val_ref = next(iter(datamodule.val_dataloader()))
+    assert tuple(val_wav.shape) == (1, 1, 4000)
+    assert tuple(val_ref.shape) == (1, 3, 1, 4000)
+    torch.testing.assert_close(val_wav, val_ref.sum(dim=1), rtol=0.0, atol=0.0)
+
+
+def test_fixed_stem_mix_dataset_strict_shape_rejects_mismatches(tmp_path: Path) -> None:
+    _make_source_pools(tmp_path)
+    source_csv = _write_source_manifest(tmp_path / "sources.csv", _manifest_rows(tmp_path, "validation", "b"))
+    fixed_csv = export_fixed_stem_mixes(
+        output_csv=tmp_path / "fixed_validation.csv",
+        output_audio_dir=tmp_path / "fixed_audio",
+        output_split="validation",
+        num_examples=1,
+        sr=8000,
+        duration=0.5,
+        seed=123,
+        source_order=_STEMS,
+        source_manifest_csv=source_csv,
+        source_manifest_split="validation",
+        synthesis={
+            "active_stem_count": {"mode": "fixed", "value": 3},
+            "clips_per_active_stem": 1,
+            "peak_norm_db": None,
+        },
+        export_mixtures=True,
+    )
+    with fixed_csv.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+
+    bad_sr_csv = tmp_path / "fixed_bad_sr.csv"
+    bad_sr_rows = [dict(row) for row in rows]
+    bad_sr_rows[0]["sample_rate"] = "16000"
+    with bad_sr_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(bad_sr_rows)
+    with pytest.raises(ValueError, match="sample_rate mismatch"):
+        FixedStemMixDataset(fixed_mix_manifest_csv=bad_sr_csv, source_order=_STEMS, sr=8000, duration=0.5)
+
+    bad_len_csv = tmp_path / "fixed_bad_len.csv"
+    bad_len_rows = [dict(row) for row in rows]
+    bad_len_rows[0]["n_samples"] = "3999"
+    with bad_len_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(bad_len_rows)
+    with pytest.raises(ValueError, match="manifest shape is inconsistent"):
+        FixedStemMixDataset(fixed_mix_manifest_csv=bad_len_csv, source_order=_STEMS, sr=8000, duration=0.5)
+
+    datamodule = OnTheFlyStemDataModule(
+        source_manifest_csv=source_csv,
+        val_fixed_mix_manifest_csv=bad_len_csv,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=1,
+        batch_size=1,
+        num_workers=0,
+        synthesis={"active_stem_count": {"mode": "fixed", "value": 3}, "peak_norm_db": None},
+    )
+    with pytest.raises(ValueError, match="manifest shape is inconsistent"):
+        datamodule.setup("fit")
+
+
+def test_on_the_fly_stem_datamodule_builds_tuple_batches(tmp_path: Path) -> None:
+    pools = _make_source_pools(tmp_path)
+    datamodule = OnTheFlyStemDataModule(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=4,
+        val_dataset_length=2,
+        batch_size=2,
+        val_batch_size=1,
+        num_workers=0,
+        train_seed=10,
+        val_seed=20,
+        train_drop_last=False,
+        synthesis={
+            "active_stem_count": {"mode": "fixed", "value": 3},
+            "clips_per_active_stem": 1,
+            "peak_norm_db": None,
+        },
+    )
+
+    datamodule.setup("fit")
+    wav, ref = next(iter(datamodule.train_dataloader()))
+    val_wav, val_ref = next(iter(datamodule.val_dataloader()))
+
+    assert tuple(wav.shape) == (2, 1, 4000)
+    assert tuple(ref.shape) == (2, 3, 1, 4000)
+    assert tuple(val_wav.shape) == (1, 1, 4000)
+    assert tuple(val_ref.shape) == (1, 3, 1, 4000)
+    torch.testing.assert_close(wav, ref.sum(dim=1), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(val_wav, val_ref.sum(dim=1), rtol=0.0, atol=0.0)

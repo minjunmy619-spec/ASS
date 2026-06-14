@@ -70,11 +70,10 @@ class SoftBandQueryCompressor2d(nn.Module):
         self.register_buffer("routing_bias", band_spec.routing_bias())
 
     def _pool_tokens(self, values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        batch, channels, n_frames, n_freq = values.shape
-        values_btfc = values.permute(0, 2, 3, 1).reshape(batch * n_frames, n_freq, channels)
-        weights_btkf = weights.permute(0, 2, 1, 3).reshape(batch * n_frames, self.n_bands, n_freq)
-        pooled_btkc = torch.bmm(weights_btkf, values_btfc)
-        return pooled_btkc.reshape(batch, n_frames, self.n_bands, channels).permute(0, 3, 1, 2)
+        values_btfc = values.permute(0, 2, 3, 1)
+        weights_btkf = weights.permute(0, 2, 1, 3)
+        pooled_btkc = torch.matmul(weights_btkf, values_btfc)
+        return pooled_btkc.permute(0, 3, 1, 2)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         _runtime_assert(x.shape[-1] == self.band_spec.n_freq, f"{x.shape} vs {self.band_spec.n_freq}")
@@ -175,11 +174,10 @@ class SoftBandQueryExpander2d(nn.Module):
         # coeff = coeff / (coeff.sum(dim=1, keepdim=True) + 1e-6) #This make NPU Complilation ERROR
 
         tokens = latent_h + query_h * self.query_skip_scale
-        batch, channels, n_frames, n_bands = tokens.shape
-        tokens_btck = tokens.permute(0, 2, 1, 3).reshape(batch * n_frames, channels, n_bands)
-        coeff_btkf = coeff.permute(0, 2, 1, 3).reshape(batch * n_frames, n_bands, self.n_freq)
-        expanded_btcf = torch.bmm(tokens_btck, coeff_btkf)
-        return expanded_btcf.reshape(batch, n_frames, channels, self.n_freq).permute(0, 2, 1, 3)
+        tokens_btck = tokens.permute(0, 2, 1, 3)
+        coeff_btkf = coeff.permute(0, 2, 1, 3)
+        expanded_btcf = torch.matmul(tokens_btck, coeff_btkf)
+        return expanded_btcf.permute(0, 2, 1, 3)
 
 
 class OnlineSoftBandQuerySFC2D(nn.Module):

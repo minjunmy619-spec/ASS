@@ -81,6 +81,7 @@ class DilatedBandMixBlock2d(nn.Module):
         _validate_npu_kernel_dilation_limit(band_kernel_size, 1, axis="frequency")
 
         hidden = channels * expansion
+        self.hidden = int(hidden)
         self.causal = causal
 
         self.norm1 = RMSNorm2d(channels)
@@ -120,7 +121,7 @@ class DilatedBandMixBlock2d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T, K)
         y = self.norm1(x)
-        a, b = self.pw1(y).chunk(2, dim=1)
+        a, b = torch.split(self.pw1(y), self.hidden, dim=1)
         # after gating: (B, hidden, T, K)
         y = a * torch.sigmoid(b)
         # time mixing keeps K and is causal only on T.
@@ -156,7 +157,7 @@ class DilatedBandMixBlock2d(nn.Module):
 
         # x: (B, C, T_chunk, K), state: (B, hidden, ctx, K)
         y = self.norm1(x)
-        a, b = self.pw1(y).chunk(2, dim=1)
+        a, b = torch.split(self.pw1(y), self.hidden, dim=1)
         y = a * torch.sigmoid(b)
         y, new_state = self.time_dw.forward_stream(y, state)
         y = F.silu(y)

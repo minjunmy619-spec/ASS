@@ -1,0 +1,99 @@
+_base_: ../online-soft-band-query-sfc2d.causal96dim.12l.musical64/config.yaml
+
+# Performance-first DnR teacher/reference model.
+# This intentionally does not start from NPU constraints.  It uses full-frequency
+# non-causal STFT chunks, overlapped adaptive mel-band SFC tokenization, axial
+# rotary attention, explicit source streams, source-axis competition, complex
+# mask + residual reconstruction, and mixture consistency.
+melband_roformer_n_bands: 128
+melband_roformer_d_model: 192
+melband_roformer_n_heads: 8
+melband_roformer_source_attention_heads: 1
+melband_roformer_encoder_layers: 8
+melband_roformer_decoder_layers: 4
+melband_roformer_ffn_mult: 4
+melband_roformer_dropout: 0.1
+melband_roformer_conv_kernel_size: [5, 5]
+melband_roformer_routing_kernel_size: [3, 5]
+melband_roformer_low_freq_hz: 1000.0
+melband_roformer_low_freq_band_fraction: 0.45
+melband_roformer_overlap_factor: 1.5
+melband_roformer_low_freq_overlap_factor: 2.0
+melband_roformer_include_logmag_features: true
+melband_roformer_masking: true
+melband_roformer_residual_output: true
+melband_roformer_residual_scale_init: 0.05
+melband_roformer_mixture_consistency: true
+melband_roformer_routing_normalization: softmax
+melband_roformer_layer_scale_init: 0.1
+
+trainer:
+  gradient_clip_val: 2.0
+
+datamodule:
+  batch_size: 1
+  val_batch_size: 1
+
+task:
+  _target_: spectral_feature_compression.core.tasks.composite_sup_task.CompositeSupTask
+  fs: ${sr}
+  mixture_consistency_weight: 0.1
+  low_frequency_weight: 0.2
+  low_frequency_hz: 300.0
+  complex_ri_weight: 0.5
+  log_magnitude_weight: 0.2
+  multi_resolution_stft_weight: 0.3
+  multi_resolution_stft_resolutions:
+    - [512, 128]
+    - [1024, 256]
+    - [2048, 512]
+  transient_weight: 0.08
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_source_aware_melband_roformer_teacher_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    n_bands: ${melband_roformer_n_bands}
+    d_model: ${melband_roformer_d_model}
+    n_heads: ${melband_roformer_n_heads}
+    source_attention_heads: ${melband_roformer_source_attention_heads}
+    n_encoder_layers: ${melband_roformer_encoder_layers}
+    n_decoder_layers: ${melband_roformer_decoder_layers}
+    ffn_mult: ${melband_roformer_ffn_mult}
+    dropout: ${melband_roformer_dropout}
+    conv_kernel_size: ${melband_roformer_conv_kernel_size}
+    routing_kernel_size: ${melband_roformer_routing_kernel_size}
+    low_freq_hz: ${melband_roformer_low_freq_hz}
+    low_freq_band_fraction: ${melband_roformer_low_freq_band_fraction}
+    overlap_factor: ${melband_roformer_overlap_factor}
+    low_freq_overlap_factor: ${melband_roformer_low_freq_overlap_factor}
+    include_logmag_features: ${melband_roformer_include_logmag_features}
+    masking: ${melband_roformer_masking}
+    residual_output: ${melband_roformer_residual_output}
+    residual_scale_init: ${melband_roformer_residual_scale_init}
+    mixture_consistency: ${melband_roformer_mixture_consistency}
+    routing_normalization: ${melband_roformer_routing_normalization}
+    layer_scale_init: ${melband_roformer_layer_scale_init}
+    scaling: true
+    css_segment_size: 12
+    css_shift_size: 6
+    css_batch_size: 1
+    online_wrapper: false
+  optimizer_config:
+    optimizer_generator:
+      _partial_: True
+      _target_: torch.optim.AdamW
+      lr: 3.e-4
+      weight_decay: 1.e-2
+      betas: [0.9, 0.999]
+    scheduler_generator:
+      _partial_: True
+      _target_: spectral_feature_compression.common.lr_schedulers.warmup.WarmUpStepLR
+      warmup_steps: 10000
+      decay_start_step: 150000
+      decay_stop_step: 260000
+      step_size: 1354
+      decay: 0.98
+    scheduler_interval: step

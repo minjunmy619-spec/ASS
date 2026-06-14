@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
 
 import torch
+
+import pytest
 
 from BandSFCNetNPU.presets import build_band_sfc_net_npu_preset
 from spectral_feature_compression.core.loss.composite_separation import CompositeSeparationSpectralLoss
@@ -25,20 +28,41 @@ from spectral_feature_compression.core.model.proposed_separation_models import (
     build_sfc_locoformer_lite_plus_system,
     build_sfc_residual_refinement_system,
     build_sfc_sepreformer_multistem_system,
+    build_source_aware_melband_roformer_strong_student_npu_system,
+    build_source_aware_melband_roformer_student_npu_system,
+    build_source_aware_melband_roformer_teacher_system,
     build_source_aware_residual_sfc_system,
     build_sparse_unet_mel_sfc_music_system,
 )
 from spectral_feature_compression.core.model.residual_refinement_sfc_2d import OnlineResidualRefinementSFC2D
+from spectral_feature_compression.core.model.source_aware_melband_roformer import SourceAwareMelBandRoformer2D
+from spectral_feature_compression.core.model.source_aware_melband_strong_student_sfc_2d import (
+    OnlineSourceAwareMelBandStrongStudentSFC2D,
+)
+from spectral_feature_compression.core.model.source_aware_melband_student_sfc_2d import (
+    OnlineSourceAwareMelBandStudentSFC2D,
+)
 from spectral_feature_compression.core.model.source_aware_residual_sfc_2d import OnlineSourceAwareResidualSFC2D
 from spectral_feature_compression.core.model.source_split_sfc_2d import OnlineSourceSplitSFC2D
 from spectral_feature_compression.core.model.sparse_unet_mel_sfc_2d import SparseUNetMelSFC2D
-from spectral_feature_compression.core.tasks.distillation_task import TeacherStudentDistillationTask
+from spectral_feature_compression.core.tasks.distillation_task import (
+    TeacherStudentDistillationTask,
+    _load_model_checkpoint,
+)
 from tools.online.export_onnx_online_model import (
     build_model_system_from_recipe_config,
     merge_task_model_mapping,
     merge_top_level_scalars,
     resolve_value,
 )
+
+
+def test_source_aware_melband_public_lazy_exports() -> None:
+    import spectral_feature_compression as sfc
+
+    assert sfc.SourceAwareMelBandRoformer2D is SourceAwareMelBandRoformer2D
+    assert sfc.OnlineSourceAwareMelBandStudentSFC2D is OnlineSourceAwareMelBandStudentSFC2D
+    assert sfc.OnlineSourceAwareMelBandStrongStudentSFC2D is OnlineSourceAwareMelBandStrongStudentSFC2D
 
 
 def test_band_sfc_rt_plus_forward_and_streaming_shape() -> None:
@@ -110,6 +134,524 @@ def test_middle_and_edge_proposal_builders_expose_waveform_wrappers() -> None:
     )
     assert middle.model.n_src == 2
     assert edge.model.n_src == 2
+
+
+def test_source_aware_melband_roformer_teacher_forward_and_recipe() -> None:
+    torch.manual_seed(0)
+    model = build_source_aware_melband_roformer_teacher_system(
+        n_fft=64,
+        hop_length=16,
+        fs=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=16,
+        n_heads=4,
+        source_attention_heads=1,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        ffn_mult=2,
+        dropout=0.0,
+        conv_kernel_size=(3, 3),
+        routing_kernel_size=(3, 3),
+        scaling=False,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 256)
+    with torch.no_grad():
+        est = model(wav)
+    assert tuple(est.shape) == (1, 2, 1, 256)
+
+    core = SourceAwareMelBandRoformer2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=16,
+        n_heads=4,
+        source_attention_heads=1,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        ffn_mult=2,
+        dropout=0.0,
+        conv_kernel_size=(3, 3),
+        routing_kernel_size=(3, 3),
+    ).eval()
+    x = torch.randn(1, 2, 4, 33)
+    with torch.no_grad():
+        y = core(x)
+    assert tuple(y.shape) == (1, 4, 4, 33)
+    y_sources = y.reshape(1, 2, 2, 4, 33)
+    torch.testing.assert_close(y_sources.sum(dim=1), x, rtol=1e-5, atol=1e-5)
+
+    raw_core = SourceAwareMelBandRoformer2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=16,
+        n_heads=4,
+        source_attention_heads=1,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        ffn_mult=2,
+        dropout=0.0,
+        conv_kernel_size=(3, 3),
+        routing_kernel_size=(3, 3),
+        masking=False,
+    ).eval()
+    with torch.no_grad():
+        masks = raw_core(x)
+    assert tuple(masks.shape) == (1, 4, 4, 33)
+
+    config_path = Path("recipes/dnr/models/source-aware-melband-roformer.teacher/config.yaml")
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert resolve_value(model_cfg["_target_"], context).endswith("build_source_aware_melband_roformer_teacher_system")
+    assert resolve_value(model_cfg["d_model"], context) == 192
+    assert resolve_value(model_cfg["n_bands"], context) == 128
+    assert resolve_value(model_cfg["online_wrapper"], context) is False
+
+
+def test_source_aware_melband_roformer_student_npu_forward_streaming_and_recipe() -> None:
+    torch.manual_seed(0)
+    model = build_source_aware_melband_roformer_student_npu_system(
+        n_fft=64,
+        hop_length=16,
+        fs=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=8,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        long_branch_layers=1,
+        correction_layers=1,
+        correction_channels=4,
+        decoder_fusion_hidden=8,
+        kernel_size=(3, 3),
+        routing_kernel_size=(1, 3),
+        freq_preprocess_enabled=False,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 256)
+    with torch.no_grad():
+        est = model(wav)
+    assert tuple(est.shape) == (1, 2, 1, 256)
+
+    core = OnlineSourceAwareMelBandStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=8,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        long_branch_layers=1,
+        correction_layers=1,
+        correction_channels=4,
+        decoder_fusion_hidden=8,
+        kernel_size=(3, 3),
+        routing_kernel_size=(1, 3),
+    ).eval()
+    x = torch.randn(1, 2, 4, 33)
+    with torch.no_grad():
+        y = core(x)
+        state = core.init_stream_state(batch_size=1, dtype=x.dtype)
+        frames = []
+        for frame_idx in range(x.shape[2]):
+            frame, state = core.forward_stream(x[:, :, frame_idx : frame_idx + 1, :], state)
+            frames.append(frame)
+        y_stream = torch.cat(frames, dim=2)
+    assert tuple(y.shape) == (1, 4, 4, 33)
+    assert tuple(y_stream.shape) == tuple(y.shape)
+    torch.testing.assert_close(y_stream, y, rtol=1e-5, atol=1e-5)
+    y_sources = y.reshape(1, 2, 2, 4, 33)
+    torch.testing.assert_close(y_sources.sum(dim=1), x, rtol=1e-5, atol=1e-5)
+    assert tuple(core.source_splitter(torch.randn(1, 8, 2, 8)).shape) == (1, 16, 2, 8)
+    assert len(core.init_stream_state(batch_size=1, dtype=x.dtype)) == 3
+    assert core.state_size_bytes(dtype=torch.float16) < 32 * 1024
+
+    raw_core = OnlineSourceAwareMelBandStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=8,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        long_branch_layers=1,
+        correction_layers=1,
+        correction_channels=4,
+        decoder_fusion_hidden=8,
+        kernel_size=(3, 3),
+        routing_kernel_size=(1, 3),
+        masking=False,
+    ).eval()
+    with torch.no_grad():
+        masks = raw_core(x)
+    assert tuple(masks.shape) == (1, 4, 4, 33)
+
+    deploy_core = OnlineSourceAwareMelBandStudentSFC2D(
+        n_freq=512,
+        sample_rate=44100,
+        n_src=3,
+        n_chan=1,
+        n_bands=80,
+        d_model=40,
+        n_encoder_layers=2,
+        n_decoder_layers=3,
+        long_branch_layers=1,
+        correction_layers=1,
+        correction_channels=16,
+        decoder_fusion_hidden=96,
+        decoder_kernel_size=(1, 3),
+        encoder_dilation_cycle=(1, 2),
+    ).eval()
+    deploy_params = sum(p.numel() for p in deploy_core.parameters())
+    assert 100_000 <= deploy_params <= 2_000_000
+    assert deploy_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+    config_path = Path("recipes/dnr/models/source-aware-melband-roformer.student-npu.rt192k.fp512keep475/config.yaml")
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert str(resolve_value(model_cfg["_target_"], context)).endswith(
+        "build_source_aware_melband_roformer_student_npu_system"
+    )
+    assert resolve_value(model_cfg["d_model"], context) == 40
+    assert resolve_value(model_cfg["n_bands"], context) == 80
+    assert resolve_value(model_cfg["decoder_fusion_hidden"], context) == 96
+    assert resolve_value(model_cfg["decoder_kernel_size"], context) == [1, 3]
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    recipe_core = system.model.core
+    assert recipe_core.n_freq == 512
+    assert recipe_core.n_bands == 80
+    assert recipe_core.d_model == 40
+    assert recipe_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+    distill_path = Path(
+        "recipes/dnr/models/source-aware-melband-roformer.student-npu.distill.rt192k.fp512keep475/config.yaml"
+    )
+    distill_top = merge_top_level_scalars(distill_path)
+    distill_model_cfg = merge_task_model_mapping(distill_path)
+    distill_context = {**distill_top, **distill_model_cfg}
+    assert distill_top["teacher_checkpoint_path"] is None
+    assert str(resolve_value(distill_model_cfg["_target_"], distill_context)).endswith(
+        "build_source_aware_melband_roformer_student_npu_system"
+    )
+    distill_text = distill_path.read_text(encoding="utf-8")
+    assert "TeacherStudentDistillationTask" in distill_text
+    assert "require_teacher_checkpoint: true" in distill_text
+    assert "teacher_css_validation: true" in distill_text
+    assert "distillation_band_mapping: mel_centers" in distill_text
+    assert "build_source_aware_melband_roformer_teacher_system" in distill_text
+
+
+def test_source_aware_melband_roformer_student_npu_onnx_audit_smoke() -> None:
+    onnx = pytest.importorskip("onnx")
+
+    from spectral_feature_compression.utils.onnx_streaming import (
+        StreamingStateIOWrapper,
+        flatten_tensor_tree,
+        get_external_constant_tensors,
+    )
+    from tools.online.audit_onnx_model import audit_npu_risks, get_allowed_ops
+
+    torch.manual_seed(0)
+    core = OnlineSourceAwareMelBandStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=8,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        long_branch_layers=1,
+        correction_layers=1,
+        correction_channels=4,
+        decoder_fusion_hidden=8,
+    ).eval()
+    wrapper = StreamingStateIOWrapper(core, batch_size=1, dtype=torch.float32, externalize_constants=True).eval()
+    state = core.init_stream_state(batch_size=1, dtype=torch.float32)
+    flat_state, _ = flatten_tensor_tree(state)
+    constants = get_external_constant_tensors(core, wrapper.constant_bindings)
+    x = torch.randn(1, 2, 1, 33)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir) / "source_aware_melband_student_stream.onnx"
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                (x, *flat_state, *constants),
+                str(out),
+                opset_version=14,
+                input_names=[
+                    "x",
+                    *[f"state_{idx}" for idx in range(len(flat_state))],
+                    *[f"const_{idx}" for idx in range(len(constants))],
+                ],
+                output_names=["y", *[f"next_state_{idx}" for idx in range(len(flat_state))]],
+                do_constant_folding=True,
+                dynamo=False,
+            )
+        model = onnx.load(str(out))
+
+    onnx.checker.check_model(model)
+    allowed_ops = get_allowed_ops("edge_npu_recommended")
+    assert sorted({node.op_type for node in model.graph.node} - allowed_ops) == []
+    audit = audit_npu_risks(model)
+    assert audit["has_strict_edge_risks"] is False
+    assert audit["risk_counts"]["rank_gt4_values"] == 0
+
+
+def test_source_aware_melband_roformer_strong_student_npu_forward_streaming_and_recipe() -> None:
+    torch.manual_seed(0)
+    model = build_source_aware_melband_roformer_strong_student_npu_system(
+        n_fft=64,
+        hop_length=16,
+        fs=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=8,
+        n_encoder_layers=1,
+        n_source_layers=1,
+        correction_layers=1,
+        source_fusion_hidden=16,
+        source_seed_hidden=16,
+        expander_hidden=16,
+        mask_hidden=16,
+        correction_channels=4,
+        kernel_size=(3, 3),
+        routing_kernel_size=(1, 3),
+        freq_preprocess_enabled=False,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 256)
+    with torch.no_grad():
+        est = model(wav)
+    assert tuple(est.shape) == (1, 2, 1, 256)
+
+    core = OnlineSourceAwareMelBandStrongStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=8,
+        n_encoder_layers=1,
+        n_source_layers=1,
+        correction_layers=1,
+        source_fusion_hidden=16,
+        source_seed_hidden=16,
+        expander_hidden=16,
+        mask_hidden=16,
+        correction_channels=4,
+        kernel_size=(3, 3),
+        routing_kernel_size=(1, 3),
+    ).eval()
+    x = torch.randn(1, 2, 4, 33)
+    with torch.no_grad():
+        y = core(x)
+        state = core.init_stream_state(batch_size=1, dtype=x.dtype)
+        frames = []
+        for frame_idx in range(x.shape[2]):
+            frame, state = core.forward_stream(x[:, :, frame_idx : frame_idx + 1, :], state)
+            frames.append(frame)
+        y_stream = torch.cat(frames, dim=2)
+    assert tuple(y.shape) == (1, 4, 4, 33)
+    assert tuple(y_stream.shape) == tuple(y.shape)
+    torch.testing.assert_close(y_stream, y, rtol=1e-5, atol=1e-5)
+    y_sources = y.reshape(1, 2, 2, 4, 33)
+    torch.testing.assert_close(y_sources.sum(dim=1), x, rtol=1e-5, atol=1e-5)
+    assert len(core.init_stream_state(batch_size=1, dtype=x.dtype)) == 2
+    assert core.state_size_bytes(dtype=torch.float16) < 32 * 1024
+
+    raw_core = OnlineSourceAwareMelBandStrongStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=8,
+        n_encoder_layers=1,
+        n_source_layers=1,
+        correction_layers=1,
+        source_fusion_hidden=16,
+        source_seed_hidden=16,
+        expander_hidden=16,
+        mask_hidden=16,
+        correction_channels=4,
+        kernel_size=(3, 3),
+        routing_kernel_size=(1, 3),
+        masking=False,
+    ).eval()
+    with torch.no_grad():
+        masks = raw_core(x)
+    assert tuple(masks.shape) == (1, 4, 4, 33)
+
+    stateless_core = OnlineSourceAwareMelBandStrongStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=8,
+        n_encoder_layers=1,
+        n_source_layers=1,
+        correction_layers=1,
+        source_fusion_hidden=16,
+        source_seed_hidden=16,
+        expander_hidden=16,
+        mask_hidden=16,
+        correction_channels=4,
+        kernel_size=(1, 3),
+        routing_kernel_size=(1, 3),
+    ).eval()
+    with torch.no_grad():
+        y_stateless = stateless_core(x)
+        state = stateless_core.init_stream_state(batch_size=1, dtype=x.dtype)
+        frames = []
+        for frame_idx in range(x.shape[2]):
+            frame, state = stateless_core.forward_stream(x[:, :, frame_idx : frame_idx + 1, :], state)
+            frames.append(frame)
+        y_stateless_stream = torch.cat(frames, dim=2)
+    assert len(stateless_core.init_stream_state(batch_size=1, dtype=x.dtype)) == 0
+    torch.testing.assert_close(y_stateless_stream, y_stateless, rtol=1e-5, atol=1e-5)
+
+    deploy_core = OnlineSourceAwareMelBandStrongStudentSFC2D(
+        n_freq=512,
+        sample_rate=44100,
+        n_src=3,
+        n_chan=1,
+        n_bands=80,
+        d_model=48,
+        n_encoder_layers=2,
+        n_source_layers=5,
+        correction_layers=1,
+        source_fusion_hidden=192,
+        source_seed_hidden=192,
+        expander_hidden=128,
+        mask_hidden=192,
+        correction_channels=24,
+        kernel_size=(3, 5),
+        encoder_dilation_cycle=(1, 2),
+    ).eval()
+    deploy_params = sum(p.numel() for p in deploy_core.parameters())
+    assert 1_000_000 <= deploy_params <= 2_500_000
+    assert deploy_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+    config_path = Path(
+        "recipes/dnr/models/source-aware-melband-roformer.student-npu-strong.rt192k.fp512keep475/config.yaml"
+    )
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert str(resolve_value(model_cfg["_target_"], context)).endswith(
+        "build_source_aware_melband_roformer_strong_student_npu_system"
+    )
+    assert resolve_value(model_cfg["d_model"], context) == 48
+    assert resolve_value(model_cfg["n_bands"], context) == 80
+    assert resolve_value(model_cfg["n_source_layers"], context) == 5
+    assert resolve_value(model_cfg["source_fusion_hidden"], context) == 192
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    recipe_core = system.model.core
+    assert recipe_core.n_freq == 512
+    assert recipe_core.n_bands == 80
+    assert recipe_core.d_model == 48
+    assert recipe_core.n_source_layers == 5
+    assert sum(p.numel() for p in recipe_core.parameters()) == deploy_params
+    assert recipe_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+    distill_path = Path(
+        "recipes/dnr/models/source-aware-melband-roformer.student-npu-strong.distill.rt192k.fp512keep475/config.yaml"
+    )
+    distill_top = merge_top_level_scalars(distill_path)
+    distill_model_cfg = merge_task_model_mapping(distill_path)
+    distill_context = {**distill_top, **distill_model_cfg}
+    assert distill_top["teacher_checkpoint_path"] is None
+    assert str(resolve_value(distill_model_cfg["_target_"], distill_context)).endswith(
+        "build_source_aware_melband_roformer_strong_student_npu_system"
+    )
+    distill_text = distill_path.read_text(encoding="utf-8")
+    assert "TeacherStudentDistillationTask" in distill_text
+    assert "require_teacher_checkpoint: true" in distill_text
+    assert "teacher_css_validation: true" in distill_text
+    assert "distillation_band_mapping: mel_centers" in distill_text
+    assert "build_source_aware_melband_roformer_teacher_system" in distill_text
+
+
+def test_source_aware_melband_roformer_strong_student_npu_onnx_audit_smoke() -> None:
+    onnx = pytest.importorskip("onnx")
+
+    from spectral_feature_compression.utils.onnx_streaming import (
+        StreamingStateIOWrapper,
+        flatten_tensor_tree,
+        get_external_constant_tensors,
+    )
+    from tools.online.audit_onnx_model import audit_npu_risks, get_allowed_ops
+
+    torch.manual_seed(0)
+    core = OnlineSourceAwareMelBandStrongStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        d_model=8,
+        n_encoder_layers=1,
+        n_source_layers=1,
+        correction_layers=1,
+        source_fusion_hidden=16,
+        source_seed_hidden=16,
+        expander_hidden=16,
+        mask_hidden=16,
+        correction_channels=4,
+        kernel_size=(3, 3),
+    ).eval()
+    wrapper = StreamingStateIOWrapper(core, batch_size=1, dtype=torch.float32, externalize_constants=True).eval()
+    state = core.init_stream_state(batch_size=1, dtype=torch.float32)
+    flat_state, _ = flatten_tensor_tree(state)
+    constants = get_external_constant_tensors(core, wrapper.constant_bindings)
+    x = torch.randn(1, 2, 1, 33)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir) / "source_aware_melband_strong_student_stream.onnx"
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                (x, *flat_state, *constants),
+                str(out),
+                opset_version=14,
+                input_names=[
+                    "x",
+                    *[f"state_{idx}" for idx in range(len(flat_state))],
+                    *[f"const_{idx}" for idx in range(len(constants))],
+                ],
+                output_names=["y", *[f"next_state_{idx}" for idx in range(len(flat_state))]],
+                do_constant_folding=True,
+                dynamo=False,
+            )
+        model = onnx.load(str(out))
+
+    onnx.checker.check_model(model)
+    allowed_ops = get_allowed_ops("edge_npu_recommended")
+    assert sorted({node.op_type for node in model.graph.node} - allowed_ops) == []
+    audit = audit_npu_risks(model)
+    assert audit["has_strict_edge_risks"] is False
+    assert audit["risk_counts"]["rank_gt4_values"] == 0
 
 
 def test_sparse_unet_mel_sfc_builder_forward_and_streaming_shape() -> None:
@@ -925,6 +1467,24 @@ def test_event_conditioned_sup_task_css_repeats_conditions_per_segment() -> None
     assert tuple(out.shape) == (2, 2, 1, 80)
 
 
+def test_distillation_checkpoint_loader_prefers_ema_weights(tmp_path: Path) -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+    checkpoint_path = tmp_path / "teacher.ckpt"
+    torch.save(
+        {
+            "state_dict": {
+                "model.weight": torch.tensor([[1.0]]),
+                "ema_model.module.weight": torch.tensor([[2.0]]),
+            }
+        },
+        checkpoint_path,
+    )
+
+    _load_model_checkpoint(model, checkpoint_path)
+
+    torch.testing.assert_close(model.weight, torch.tensor([[2.0]]))
+
+
 def test_distillation_task_requires_teacher_when_weighted() -> None:
     student = torch.nn.Identity()
     loss = torch.nn.L1Loss()
@@ -978,6 +1538,16 @@ class _ToyLatentSeparator(torch.nn.Module):
         return torch.stack([wav * self.scale, wav * (1.0 - self.scale)], dim=1)
 
 
+class _ToyBandSpecSeparator(torch.nn.Module):
+    def __init__(self, n_bands: int, scale: float) -> None:
+        super().__init__()
+        self.band_spec = AdaptiveMelBandSpec2d(n_freq=33, n_bands=n_bands, sample_rate=16000)
+        self.scale = scale
+
+    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+        return torch.stack([wav * self.scale, wav * (1.0 - self.scale)], dim=1)
+
+
 def test_distillation_task_supports_activity_mask_logit_and_latent_losses() -> None:
     torch.manual_seed(0)
     student = _ToyLatentSeparator(scale=0.4)
@@ -1010,4 +1580,46 @@ def test_distillation_task_supports_activity_mask_logit_and_latent_losses() -> N
         task._mask_or_logit_loss(est, teacher_est, wav, student_aux, teacher_aux, logit=True),
         task._latent_distillation_loss(student_aux, teacher_aux),
     ]
+    assert all(loss.ndim == 0 and torch.isfinite(loss) for loss in losses)
+
+
+def test_distillation_task_maps_teacher_band_tensors_to_student_grid() -> None:
+    student = _ToyBandSpecSeparator(n_bands=4, scale=0.4)
+    teacher = _ToyBandSpecSeparator(n_bands=6, scale=0.6)
+    task = TeacherStudentDistillationTask(
+        model=student,
+        teacher_model=teacher,
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        teacher_mask_loss_weight=0.1,
+        teacher_logit_loss_weight=0.1,
+        latent_distillation_weight=0.1,
+        distillation_band_mapping="mel_centers",
+    )
+    wav = torch.randn(2, 1, 128)
+    est = student(wav)
+    teacher_est = teacher(wav)
+    student_band = torch.zeros(2, 2, 3, 4)
+    teacher_band = torch.ones(2, 2, 3, 6)
+    student_aux = {
+        "mask": student_band,
+        "mask_logits": student_band,
+        "latents": {"z": student_band},
+    }
+    teacher_aux = {
+        "mask": teacher_band,
+        "mask_logits": teacher_band,
+        "latents": {"z": teacher_band},
+    }
+
+    _, mapped_teacher = task._align_distillation_tensors(student_band, teacher_band, name="test")
+    losses = [
+        task._mask_or_logit_loss(est, teacher_est, wav, student_aux, teacher_aux, logit=False),
+        task._mask_or_logit_loss(est, teacher_est, wav, student_aux, teacher_aux, logit=True),
+        task._latent_distillation_loss(student_aux, teacher_aux),
+    ]
+
+    assert mapped_teacher.shape == student_band.shape
     assert all(loss.ndim == 0 and torch.isfinite(loss) for loss in losses)

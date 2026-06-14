@@ -1,0 +1,89 @@
+# Opt-in dry on-the-fly 3-stem mixer using CSV source manifests.
+# The CSV schema is expected to include at least:
+# filename, split, type, filepath, sample_rate, channels
+#
+# The dataset groups rows by `type` in source_order [speech, music, effects]
+# and loads audio from `filepath` instead of recursively scanning folders.
+# Validation/test are deterministic when val_seed/test_seed are fixed and
+# dataloaders are not shuffled.
+
+datamodule:
+  _target_: spectral_feature_compression.common.datamodules.on_the_fly_stem_datamodule.OnTheFlyStemDataModule
+  sr: ${sr}
+  duration: 6.0
+  batch_size: 4
+  val_batch_size: 1
+  test_batch_size: 1
+  num_workers: 4
+  dataset_length: 200000
+  val_dataset_length: 2000
+  test_dataset_length: 2000
+  train_seed: null
+  val_seed: 2026
+  test_seed: 2027
+  source_order: [speech, music, effects]
+
+  # Separate source manifests per split.  Use full paths in filepath when possible.
+  source_manifest_csv:
+    - /data1/manifests/train_sources.csv
+  val_source_manifest_csv:
+    - /data1/manifests/validation_sources.csv
+  test_source_manifest_csv:
+    - /data1/manifests/test_sources.csv
+
+  # Alternative for fully fixed/pre-rendered validation/test examples exported by
+  # tools/export_fixed_stem_mixes.py.  If these are set, they replace the
+  # corresponding val/test source manifests above.
+  # val_fixed_mix_manifest_csv:
+  #   - /data1/manifests/fixed_validation.csv
+  # test_fixed_mix_manifest_csv:
+  #   - /data1/manifests/fixed_test.csv
+  # val_synthesis:
+  #   fixed_mix_strict_shape: true  # default: fail if CSV sr/duration/n_samples mismatches this recipe
+
+  # Alternative: one shared source manifest with split filtering.
+  # source_manifest_csv:
+  #   - /data1/manifests/all_sources.csv
+  # train_manifest_split: train
+  # val_manifest_split: validation
+  # test_manifest_split: test
+
+  synthesis:
+    backend: dry_mix
+    mixture_duration: ${datamodule.duration}
+    active_stem_count:
+      mode: weighted
+      weights:
+        0: 0.01
+        1: 0.20
+        2: 0.35
+        3: 0.44
+    stem_sampling_weights:
+      speech: 1.0
+      music: 1.0
+      effects: 1.2
+    clips_per_active_stem:
+      speech: [1, 2]
+      music: [1, 1]
+      effects: [1, 4]
+    short_clip_policy: concatenate
+    same_stem_placement:
+      mode: random_sequential
+      initial_offset_sec_range: [0.0, 0.5]
+      gap_sec_range: [0.0, 0.5]
+      overlap_sec_range: [0.0, 0.25]
+      allow_self_overlap: true
+      max_self_overlap: 2
+    stem_gain_db:
+      speech: [-6, 6]
+      music: [-8, 4]
+      effects: [-10, 6]
+    stem_snr_db:
+      enabled: true
+      anchor: random_active
+      range:
+        speech: [-3, 9]
+        music: [-6, 6]
+        effects: [-9, 6]
+    peak_norm_db: -1.0
+    peak_norm_mode: scale_down

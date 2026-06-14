@@ -1,0 +1,73 @@
+_base_: ../source-aware-melband-roformer.student-npu.rt192k.fp512keep475/config.yaml
+
+# Distill the NPU student from a trained SourceAwareMelBandRoFormer teacher.
+# Set teacher_checkpoint_path before launch; the task fails fast by default so
+# accidental random-teacher distillation is not possible.
+teacher_checkpoint_path: null
+teacher_n_fft: ${n_fft}
+teacher_hop_length: ${hop_length}
+
+task:
+    _target_: spectral_feature_compression.core.tasks.distillation_task.TeacherStudentDistillationTask
+    fs: ${sr}
+    require_teacher_checkpoint: true
+    teacher_checkpoint_path: ${teacher_checkpoint_path}
+    teacher_css_validation: true
+    teacher_loss_weight: 0.45
+    mixture_consistency_weight: 0.1
+    low_frequency_weight: 0.2
+    low_frequency_hz: 300.0
+    silent_source_weight: 0.05
+    silent_source_db: -60.0
+    source_activity_loss_weight: 0.1
+    source_activity_db: -50.0
+    source_activity_active_weight: 1.0
+    source_activity_inactive_weight: 0.25
+    complex_ri_weight: 0.4
+    log_magnitude_weight: 0.15
+    multi_resolution_stft_weight: 0.2
+    multi_resolution_stft_resolutions:
+        - [512, 128]
+        - [1024, 256]
+        - [2048, 512]
+    transient_weight: 0.05
+    teacher_mask_loss_weight: 0.1
+    teacher_logit_loss_weight: 0.05
+    distillation_band_mapping: mel_centers
+    latent_distillation_weight: 0.0
+    student_latent_modules: []
+    teacher_latent_modules: []
+    latent_allow_missing: true
+    teacher_model:
+        _target_: spectral_feature_compression.core.model.proposed_separation_models.build_source_aware_melband_roformer_teacher_system
+        n_fft: ${teacher_n_fft}
+        hop_length: ${teacher_hop_length}
+        fs: ${sr}
+        n_src: ${n_src}
+        n_chan: ${n_chan}
+        n_bands: 128
+        d_model: 192
+        n_heads: 8
+        source_attention_heads: 1
+        n_encoder_layers: 8
+        n_decoder_layers: 4
+        ffn_mult: 4
+        dropout: 0.1
+        conv_kernel_size: [5, 5]
+        routing_kernel_size: [3, 5]
+        low_freq_hz: 1000.0
+        low_freq_band_fraction: 0.45
+        overlap_factor: 1.5
+        low_freq_overlap_factor: 2.0
+        include_logmag_features: true
+        masking: true
+        residual_output: true
+        residual_scale_init: 0.05
+        mixture_consistency: true
+        routing_normalization: softmax
+        layer_scale_init: 0.1
+        scaling: true
+        css_segment_size: 12
+        css_shift_size: 6
+        css_batch_size: 1
+        online_wrapper: false

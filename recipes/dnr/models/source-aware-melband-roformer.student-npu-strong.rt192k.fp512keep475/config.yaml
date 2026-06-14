@@ -1,0 +1,111 @@
+_base_: ../online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml
+
+# Handcrafted strongest-current NPU student for SourceAwareMelBandRoFormer.
+# Unlike the conservative student, this does not assemble existing separator
+# blocks or add pooled capacity mixers. It spends capacity in custom source
+# competition, query-conditioned expansion, full-band mask reconstruction, and a
+# low-rank correction head while keeping temporal state below the 192 KB fp16
+# target for F=512.
+strong_student_n_bands: 80
+strong_student_d_model: 48
+strong_student_encoder_layers: 2
+strong_student_source_layers: 5
+strong_student_correction_layers: 1
+strong_student_encoder_expansion: 2
+strong_student_encoder_ffn_mult: 4
+strong_student_source_local_expansion: 2
+strong_student_source_local_ffn_mult: 4
+strong_student_source_fusion_hidden: 192
+strong_student_source_seed_hidden: 192
+strong_student_expander_hidden: 128
+strong_student_mask_hidden: 192
+strong_student_correction_channels: 24
+strong_student_kernel_size: [3, 5]
+strong_student_routing_kernel_size: [1, 3]
+strong_student_encoder_dilation_cycle: [1, 2]
+strong_student_low_freq_hz: 1000.0
+strong_student_low_freq_band_fraction: 0.45
+strong_student_overlap_factor: 1.5
+strong_student_low_freq_overlap_factor: 2.0
+strong_student_include_magnitude_features: true
+strong_student_include_logmag_features: false
+strong_student_mixture_consistency: true
+strong_student_routing_normalization: softmax
+
+trainer:
+  gradient_clip_val: 2.0
+
+task:
+  _target_: spectral_feature_compression.core.tasks.composite_sup_task.CompositeSupTask
+  fs: ${sr}
+  mixture_consistency_weight: 0.1
+  low_frequency_weight: 0.2
+  low_frequency_hz: 300.0
+  complex_ri_weight: 0.45
+  log_magnitude_weight: 0.2
+  multi_resolution_stft_weight: 0.25
+  multi_resolution_stft_resolutions:
+    - [512, 128]
+    - [1024, 256]
+    - [2048, 512]
+  transient_weight: 0.06
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_source_aware_melband_roformer_strong_student_npu_system
+    n_fft: ${n_fft}
+    hop_length: ${hop_length}
+    fs: ${sr}
+    scaling: false
+    css_segment_size: 12
+    css_shift_size: 6
+    css_batch_size: 1
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    n_bands: ${strong_student_n_bands}
+    d_model: ${strong_student_d_model}
+    n_layers: null
+    n_decoder_layers: null
+    n_encoder_layers: ${strong_student_encoder_layers}
+    n_source_layers: ${strong_student_source_layers}
+    correction_layers: ${strong_student_correction_layers}
+    encoder_expansion: ${strong_student_encoder_expansion}
+    encoder_ffn_mult: ${strong_student_encoder_ffn_mult}
+    source_local_expansion: ${strong_student_source_local_expansion}
+    source_local_ffn_mult: ${strong_student_source_local_ffn_mult}
+    source_fusion_hidden: ${strong_student_source_fusion_hidden}
+    source_seed_hidden: ${strong_student_source_seed_hidden}
+    expander_hidden: ${strong_student_expander_hidden}
+    mask_hidden: ${strong_student_mask_hidden}
+    correction_channels: ${strong_student_correction_channels}
+    kernel_size: ${strong_student_kernel_size}
+    routing_kernel_size: ${strong_student_routing_kernel_size}
+    encoder_dilation_cycle: ${strong_student_encoder_dilation_cycle}
+    low_freq_hz: ${strong_student_low_freq_hz}
+    low_freq_band_fraction: ${strong_student_low_freq_band_fraction}
+    overlap_factor: ${strong_student_overlap_factor}
+    low_freq_overlap_factor: ${strong_student_low_freq_overlap_factor}
+    include_magnitude_features: ${strong_student_include_magnitude_features}
+    include_logmag_features: ${strong_student_include_logmag_features}
+    causal: true
+    masking: true
+    mixture_consistency: ${strong_student_mixture_consistency}
+    routing_normalization: ${strong_student_routing_normalization}
+    freq_preprocess_enabled: true
+    freq_preprocess_keep_bins: 475
+    freq_preprocess_target_bins: 512
+    freq_preprocess_mode: triangular
+  optimizer_config:
+    optimizer_generator:
+      _partial_: True
+      _target_: torch.optim.AdamW
+      lr: 4.e-4
+      weight_decay: 1.e-2
+      betas: [0.9, 0.999]
+    scheduler_generator:
+      _partial_: True
+      _target_: spectral_feature_compression.common.lr_schedulers.warmup.WarmUpStepLR
+      warmup_steps: 10000
+      decay_start_step: 170000
+      decay_stop_step: 280000
+      step_size: 1354
+      decay: 0.98
+    scheduler_interval: step

@@ -87,13 +87,15 @@ def _apply_packed_complex_mask_no_repeat(
     _runtime_assert(x.shape[1] == 2 * n_chan, f"{x.shape[1]} vs {2 * n_chan}")
     _runtime_assert(y.shape[1] == 2 * n_src * n_chan, f"{y.shape[1]} vs {2 * n_src * n_chan}")
     outputs: list[torch.Tensor] = []
+    mixture_channels = torch.split(x, 1, dim=1)
+    mask_channels = torch.split(y, 1, dim=1)
     for src_idx in range(n_src):
         for chan_idx in range(n_chan):
-            in_r = x[:, 2 * chan_idx : 2 * chan_idx + 1, :, :]
-            in_i = x[:, 2 * chan_idx + 1 : 2 * chan_idx + 2, :, :]
+            in_r = mixture_channels[2 * chan_idx]
+            in_i = mixture_channels[2 * chan_idx + 1]
             mask_base = 2 * (src_idx * n_chan + chan_idx)
-            mask_r = y[:, mask_base : mask_base + 1, :, :]
-            mask_i = y[:, mask_base + 1 : mask_base + 2, :, :]
+            mask_r = mask_channels[mask_base]
+            mask_i = mask_channels[mask_base + 1]
             outputs.append(in_r * mask_r - in_i * mask_i)
             outputs.append(in_r * mask_i + in_i * mask_r)
     return torch.cat(outputs, dim=1)
