@@ -514,11 +514,12 @@ class StrongSourceCompetitionBlock2d(nn.Module):
     def forward(self, source_tokens: torch.Tensor, mixture_tokens: torch.Tensor) -> torch.Tensor:
         chunks = _source_chunks(source_tokens, n_src=self.n_src, channels=self.channels)
         chunks = [self.local(chunk) for chunk in chunks]
-        source_mean = _sum_chunks(chunks) / float(self.n_src)
+        inv_n_src = 1.0 / float(self.n_src)
+        source_mean = _sum_chunks(chunks) * inv_n_src
         fused = []
         for chunk in chunks:
             if self.n_src > 1:
-                other_mean = (source_mean * float(self.n_src) - chunk) / float(self.n_src - 1)
+                other_mean = (source_mean * float(self.n_src) - chunk) * (1.0 / float(self.n_src - 1))
             else:
                 other_mean = source_mean
             comp = torch.cat([chunk, mixture_tokens, other_mean, chunk - other_mean, mixture_tokens - chunk], dim=1)
@@ -629,7 +630,7 @@ class StrongSourceMaskHead2d(nn.Module):
             fullband = self.fullband_local(self.expander(chunk, query_tokens))
             contexts.append(fullband)
             masks.append(self.mask(fullband))
-        return torch.cat(masks, dim=1), _sum_chunks(contexts) / float(self.n_src)
+        return torch.cat(masks, dim=1), _sum_chunks(contexts) * (1.0 / float(self.n_src))
 
 
 class StrongMaskCorrectionHead2d(nn.Module):

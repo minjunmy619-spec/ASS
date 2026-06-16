@@ -1,0 +1,6 @@
+_base_: ../source-aware-melband-loco-cnb.student-npu-residual-sfx.rt192k.fp512keep475/config.yaml
+
+# Low-latency deployment ablation: collapse the three Loco-CNB FSMN
+# dilation branches into one depthwise causal Conv2D with the same max
+# temporal context/state size.
+loco_cnb_merge_dilations: true

@@ -21,7 +21,25 @@ from onnx import TensorProto, helper
 
 ROOT = Path("/home/cmj/works/ASS")
 ONE_CMDS = Path("/home/cmj/works/ONE/build/compiler/one-cmds")
+CIRCLE_INSPECT = Path("/home/cmj/works/ONE/build/compiler/circle-inspect/circle-inspect")
 DEFAULT_OUT_ROOT = ROOT / "logs" / "npu_verify_general"
+
+LOW_LATENCY_ONE_OPTIMIZE_FLAGS = (
+    "remove_redundant_transpose",
+    "remove_unnecessary_transpose",
+    "remove_redundant_reshape",
+    "remove_unnecessary_reshape",
+    "remove_unnecessary_add",
+    "remove_unnecessary_mul",
+    "remove_unnecessary_div",
+    "fuse_mul_with_conv",
+    "fuse_add_with_conv",
+    "fuse_mul_with_fullyconnected",
+    "fuse_add_with_fully_connected",
+    "fuse_mean_with_mean",
+    "fuse_mul_with_div",
+    "transform_sqrt_div_to_rsqrt_mul",
+)
 
 
 @dataclass
@@ -70,6 +88,40 @@ def load_lib_dirs() -> list[str]:
         "dio-hdf5",
     ]
     return [str((base / r).resolve()) for r in rels if (base / r).exists()]
+
+
+def parse_circle_operator_counts(output: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for raw_line in output.splitlines():
+        op = raw_line.strip()
+        if not op or " " in op or op.startswith("["):
+            continue
+        counts[op] = counts.get(op, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def circle_operator_counts(circle_path: Path, env: dict[str, str]) -> dict[str, int]:
+    if not CIRCLE_INSPECT.exists() or not circle_path.exists():
+        return {}
+    p = subprocess.run(
+        [str(CIRCLE_INSPECT), "--operators", str(circle_path)],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    if p.returncode != 0:
+        return {}
+    return parse_circle_operator_counts(p.stdout or "")
+
+
+def top_operator_counts(counts: dict[str, int], *, limit: int = 12) -> dict[str, int]:
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit])
+
+
+def format_operator_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "unavailable"
+    return ", ".join(f"{op}:{count}" for op, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
 def first_error_stage(log_text: str) -> str:
@@ -538,14 +590,184 @@ def rewrite_matmul_stack_lhs3_rhs2_flatten(onnx_path: Path) -> int:
     return touched
 
 
+def _constant_array_by_output(graph: onnx.GraphProto) -> dict[str, np.ndarray]:
+    constants: dict[str, np.ndarray] = {}
+    for node in graph.node:
+        if node.op_type != "Constant" or not node.output:
+            continue
+        for attr in node.attribute:
+            if attr.name == "value" and attr.HasField("t"):
+                constants[node.output[0]] = onnx.numpy_helper.to_array(attr.t)
+                break
+    return constants
+
+
+def _static_float_array(name: str, graph: onnx.GraphProto, constants: dict[str, np.ndarray]) -> np.ndarray | None:
+    if not name:
+        return None
+    for initializer in graph.initializer:
+        if initializer.name == name:
+            arr = onnx.numpy_helper.to_array(initializer)
+            return arr if np.issubdtype(arr.dtype, np.floating) else None
+    arr = constants.get(name)
+    return arr if arr is not None and np.issubdtype(arr.dtype, np.floating) else None
+
+
+def rewrite_div_by_static_const_to_mul(onnx_path: Path) -> int:
+    """Replace safe floating-point `x / const` nodes with `x * reciprocal_const`.
+
+    This removes slow division nodes before ONE import when the divisor is a
+    finite, non-zero static initializer or Constant-node tensor. Dynamic divisors
+    are intentionally left unchanged because replacing them changes the required
+    operator set and does not reduce the actual reciprocal computation.
+    """
+
+    model = onnx.load(str(onnx_path))
+    graph = model.graph
+    constants = _constant_array_by_output(graph)
+    existing_names = {initializer.name for initializer in graph.initializer}
+    touched = 0
+    new_nodes: list[onnx.NodeProto] = []
+
+    for idx, node in enumerate(graph.node):
+        if node.op_type != "Div" or len(node.input) < 2:
+            new_nodes.append(node)
+            continue
+        divisor = _static_float_array(node.input[1], graph, constants)
+        if divisor is None or divisor.size == 0:
+            new_nodes.append(node)
+            continue
+        if not np.all(np.isfinite(divisor)) or np.any(divisor == 0):
+            new_nodes.append(node)
+            continue
+
+        recip = (1.0 / divisor).astype(divisor.dtype, copy=False)
+        stem = _sanitize_onnx_identity(node.name or node.output[0] or "div_const")
+        recip_name = f"{stem}_npu_recip_{idx}"
+        while recip_name in existing_names:
+            recip_name += "_x"
+        existing_names.add(recip_name)
+        graph.initializer.append(onnx.numpy_helper.from_array(recip, name=recip_name))
+        new_nodes.append(
+            helper.make_node(
+                "Mul",
+                [node.input[0], recip_name],
+                list(node.output),
+                name=f"{stem}_mul_recip",
+            )
+        )
+        touched += 1
+
+    if touched:
+        del graph.node[:]
+        graph.node.extend(new_nodes)
+        onnx.save(model, str(onnx_path))
+    return touched
+
+
+def rewrite_unit_batch_rank4_matmul_to_2d(onnx_path: Path) -> int:
+    """Flatten static streaming rank-4 MatMul to 2D MatMul for ONE optimize.
+
+    The strict streaming SFC graphs export transport as rank-4 MatMul to avoid
+    rank-3 activation BatchMatMul risk in the deploy ONNX.  For the actual
+    one-frame NPU import shape, those nodes are often `[1, 1, M, K] @ [1, 1, K,
+    N]`.  ONE can import them, but `convert_nchw_to_nhwc` plus
+    `replace_non_const_fc_with_batch_matmul` may hit a CircleBatchMatMul shape
+    assertion.  Because both leading dimensions are statically one, this rewrite
+    preserves math exactly as `Reshape -> MatMul2D -> Reshape`.
+    """
+
+    model = onnx.load(str(onnx_path))
+    graph = model.graph
+    try:
+        inferred = onnx.shape_inference.infer_shapes(model)
+    except Exception:
+        return 0
+
+    shapes: dict[str, list[int]] = {}
+    for init in graph.initializer:
+        shapes[init.name] = list(init.dims)
+    for group in (inferred.graph.input, inferred.graph.output, inferred.graph.value_info):
+        for vi in group:
+            if not vi.type.HasField("tensor_type"):
+                continue
+            dims: list[int] = []
+            for d in vi.type.tensor_type.shape.dim:
+                if not d.dim_value:
+                    dims = []
+                    break
+                dims.append(int(d.dim_value))
+            if dims:
+                shapes[vi.name] = dims
+
+    specs: list[tuple[int, onnx.NodeProto, tuple[int, int, int]]] = []
+    for idx, node in enumerate(graph.node):
+        if node.op_type != "MatMul" or len(node.input) < 2:
+            continue
+        a, b = node.input[0], node.input[1]
+        sa, sb = shapes.get(a), shapes.get(b)
+        if not sa or not sb or len(sa) != 4 or len(sb) != 4:
+            continue
+        if sa[0] != 1 or sa[1] != 1 or sb[0] != 1 or sb[1] != 1:
+            continue
+        m, k = sa[2], sa[3]
+        rk, n = sb[2], sb[3]
+        if k != rk or min(m, k, rk, n) <= 0:
+            continue
+        specs.append((idx, node, (m, k, n)))
+
+    existing_ini = {i.name for i in graph.initializer}
+    touched = 0
+    for run_id, (idx, node, (m, k, n)) in enumerate(sorted(specs, key=lambda x: x[0], reverse=True)):
+        stem = _sanitize_onnx_identity(node.name or "matmul_rank4")
+        a, b = node.input[0], node.input[1]
+        out_name = node.output[0]
+        lhs_shape_name = f"{stem}_npu4_lhsh_{idx}_{run_id}"
+        rhs_shape_name = f"{stem}_npu4_rhsh_{idx}_{run_id}"
+        out_shape_name = f"{stem}_npu4_oush_{idx}_{run_id}"
+        if lhs_shape_name in existing_ini or rhs_shape_name in existing_ini or out_shape_name in existing_ini:
+            continue
+        existing_ini.update({lhs_shape_name, rhs_shape_name, out_shape_name})
+
+        lhs_2d = f"{stem}_npu4_l2d_{idx}_{run_id}"
+        rhs_2d = f"{stem}_npu4_r2d_{idx}_{run_id}"
+        mm_2d = f"{stem}_npu4_mm2d_{idx}_{run_id}"
+        graph.initializer.extend(
+            [
+                onnx.numpy_helper.from_array(np.array([m, k], dtype=np.int64), name=lhs_shape_name),
+                onnx.numpy_helper.from_array(np.array([k, n], dtype=np.int64), name=rhs_shape_name),
+                onnx.numpy_helper.from_array(np.array([1, 1, m, n], dtype=np.int64), name=out_shape_name),
+            ]
+        )
+        ra = helper.make_node("Reshape", [a, lhs_shape_name], [lhs_2d], name=f"{stem}_npu4_rsh_l_{run_id}")
+        rb = helper.make_node("Reshape", [b, rhs_shape_name], [rhs_2d], name=f"{stem}_npu4_rsh_r_{run_id}")
+        mm = helper.make_node("MatMul", [lhs_2d, rhs_2d], [mm_2d], name=f"{stem}_npu4_mm_{run_id}")
+        ro = helper.make_node("Reshape", [mm_2d, out_shape_name], [out_name], name=f"{stem}_npu4_rsh_o_{run_id}")
+
+        del graph.node[idx]
+        graph.node.insert(idx, ra)
+        graph.node.insert(idx + 1, rb)
+        graph.node.insert(idx + 2, mm)
+        graph.node.insert(idx + 3, ro)
+        touched += 1
+
+    if touched:
+        onnx.save(model, str(onnx_path))
+    return touched
+
+
 def apply_npu_onnx_compat_for_circle_import(onnx_path: Path) -> dict[str, int]:
     """ONNX tweaks so stock ONE importer + interpreter survive record-minmax."""
     tp_i64, tp_rew = rewrite_transpose_perm_int64_to_int32(onnx_path)
+    div_const = rewrite_div_by_static_const_to_mul(onnx_path)
     mm = rewrite_matmul_stack_lhs3_rhs2_flatten(onnx_path)
+    mm4 = rewrite_unit_batch_rank4_matmul_to_2d(onnx_path)
     return {
         "transpose_perm_i64_tensors": tp_i64,
         "transpose_perm_rewired_to_init": tp_rew,
+        "div_static_const_to_mul": div_const,
         "matmul_flatten_lhs3_rhs2": mm,
+        "matmul_unit_batch_rank4_to_2d": mm4,
     }
 
 
@@ -595,10 +817,27 @@ def generate_calibration_from_onnx(onnx_path: Path, out_dir: Path, env: dict[str
     return rc, out, calib_h5
 
 
-def write_onecc_cfg(out_dir: Path, onnx_path: Path, calib_h5: Path, granularity: str = "channel") -> Path:
+def write_onecc_cfg(
+    out_dir: Path,
+    onnx_path: Path,
+    calib_h5: Path,
+    granularity: str = "channel",
+    *,
+    low_latency_optimize: bool = False,
+) -> Path:
     circle_path = out_dir / "model.circle"
     opt_path = out_dir / "model.opt.circle"
     q_path = out_dir / "model.q.circle"
+
+    optimize_lines = [
+        "[one-optimize]",
+        f"input_path={circle_path}",
+        f"output_path={opt_path}",
+        "replace_non_const_fc_with_batch_matmul=True",
+        "convert_nchw_to_nhwc=True",
+    ]
+    if low_latency_optimize:
+        optimize_lines.extend(f"{flag}=True" for flag in LOW_LATENCY_ONE_OPTIMIZE_FLAGS)
 
     cfg_text = "\n".join(
         [
@@ -625,11 +864,7 @@ def write_onecc_cfg(out_dir: Path, onnx_path: Path, calib_h5: Path, granularity:
             f"input_path={onnx_path}",
             f"output_path={circle_path}",
             "",
-            "[one-optimize]",
-            f"input_path={circle_path}",
-            f"output_path={opt_path}",
-            "replace_non_const_fc_with_batch_matmul=True",
-            "convert_nchw_to_nhwc=True",
+            *optimize_lines,
             "",
             "[one-quantize]",
             f"input_path={opt_path}",
@@ -656,6 +891,7 @@ def run_one_variant(
     quantize_layer_fallback: bool = False,
     force_onnxsim_large_shape_ops: bool = False,
     streaming: bool = False,
+    low_latency_optimize: bool = False,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     log_parts: list[str] = []
@@ -667,6 +903,7 @@ def run_one_variant(
     onecc_rc = -1
     quant_granularity_used = "channel"
     quant_retry_layer = False
+    circle_counts: dict[str, dict[str, int]] = {}
 
     if variant.kind == "recipe":
         export_rc, export_out, onnx_path = export_recipe_variant(
@@ -723,14 +960,26 @@ def run_one_variant(
             fail_stage = "calibration"
 
     if status == "PASS":
-        onecc_cfg = write_onecc_cfg(out_dir, sim_path, calib_h5, granularity="channel")
+        onecc_cfg = write_onecc_cfg(
+            out_dir,
+            sim_path,
+            calib_h5,
+            granularity="channel",
+            low_latency_optimize=low_latency_optimize,
+        )
         onecc_rc, onecc_out = sh(f'cd "{out_dir}" && onecc -C "{onecc_cfg}"', env=env)
         log_parts.append("\n=== ONECC ===\n")
         log_parts.append(onecc_out + "\n")
         if quantize_layer_fallback and onecc_rc != 0 and "Non-channel dimension of const node must be 1" in onecc_out:
             quant_retry_layer = True
             quant_granularity_used = "layer"
-            onecc_cfg = write_onecc_cfg(out_dir, sim_path, calib_h5, granularity="layer")
+            onecc_cfg = write_onecc_cfg(
+                out_dir,
+                sim_path,
+                calib_h5,
+                granularity="layer",
+                low_latency_optimize=low_latency_optimize,
+            )
             retry_rc, retry_out = sh(f'cd "{out_dir}" && onecc -C "{onecc_cfg}"', env=env)
             log_parts.append("\n=== ONECC RETRY (granularity=layer) ===\n")
             log_parts.append(retry_out + "\n")
@@ -751,6 +1000,16 @@ def run_one_variant(
                 status = "FAIL"
                 fail_stage = "quantize"
 
+        circle_counts = {
+            "import": circle_operator_counts(out_dir / "model.circle", env),
+            "optimize": circle_operator_counts(out_dir / "model.opt.circle", env),
+            "quantize": circle_operator_counts(out_dir / "model.q.circle", env),
+        }
+        if any(circle_counts.values()):
+            log_parts.append("\n=== CIRCLE_OP_COUNTS ===\n")
+            for stage_name, counts in circle_counts.items():
+                log_parts.append(f"{stage_name}: {format_operator_counts(counts)}\n")
+
     log_path = out_dir / "run.log"
     log_path.write_text("".join(log_parts), encoding="utf-8")
     return {
@@ -764,6 +1023,12 @@ def run_one_variant(
         "onecc_rc": onecc_rc,
         "quant_granularity_used": quant_granularity_used,
         "quant_retry_layer": quant_retry_layer,
+        "low_latency_optimize": low_latency_optimize,
+        "circle_op_counts": circle_counts,
+        "circle_top_ops": {stage: top_operator_counts(counts) for stage, counts in circle_counts.items()},
+        "circle_opt_transpose": circle_counts.get("optimize", {}).get("TRANSPOSE", 0),
+        "circle_opt_reshape": circle_counts.get("optimize", {}).get("RESHAPE", 0),
+        "circle_opt_strided_slice": circle_counts.get("optimize", {}).get("STRIDED_SLICE", 0),
         "log": str(log_path),
         "path": str(out_dir),
         "recipe_cfg": str(variant.recipe_cfg) if variant.recipe_cfg else "",
@@ -798,11 +1063,31 @@ def write_summary(results: list[dict[str, Any]], out_root: Path) -> None:
         f"- PASS: {ok}",
         f"- FAIL: {fail}",
         "",
-        "| Kind | Variant | Status | Fail Stage |",
-        "|---|---|---|---|",
+        "| Kind | Variant | Status | Fail Stage | Low-latency opt | Opt Transpose | Opt Reshape | Opt StridedSlice |",
+        "|---|---|---|---|---:|---:|---:|---:|",
     ]
     for r in results:
-        lines.append(f"| {r['kind']} | {r['variant']} | {r['status']} | {r['fail_stage'] or '-'} |")
+        lines.append(
+            "| "
+            f"{r['kind']} | {r['variant']} | {r['status']} | {r['fail_stage'] or '-'} | "
+            f"{r.get('low_latency_optimize', False)} | "
+            f"{r.get('circle_opt_transpose', 0)} | "
+            f"{r.get('circle_opt_reshape', 0)} | "
+            f"{r.get('circle_opt_strided_slice', 0)} |"
+        )
+    if any(r.get("circle_top_ops") for r in results):
+        lines.extend(["", "## Circle optimized top operators", ""])
+        for r in results:
+            top_ops = r.get("circle_top_ops", {}).get("optimize", {})
+            if not top_ops:
+                continue
+            lines.append(f"### {r['kind']}:{r['variant']}")
+            lines.append("")
+            lines.append("```text")
+            for op, count in top_ops.items():
+                lines.append(f"{op}: {count}")
+            lines.append("```")
+            lines.append("")
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -849,6 +1134,14 @@ def parse_args() -> argparse.Namespace:
         "--streaming",
         action="store_true",
         help="Export recipe variants with flattened forward_stream state inputs/outputs before ONE verification.",
+    )
+    p.add_argument(
+        "--low-latency-optimize",
+        action="store_true",
+        help=(
+            "Enable additional ONE cleanup/fusion passes after NCHW->NHWC conversion "
+            "to reduce memory/no-op nodes in deploy graphs."
+        ),
     )
     return p.parse_args()
 
@@ -897,6 +1190,7 @@ def main() -> int:
             quantize_layer_fallback=args.quantize_layer_fallback,
             force_onnxsim_large_shape_ops=args.force_onnxsim_large_shape_ops,
             streaming=args.streaming,
+            low_latency_optimize=args.low_latency_optimize,
         )
         results.append(result)
         status = result["status"]

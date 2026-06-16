@@ -126,6 +126,8 @@ def merge_task_model_mapping(path: Path) -> dict[str, object]:
 
     in_task = False
     in_model = False
+    model_indent: int | None = None
+    model_key_indent: int | None = None
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
@@ -134,15 +136,24 @@ def merge_task_model_mapping(path: Path) -> dict[str, object]:
         if indent == 0:
             in_task = stripped.startswith("task:")
             in_model = False
+            model_indent = None
+            model_key_indent = None
             continue
-        if in_task and indent == 2 and stripped.startswith("model:"):
+        if in_task and not in_model and stripped.startswith("model:"):
+            model_indent = indent
+            model_key_indent = None
             in_model = True
             continue
         if in_model:
-            if indent < 4:
+            assert model_indent is not None
+            if indent <= model_indent:
                 in_model = False
+                model_indent = None
+                model_key_indent = None
                 continue
-            if indent == 4 and ":" in stripped:
+            if model_key_indent is None:
+                model_key_indent = indent
+            if indent == model_key_indent and ":" in stripped:
                 key, value = stripped.split(":", 1)
                 merged[key.strip()] = parse_scalar(value.strip())
     return merged

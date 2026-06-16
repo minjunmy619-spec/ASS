@@ -1,0 +1,14 @@
+_base_: ../source-aware-melband-loco-cnb.student-npu.rt192k.fp512keep475/config.yaml
+
+# Recommended first deploy-quality ablation: explicitly predict Speech and Music,
+# then reconstruct Effects/SFX wrapper-side as mixture - speech - music.
+# Core-level mixture consistency must stay disabled here; otherwise the two
+# explicit core stems are forced to sum to the mixture and the residual SFX stem
+# collapses to zero/projector residual.
+loco_cnb_mixture_consistency: false
+
+task:
+    model:
+        core_n_src: 2
+        residual_source_enabled: true
+        residual_source_index: 2

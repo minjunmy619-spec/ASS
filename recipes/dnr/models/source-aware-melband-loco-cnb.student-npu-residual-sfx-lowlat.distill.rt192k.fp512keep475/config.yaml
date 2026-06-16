@@ -1,0 +1,4 @@
+_base_: ../source-aware-melband-loco-cnb.student-npu-residual-sfx.distill.rt192k.fp512keep475/config.yaml
+
+# Distillation variant for the low-latency merged-FSMN student.
+loco_cnb_merge_dilations: true

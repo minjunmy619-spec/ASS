@@ -28,6 +28,7 @@ from spectral_feature_compression.core.model.proposed_separation_models import (
     build_sfc_locoformer_lite_plus_system,
     build_sfc_residual_refinement_system,
     build_sfc_sepreformer_multistem_system,
+    build_source_aware_melband_loco_cnb_student_npu_system,
     build_source_aware_melband_roformer_strong_student_npu_system,
     build_source_aware_melband_roformer_student_npu_system,
     build_source_aware_melband_roformer_teacher_system,
@@ -35,6 +36,9 @@ from spectral_feature_compression.core.model.proposed_separation_models import (
     build_sparse_unet_mel_sfc_music_system,
 )
 from spectral_feature_compression.core.model.residual_refinement_sfc_2d import OnlineResidualRefinementSFC2D
+from spectral_feature_compression.core.model.source_aware_melband_loco_cnb_student_sfc_2d import (
+    OnlineSourceAwareMelBandLocoCNBStudentSFC2D,
+)
 from spectral_feature_compression.core.model.source_aware_melband_roformer import SourceAwareMelBandRoformer2D
 from spectral_feature_compression.core.model.source_aware_melband_strong_student_sfc_2d import (
     OnlineSourceAwareMelBandStrongStudentSFC2D,
@@ -63,6 +67,7 @@ def test_source_aware_melband_public_lazy_exports() -> None:
     assert sfc.SourceAwareMelBandRoformer2D is SourceAwareMelBandRoformer2D
     assert sfc.OnlineSourceAwareMelBandStudentSFC2D is OnlineSourceAwareMelBandStudentSFC2D
     assert sfc.OnlineSourceAwareMelBandStrongStudentSFC2D is OnlineSourceAwareMelBandStrongStudentSFC2D
+    assert sfc.OnlineSourceAwareMelBandLocoCNBStudentSFC2D is OnlineSourceAwareMelBandLocoCNBStudentSFC2D
 
 
 def test_band_sfc_rt_plus_forward_and_streaming_shape() -> None:
@@ -593,6 +598,332 @@ def test_source_aware_melband_roformer_strong_student_npu_forward_streaming_and_
     assert "build_source_aware_melband_roformer_teacher_system" in distill_text
 
 
+def test_source_aware_melband_loco_cnb_student_npu_forward_streaming_and_recipe() -> None:
+    torch.manual_seed(0)
+    model = build_source_aware_melband_loco_cnb_student_npu_system(
+        n_fft=64,
+        hop_length=16,
+        fs=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        state_channels=8,
+        source_channels=8,
+        n_loco_layers=1,
+        n_source_layers=1,
+        source_fusion_hidden=16,
+        source_seed_hidden=16,
+        expander_hidden=16,
+        mask_hidden=16,
+        correction_channels=4,
+        correction_kernel_size=(1, 3),
+        cnb_kernel=3,
+        cnb_dilation_schedule=(1, 2),
+        cnb_num_heads=2,
+        cnb_head_dim=4,
+        pooled_mixer_hidden_schedule=(16,),
+        freq_preprocess_enabled=False,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 256)
+    with torch.no_grad():
+        est = model(wav)
+    assert tuple(est.shape) == (1, 2, 1, 256)
+
+    core = OnlineSourceAwareMelBandLocoCNBStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        state_channels=8,
+        source_channels=8,
+        n_loco_layers=1,
+        n_source_layers=1,
+        source_fusion_hidden=16,
+        source_seed_hidden=16,
+        expander_hidden=16,
+        mask_hidden=16,
+        correction_channels=4,
+        correction_kernel_size=(1, 3),
+        cnb_kernel=3,
+        cnb_dilation_schedule=(1, 2),
+        cnb_num_heads=2,
+        cnb_head_dim=4,
+        pooled_mixer_hidden_schedule=(16,),
+    ).eval()
+    x = torch.randn(1, 2, 4, 33)
+    with torch.no_grad():
+        y = core(x)
+        state = core.init_stream_state(batch_size=1, dtype=x.dtype)
+        frames = []
+        for frame_idx in range(x.shape[2]):
+            frame, state = core.forward_stream(x[:, :, frame_idx : frame_idx + 1, :], state)
+            frames.append(frame)
+        y_stream = torch.cat(frames, dim=2)
+    assert tuple(y.shape) == (1, 4, 4, 33)
+    assert tuple(y_stream.shape) == tuple(y.shape)
+    torch.testing.assert_close(y_stream, y, rtol=1e-5, atol=1e-5)
+    y_sources = y.reshape(1, 2, 2, 4, 33)
+    torch.testing.assert_close(y_sources.sum(dim=1), x, rtol=1e-5, atol=1e-5)
+    assert len(core.init_stream_state(batch_size=1, dtype=x.dtype)) == 1
+    assert core.state_size_bytes(dtype=torch.float16) < 32 * 1024
+
+    raw_core = OnlineSourceAwareMelBandLocoCNBStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        state_channels=8,
+        source_channels=8,
+        n_loco_layers=1,
+        n_source_layers=1,
+        source_fusion_hidden=16,
+        source_seed_hidden=16,
+        expander_hidden=16,
+        mask_hidden=16,
+        correction_channels=4,
+        correction_kernel_size=(1, 3),
+        cnb_kernel=3,
+        cnb_dilation_schedule=(1, 2),
+        cnb_num_heads=2,
+        cnb_head_dim=4,
+        pooled_mixer_hidden_schedule=(16,),
+        masking=False,
+    ).eval()
+    with torch.no_grad():
+        masks = raw_core(x)
+    assert tuple(masks.shape) == (1, 4, 4, 33)
+
+    merged_core = OnlineSourceAwareMelBandLocoCNBStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        state_channels=8,
+        source_channels=8,
+        n_loco_layers=1,
+        n_source_layers=1,
+        source_fusion_hidden=16,
+        source_seed_hidden=16,
+        expander_hidden=16,
+        mask_hidden=16,
+        correction_channels=4,
+        correction_kernel_size=(1, 3),
+        cnb_kernel=3,
+        cnb_dilation_schedule=(1, 2),
+        cnb_merge_dilations=True,
+        cnb_num_heads=2,
+        cnb_head_dim=4,
+        pooled_mixer_hidden_schedule=(16,),
+    ).eval()
+    with torch.no_grad():
+        y_merged = merged_core(x)
+        merged_state = merged_core.init_stream_state(batch_size=1, dtype=x.dtype)
+        merged_frames = []
+        for frame_idx in range(x.shape[2]):
+            frame, merged_state = merged_core.forward_stream(x[:, :, frame_idx : frame_idx + 1, :], merged_state)
+            merged_frames.append(frame)
+        y_merged_stream = torch.cat(merged_frames, dim=2)
+    assert merged_core.cnb_merge_dilations is True
+    assert merged_core.backbone[0].narrow_band.merge_dilations is True
+    assert tuple(y_merged_stream.shape) == tuple(y_merged.shape)
+    torch.testing.assert_close(y_merged_stream, y_merged, rtol=1e-5, atol=1e-5)
+
+    deploy_core = OnlineSourceAwareMelBandLocoCNBStudentSFC2D(
+        n_freq=512,
+        sample_rate=44100,
+        n_src=3,
+        n_chan=1,
+        n_bands=56,
+        state_channels=36,
+        source_channels=48,
+        n_loco_layers=4,
+        n_source_layers=4,
+        source_fusion_hidden=192,
+        source_seed_hidden=192,
+        expander_hidden=128,
+        mask_hidden=160,
+        correction_channels=16,
+        correction_kernel_size=(1, 5),
+        routing_kernel_size=(1, 3),
+        cnb_num_heads=4,
+        cnb_head_dim=8,
+        pooled_mixer_hidden_schedule=(2048, 4096, 4096, 2048),
+    ).eval()
+    deploy_params = sum(p.numel() for p in deploy_core.parameters())
+    assert 2_000_000 <= deploy_params <= 4_000_000
+    assert deploy_core.state_size_bytes(dtype=torch.float16) == 177_408
+    assert deploy_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+    config_path = Path("recipes/dnr/models/source-aware-melband-loco-cnb.student-npu.rt192k.fp512keep475/config.yaml")
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert str(resolve_value(model_cfg["_target_"], context)).endswith(
+        "build_source_aware_melband_loco_cnb_student_npu_system"
+    )
+    assert resolve_value(model_cfg["n_bands"], context) == 56
+    assert resolve_value(model_cfg["state_channels"], context) == 36
+    assert resolve_value(model_cfg["source_channels"], context) == 48
+    assert resolve_value(model_cfg["cnb_merge_dilations"], context) is False
+    assert resolve_value(model_cfg["pooled_mixer_hidden_schedule"], context) == [2048, 4096, 4096, 2048]
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    recipe_core = system.model.core
+    assert recipe_core.n_freq == 512
+    assert recipe_core.n_bands == 56
+    assert recipe_core.state_channels == 36
+    assert recipe_core.source_channels == 48
+    assert sum(p.numel() for p in recipe_core.parameters()) == deploy_params
+    assert recipe_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+    residual_path = Path(
+        "recipes/dnr/models/source-aware-melband-loco-cnb.student-npu-residual-sfx.rt192k.fp512keep475/config.yaml"
+    )
+    residual_top = merge_top_level_scalars(residual_path)
+    residual_model_cfg = merge_task_model_mapping(residual_path)
+    residual_context = {**residual_top, **residual_model_cfg}
+    assert resolve_value(residual_model_cfg["mixture_consistency"], residual_context) is False
+    residual_system = build_model_system_from_recipe_config(residual_path).eval()
+    assert residual_system.model.residual_source_enabled is True
+    assert residual_system.model.core.n_src == 2
+    assert residual_system.model.n_src == 3
+    assert residual_system.model.core.mixture_consistency is False
+    assert residual_system.model.core.state_size_bytes(dtype=torch.float16) == 177_408
+
+    with pytest.raises(ValueError, match="residual_source_enabled requires mixture_consistency=False"):
+        build_source_aware_melband_loco_cnb_student_npu_system(
+            n_fft=64,
+            hop_length=16,
+            fs=8000,
+            n_src=3,
+            n_chan=1,
+            core_n_src=2,
+            n_bands=8,
+            state_channels=8,
+            source_channels=8,
+            n_loco_layers=1,
+            n_source_layers=1,
+            residual_source_enabled=True,
+            residual_source_index=2,
+            mixture_consistency=True,
+            freq_preprocess_enabled=False,
+        )
+
+    lowlat_path = Path(
+        "recipes/dnr/models/source-aware-melband-loco-cnb.student-npu-residual-sfx-lowlat.rt192k.fp512keep475/config.yaml"
+    )
+    lowlat_top = merge_top_level_scalars(lowlat_path)
+    lowlat_model_cfg = merge_task_model_mapping(lowlat_path)
+    lowlat_context = {**lowlat_top, **lowlat_model_cfg}
+    assert resolve_value(lowlat_model_cfg["cnb_merge_dilations"], lowlat_context) is True
+    assert resolve_value(lowlat_model_cfg["mixture_consistency"], lowlat_context) is False
+    lowlat_system = build_model_system_from_recipe_config(lowlat_path).eval()
+    assert lowlat_system.model.core.cnb_merge_dilations is True
+    assert lowlat_system.model.core.mixture_consistency is False
+    assert lowlat_system.model.core.state_size_bytes(dtype=torch.float16) == 177_408
+    assert sum(p.numel() for p in lowlat_system.model.core.parameters()) < sum(
+        p.numel() for p in residual_system.model.core.parameters()
+    )
+
+    distill_path = Path(
+        "recipes/dnr/models/source-aware-melband-loco-cnb.student-npu-residual-sfx.distill.rt192k.fp512keep475/config.yaml"
+    )
+    distill_top = merge_top_level_scalars(distill_path)
+    distill_model_cfg = merge_task_model_mapping(distill_path)
+    distill_context = {**distill_top, **distill_model_cfg}
+    assert distill_top["teacher_checkpoint_path"] is None
+    assert str(resolve_value(distill_model_cfg["_target_"], distill_context)).endswith(
+        "build_source_aware_melband_loco_cnb_student_npu_system"
+    )
+    distill_text = distill_path.read_text(encoding="utf-8")
+    assert "TeacherStudentDistillationTask" in distill_text
+    assert "require_teacher_checkpoint: true" in distill_text
+    assert "teacher_css_validation: true" in distill_text
+    assert "distillation_band_mapping: mel_centers" in distill_text
+    assert "build_source_aware_melband_roformer_teacher_system" in distill_text
+
+    lowlat_distill_path = Path(
+        "recipes/dnr/models/source-aware-melband-loco-cnb.student-npu-residual-sfx-lowlat.distill.rt192k.fp512keep475/config.yaml"
+    )
+    lowlat_distill_top = merge_top_level_scalars(lowlat_distill_path)
+    lowlat_distill_model_cfg = merge_task_model_mapping(lowlat_distill_path)
+    lowlat_distill_context = {**lowlat_distill_top, **lowlat_distill_model_cfg}
+    assert resolve_value(lowlat_distill_model_cfg["cnb_merge_dilations"], lowlat_distill_context) is True
+    assert resolve_value(lowlat_distill_model_cfg["mixture_consistency"], lowlat_distill_context) is False
+
+
+def test_source_aware_melband_loco_cnb_student_npu_onnx_audit_smoke() -> None:
+    onnx = pytest.importorskip("onnx")
+
+    from spectral_feature_compression.utils.onnx_streaming import (
+        StreamingStateIOWrapper,
+        flatten_tensor_tree,
+        get_external_constant_tensors,
+    )
+    from tools.online.audit_onnx_model import audit_npu_risks, get_allowed_ops
+
+    torch.manual_seed(0)
+    core = OnlineSourceAwareMelBandLocoCNBStudentSFC2D(
+        n_freq=33,
+        sample_rate=8000,
+        n_src=2,
+        n_chan=1,
+        n_bands=8,
+        state_channels=8,
+        source_channels=8,
+        n_loco_layers=1,
+        n_source_layers=1,
+        source_fusion_hidden=16,
+        source_seed_hidden=16,
+        expander_hidden=16,
+        mask_hidden=16,
+        correction_channels=4,
+        correction_kernel_size=(1, 3),
+        cnb_kernel=3,
+        cnb_dilation_schedule=(1, 2),
+        cnb_num_heads=2,
+        cnb_head_dim=4,
+        pooled_mixer_hidden_schedule=(16,),
+    ).eval()
+    wrapper = StreamingStateIOWrapper(core, batch_size=1, dtype=torch.float32, externalize_constants=True).eval()
+    state = core.init_stream_state(batch_size=1, dtype=torch.float32)
+    flat_state, _ = flatten_tensor_tree(state)
+    constants = get_external_constant_tensors(core, wrapper.constant_bindings)
+    x = torch.randn(1, 2, 1, 33)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir) / "source_aware_melband_loco_cnb_student_stream.onnx"
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                (x, *flat_state, *constants),
+                str(out),
+                opset_version=14,
+                input_names=[
+                    "x",
+                    *[f"state_{idx}" for idx in range(len(flat_state))],
+                    *[f"const_{idx}" for idx in range(len(constants))],
+                ],
+                output_names=["y", *[f"next_state_{idx}" for idx in range(len(flat_state))]],
+                do_constant_folding=True,
+                dynamo=False,
+            )
+        model = onnx.load(str(out))
+
+    onnx.checker.check_model(model)
+    allowed_ops = get_allowed_ops("edge_npu_recommended")
+    assert sorted({node.op_type for node in model.graph.node} - allowed_ops) == []
+    audit = audit_npu_risks(model)
+    assert audit["has_strict_edge_risks"] is False
+    assert audit["risk_counts"]["rank_gt4_values"] == 0
+    assert audit["risk_counts"]["activation_matmul_rank_le3"] == 0
+
+
 def test_source_aware_melband_roformer_strong_student_npu_onnx_audit_smoke() -> None:
     onnx = pytest.importorskip("onnx")
 
@@ -873,7 +1204,7 @@ def test_source_aware_residual_sfc_builder_forward_streaming_and_recipe() -> Non
     distill_top = merge_top_level_scalars(distill_path)
     distill_model_cfg = merge_task_model_mapping(distill_path)
     assert distill_top["teacher_checkpoint_path"] is None
-    assert resolve_value(distill_model_cfg["_target_"], {**distill_top, **distill_model_cfg}).endswith(
+    assert str(resolve_value(distill_model_cfg["_target_"], {**distill_top, **distill_model_cfg})).endswith(
         "build_source_aware_residual_sfc_system"
     )
     distill_text = distill_path.read_text(encoding="utf-8")

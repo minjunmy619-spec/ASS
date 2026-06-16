@@ -1,0 +1,133 @@
+_base_: ../online-soft-band-query-sfc2d.rt192k.fp512keep475.causal24dim.6l.64b/config.yaml
+
+# Source-aware MelBand Loco-CNB student: explicit Speech/Music/Effects masks.
+# This combines the strong source-aware MelBand decoder with a shared Loco-CNB
+# causal backbone. Persistent state is spent on compressed K=56 bands only.
+loco_cnb_n_bands: 56
+loco_cnb_state_channels: 36
+loco_cnb_source_channels: 48
+loco_cnb_layers: 4
+loco_cnb_source_layers: 4
+loco_cnb_source_local_expansion: 2
+loco_cnb_source_local_ffn_mult: 4
+loco_cnb_source_fusion_hidden: 192
+loco_cnb_source_seed_hidden: 192
+loco_cnb_expander_hidden: 128
+loco_cnb_mask_hidden: 160
+loco_cnb_correction_layers: 1
+loco_cnb_correction_channels: 16
+loco_cnb_correction_kernel_size: [1, 5]
+loco_cnb_routing_kernel_size: [1, 3]
+loco_cnb_freq_kernel: 3
+loco_cnb_kernel: 4
+loco_cnb_dilation_schedule: [1, 2, 3]
+loco_cnb_merge_dilations: false
+loco_cnb_num_heads: 4
+loco_cnb_head_dim: 8
+loco_cnb_attention_enabled: false
+loco_cnb_pooled_mixer_hidden_schedule: [2048, 4096, 4096, 2048]
+loco_cnb_expansion: 1
+loco_cnb_ffn_expansion: 2
+loco_cnb_time_kernel: 3
+loco_cnb_band_kernel: 3
+loco_cnb_time_dilation: 1
+loco_cnb_low_freq_hz: 1000.0
+loco_cnb_low_freq_band_fraction: 0.45
+loco_cnb_overlap_factor: 1.5
+loco_cnb_low_freq_overlap_factor: 2.0
+loco_cnb_include_magnitude_features: true
+loco_cnb_include_logmag_features: false
+loco_cnb_mixture_consistency: true
+loco_cnb_routing_normalization: softmax
+
+trainer:
+    gradient_clip_val: 2.0
+
+task:
+    _target_: spectral_feature_compression.core.tasks.composite_sup_task.CompositeSupTask
+    fs: ${sr}
+    mixture_consistency_weight: 0.1
+    low_frequency_weight: 0.2
+    low_frequency_hz: 300.0
+    complex_ri_weight: 0.45
+    log_magnitude_weight: 0.2
+    multi_resolution_stft_weight: 0.25
+    multi_resolution_stft_resolutions:
+        - [512, 128]
+        - [1024, 256]
+        - [2048, 512]
+    transient_weight: 0.06
+    model:
+        _target_: spectral_feature_compression.core.model.proposed_separation_models.build_source_aware_melband_loco_cnb_student_npu_system
+        n_fft: ${n_fft}
+        hop_length: ${hop_length}
+        fs: ${sr}
+        scaling: false
+        css_segment_size: 12
+        css_shift_size: 6
+        css_batch_size: 1
+        n_src: ${n_src}
+        n_chan: ${n_chan}
+        n_bands: ${loco_cnb_n_bands}
+        band_config: null
+        state_channels: ${loco_cnb_state_channels}
+        source_channels: ${loco_cnb_source_channels}
+        d_model: ${loco_cnb_source_channels}
+        n_layers: null
+        n_decoder_layers: null
+        kernel_size: null
+        n_loco_layers: ${loco_cnb_layers}
+        n_source_layers: ${loco_cnb_source_layers}
+        source_local_expansion: ${loco_cnb_source_local_expansion}
+        source_local_ffn_mult: ${loco_cnb_source_local_ffn_mult}
+        source_fusion_hidden: ${loco_cnb_source_fusion_hidden}
+        source_seed_hidden: ${loco_cnb_source_seed_hidden}
+        expander_hidden: ${loco_cnb_expander_hidden}
+        mask_hidden: ${loco_cnb_mask_hidden}
+        correction_layers: ${loco_cnb_correction_layers}
+        correction_channels: ${loco_cnb_correction_channels}
+        correction_kernel_size: ${loco_cnb_correction_kernel_size}
+        routing_kernel_size: ${loco_cnb_routing_kernel_size}
+        loco_freq_kernel: ${loco_cnb_freq_kernel}
+        cnb_kernel: ${loco_cnb_kernel}
+        cnb_dilation_schedule: ${loco_cnb_dilation_schedule}
+        cnb_merge_dilations: ${loco_cnb_merge_dilations}
+        cnb_num_heads: ${loco_cnb_num_heads}
+        cnb_head_dim: ${loco_cnb_head_dim}
+        cnb_attention_enabled: ${loco_cnb_attention_enabled}
+        pooled_mixer_hidden_schedule: ${loco_cnb_pooled_mixer_hidden_schedule}
+        loco_expansion: ${loco_cnb_expansion}
+        loco_ffn_expansion: ${loco_cnb_ffn_expansion}
+        loco_time_kernel: ${loco_cnb_time_kernel}
+        loco_band_kernel: ${loco_cnb_band_kernel}
+        loco_time_dilation: ${loco_cnb_time_dilation}
+        low_freq_hz: ${loco_cnb_low_freq_hz}
+        low_freq_band_fraction: ${loco_cnb_low_freq_band_fraction}
+        overlap_factor: ${loco_cnb_overlap_factor}
+        low_freq_overlap_factor: ${loco_cnb_low_freq_overlap_factor}
+        include_magnitude_features: ${loco_cnb_include_magnitude_features}
+        include_logmag_features: ${loco_cnb_include_logmag_features}
+        causal: true
+        masking: true
+        mixture_consistency: ${loco_cnb_mixture_consistency}
+        routing_normalization: ${loco_cnb_routing_normalization}
+        freq_preprocess_enabled: true
+        freq_preprocess_keep_bins: 475
+        freq_preprocess_target_bins: 512
+        freq_preprocess_mode: triangular
+    optimizer_config:
+        optimizer_generator:
+            _partial_: True
+            _target_: torch.optim.AdamW
+            lr: 4.e-4
+            weight_decay: 1.e-2
+            betas: [0.9, 0.999]
+        scheduler_generator:
+            _partial_: True
+            _target_: spectral_feature_compression.common.lr_schedulers.warmup.WarmUpStepLR
+            warmup_steps: 10000
+            decay_start_step: 170000
+            decay_stop_step: 280000
+            step_size: 1354
+            decay: 0.98
+        scheduler_interval: step
