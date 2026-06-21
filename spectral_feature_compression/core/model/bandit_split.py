@@ -50,7 +50,13 @@ def check_no_gap(band_specs):
 
 
 def get_band_specs(band_specs, n_fft, fs, n_bands=None):
-    if "tribark" in band_specs:
+    if "vocal" in band_specs or "speech_vocal" in band_specs:
+        assert n_bands is not None
+        specs = SpeechVocalBandsplitSpecification(nfft=n_fft, fs=fs, n_bands=n_bands)
+        bsm = specs.get_band_specs()
+        freq_weights = specs.get_freq_weights()
+        overlapping_band = True
+    elif "tribark" in band_specs:
         assert n_bands is not None
         specs = TriangularBarkBandsplitSpecification(nfft=n_fft, fs=fs, n_bands=n_bands)
         bsm = specs.get_band_specs()
@@ -251,6 +257,97 @@ def musical_filterbank(n_bands, fs, f_min, f_max, n_freqs, scale="constant"):
 class MusicalBandsplitSpecification(PerceptualBandsplitSpecification):
     def __init__(self, nfft: int, fs: int, n_bands: int, f_min: float = 0.0, f_max: float = None) -> None:
         super().__init__(fbank_fn=musical_filterbank, nfft=nfft, fs=fs, n_bands=n_bands, f_min=f_min, f_max=f_max)
+
+
+class SpeechVocalBandsplitSpecification(BandsplitSpecification):
+    """Speech/vocal-emphasis overlapped bands for 24 kHz teacher SFC.
+
+    This band map spends most of the 64 compressed tokens on the vocal-critical
+    region instead of following a generic musical/log-frequency allocation:
+
+    - 0-80 Hz: rumble / very low F0 support, 3 bands
+    - 80-300 Hz: speech/singing F0 and low body, 7 bands
+    - 300-1000 Hz: lower formants, 14 bands
+    - 1-4 kHz: core vocal intelligibility/formants, 24 bands
+    - 4-8 kHz: consonants/sibilance/cymbal-confuser region, 12 bands
+    - 8-12 kHz: residual air/high band at 24 kHz, 4 bands
+
+    For ``fs=24000, nfft=2048, n_bands=64`` this produces exactly the fixed
+    ranges proposed in ``sfc_teacher_song_quality_deep_research_20260620.md``.
+    For other FFT sizes/sample rates the same Hz design is converted to bins.
+    """
+
+    _SEGMENTS_64 = (
+        (0.0, 80.0, 3),
+        (80.0, 300.0, 7),
+        (300.0, 1000.0, 14),
+        (1000.0, 4000.0, 24),
+        (4000.0, 8000.0, 12),
+        (8000.0, 12000.0, 4),
+    )
+
+    def __init__(self, nfft: int, fs: int, n_bands: int = 64) -> None:
+        super().__init__(nfft=nfft, fs=fs)
+        if n_bands != 64:
+            raise ValueError(
+                "SpeechVocalBandsplitSpecification currently supports n_bands=64 only; "
+                f"got n_bands={n_bands}"
+            )
+        self.n_bands = int(n_bands)
+        self.band_specs = self._build_band_specs()
+        self.freq_weights = self._build_freq_weights(self.band_specs)
+
+    def _build_band_specs(self) -> list[tuple[int, int]]:
+        specs: list[tuple[int, int]] = []
+        nyquist = self.fs / 2.0
+        for raw_lo_hz, raw_hi_hz, count in self._SEGMENTS_64:
+            lo_hz = min(float(raw_lo_hz), nyquist)
+            hi_hz = min(float(raw_hi_hz), nyquist)
+            if hi_hz <= lo_hz:
+                continue
+            step_hz = (hi_hz - lo_hz) / float(count)
+            # 1.8x step gives robust overlap without making high bands as wide
+            # as musical64.  First/last bands are clamped to segment boundaries.
+            width_hz = step_hz * 1.8
+            for band_idx in range(count):
+                center_hz = lo_hz + (band_idx + 0.5) * step_hz
+                start_hz = max(lo_hz, center_hz - width_hz / 2.0)
+                end_hz = min(hi_hz, center_hz + width_hz / 2.0)
+                if band_idx == 0:
+                    start_hz = lo_hz
+                if band_idx == count - 1:
+                    end_hz = hi_hz
+                start = int(np.floor(self.hertz_to_index(start_hz, round=False)))
+                # ``end`` is exclusive.  Add one bin so the requested Hz end is
+                # included after integer conversion, matching existing overlapped
+                # perceptual band specs in this file.
+                end = int(np.ceil(self.hertz_to_index(end_hz, round=False))) + 1
+                start = max(0, min(self.max_index - 1, start))
+                end = max(start + 1, min(self.max_index, end))
+                specs.append((start, end))
+
+        if len(specs) != self.n_bands:
+            raise ValueError(f"Expected {self.n_bands} vocal bands, got {len(specs)}")
+
+        counter = torch.zeros(self.max_index)
+        for start, end in specs:
+            counter[start:end] += 1
+        if torch.any(counter == 0):
+            missing = torch.nonzero(counter == 0, as_tuple=False).flatten()[:10].tolist()
+            raise ValueError(f"speech/vocal band map does not cover all bins; first missing bins: {missing}")
+        return specs
+
+    def _build_freq_weights(self, band_specs: list[tuple[int, int]]) -> list[torch.Tensor]:
+        counter = torch.zeros(self.max_index)
+        for start, end in band_specs:
+            counter[start:end] += 1
+        return [1.0 / counter[start:end].clamp_min(1.0) for start, end in band_specs]
+
+    def get_band_specs(self):
+        return self.band_specs
+
+    def get_freq_weights(self):
+        return self.freq_weights
 
 
 def bark_filterbank(n_bands, fs, f_min, f_max, n_freqs):

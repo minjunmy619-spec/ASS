@@ -1,0 +1,188 @@
+_base_: ${base_config_path}/train_base.yaml
+
+# Run C: model-first source-aware teacher. This recipe intentionally keeps the
+# original on-the-fly synthesis and auxiliary-loss scaling behavior so it can be
+# compared with the capacity control without combining the RMS repair.
+seed: 2026
+working_directory: ./logs/source-aware-sfc-locoformer-teacher
+
+sr: 24000
+n_fft: 2048
+hop_length: 512
+n_src: 3
+n_chan: 1
+
+trainer:
+  _target_: spectral_feature_compression.common.seeded_trainer.build_seeded_trainer
+  seed: ${seed}
+  max_epochs: 150
+  max_steps: 20000
+  check_val_every_n_epoch: 1
+  gradient_clip_val: 5.0
+  sync_batchnorm: true
+  deterministic: false
+  limit_train_batches: 1354
+  limit_val_batches: 10
+  benchmark: true
+  use_distributed_sampler: true
+  precision: bf16-mixed
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      filename: "{epoch:04d}"
+      save_top_k: 5
+      monitor: validation/loss
+      mode: min
+      save_last: true
+    - _target_: lightning.pytorch.callbacks.RichProgressBar
+      refresh_rate: 5
+    - _target_: lightning.pytorch.callbacks.RichModelSummary
+      max_depth: 3
+
+datamodule:
+  _target_: spectral_feature_compression.common.datamodules.on_the_fly_stem_datamodule.OnTheFlyStemDataModule
+  sr: ${sr}
+  duration: 6.0
+  batch_size: 4
+  val_batch_size: 1
+  num_workers: 4
+  dataset_length: 200000
+  val_dataset_length: 2000
+  train_seed: ${seed}
+  val_seed: ${seed}
+  source_order: [speech, music, effects]
+  source_pools:
+    speech:
+      - /data1/speech1
+      - /data1/speech2
+    music:
+      - /data1/music1
+      - /data1/music2
+    effects:
+      - /data1/effects1
+      - /data1/effects2
+      - /data1/effects3
+  synthesis:
+    backend: dry_mix
+    mixture_duration: ${datamodule.duration}
+    active_stem_count:
+      mode: weighted
+      weights:
+        0: 0.01
+        1: 0.20
+        2: 0.35
+        3: 0.44
+    stem_sampling_weights:
+      speech: 1.0
+      music: 1.0
+      effects: 1.2
+    clips_per_active_stem:
+      speech: [1, 2]
+      music: [1, 1]
+      effects: [1, 4]
+    short_clip_policy: concatenate
+    same_stem_placement:
+      mode: random_sequential
+      initial_offset_sec_range: [0.0, 0.5]
+      gap_sec_range: [0.0, 0.5]
+      overlap_sec_range: [0.0, 0.25]
+      allow_self_overlap: true
+      max_self_overlap: 2
+    stem_gain_db:
+      speech: [-6, 6]
+      music: [-8, 4]
+      effects: [-10, 6]
+    stem_snr_db:
+      enabled: true
+      anchor: random_active
+      range:
+        speech: [-3, 9]
+        music: [-6, 6]
+        effects: [-9, 6]
+    normalize_sources: false
+    source_activity_threshold: 0.0
+    crop_retry: 1
+    peak_norm_db: -1.0
+    peak_norm_mode: scale_down
+
+teacher_model:
+  _target_: spectral_feature_compression.core.model.proposed_separation_models.build_source_aware_sfc_locoformer_teacher_system
+  n_fft: ${n_fft}
+  hop_length: ${hop_length}
+  fs: ${sr}
+  n_src: ${n_src}
+  n_chan: ${n_chan}
+  n_bands: 80
+  band_config: musical
+  d_inner: 112
+  d_model: 144
+  encoder_heads: 4
+  n_shared_layers: 4
+  n_source_layers: 4
+  n_heads: 8
+  source_attention_heads: 4
+  attention_dim: 144
+  ffn_type: [swiglu_conv1d, swiglu_conv1d]
+  ffn_hidden_dim: [224, 224]
+  conv1d_kernel: 8
+  conv1d_shift: 1
+  num_groups: 8
+  dropout: 0.1
+  tf_order: ft
+  flash_attention: true
+  decoder_feature_channels: 16
+  residual_scale_init: 0.05
+  layer_scale_init: 0.1
+  checkpointing: true
+  scaling: true
+  css_segment_size: 12
+  css_shift_size: 6
+  css_batch_size: 1
+
+task:
+  _target_: spectral_feature_compression.core.tasks.composite_sup_task.CompositeSupTask
+  n_fft: ${n_fft}
+  hop_length: ${hop_length}
+  fs: ${sr}
+  css_validation: true
+  pretrained_model_path: null
+  ema_weight: 0.999
+  ema_update_freq: 1
+  model: ${teacher_model}
+  loss:
+    _target_: spectral_feature_compression.core.loss.snr.ThresSNRLossWithInactiveSource
+    solve_perm: false
+    n_src: ${n_src}
+    zeroref_weight: 0.1
+    only_denominator: false
+  # Hard complex-STFT projection in Run C makes the soft waveform term redundant.
+  mixture_consistency_weight: 0.0
+  low_frequency_weight: 0.2
+  low_frequency_hz: 300.0
+  complex_ri_weight: 0.5
+  log_magnitude_weight: 0.2
+  multi_resolution_stft_weight: 0.3
+  multi_resolution_stft_resolutions:
+    - [512, 128]
+    - [1024, 256]
+    - [2048, 512]
+  transient_weight: 0.08
+  normalize_active_sources_for_aux_loss: false
+  aux_activity_threshold_db: -60.0
+  normalize_mixture_consistency: false
+  optimizer_config:
+    _target_: aiaccel.torch.lightning.OptimizerConfig
+    optimizer_generator:
+      _partial_: true
+      _target_: torch.optim.AdamW
+      lr: 1.0e-3
+      weight_decay: 1.0e-2
+      betas: [0.9, 0.999]
+    scheduler_generator:
+      _partial_: true
+      _target_: spectral_feature_compression.common.lr_schedulers.warmup.WarmUpStepLR
+      warmup_steps: 5000
+      decay_start_step: 101550
+      decay_stop_step: 203100
+      step_size: 1354
+      decay: 0.96
+    scheduler_interval: step

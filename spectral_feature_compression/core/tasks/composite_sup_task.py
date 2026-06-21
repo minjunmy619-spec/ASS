@@ -31,6 +31,9 @@ class CompositeSupTask(SupTask):
         multi_resolution_stft_weight: float = 0.0,
         multi_resolution_stft_resolutions=None,
         transient_weight: float = 0.0,
+        normalize_active_sources_for_aux_loss: bool = False,
+        aux_activity_threshold_db: float = -60.0,
+        normalize_mixture_consistency: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -38,6 +41,9 @@ class CompositeSupTask(SupTask):
         self.mixture_consistency_weight = float(mixture_consistency_weight)
         self.low_frequency_weight = float(low_frequency_weight)
         self.low_frequency_hz = float(low_frequency_hz)
+        self.normalize_active_sources_for_aux_loss = bool(normalize_active_sources_for_aux_loss)
+        self.aux_activity_threshold_db = float(aux_activity_threshold_db)
+        self.normalize_mixture_consistency = bool(normalize_mixture_consistency)
         self.composite_loss = CompositeSeparationSpectralLoss(
             n_fft=self.stft[0].n_fft,
             hop_length=self.stft[0].hop_length,
@@ -47,6 +53,35 @@ class CompositeSupTask(SupTask):
             multi_resolution_stft_resolutions=multi_resolution_stft_resolutions,
             transient_weight=transient_weight,
         )
+
+    def _prepare_auxiliary_sources(
+        self,
+        wav: torch.Tensor,
+        est: torch.Tensor,
+        ref: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.normalize_active_sources_for_aux_loss:
+            return est, ref
+
+        est = est.float()
+        ref = ref.float()
+        wav = wav.float()
+        eps = 1.0e-8
+        ref_rms = ref.square().mean(dim=(-1, -2), keepdim=True).sqrt()
+        mix_rms = wav.square().mean(dim=(-1, -2), keepdim=True).sqrt().unsqueeze(1)
+        activity_ratio = ref_rms / mix_rms.clamp_min(eps)
+        activity_threshold = 10.0 ** (self.aux_activity_threshold_db / 20.0)
+        active = (mix_rms > eps) & activity_ratio.ge(activity_threshold)
+        scale = ref_rms.detach().clamp_min(eps)
+        active_mask = active.squeeze(-1).squeeze(-1)
+        return (est / scale)[active_mask], (ref / scale)[active_mask]
+
+    def _mixture_consistency_l1(self, wav: torch.Tensor, est: torch.Tensor) -> torch.Tensor:
+        est_mix = est.sum(dim=1)
+        if not self.normalize_mixture_consistency:
+            return F.l1_loss(est_mix, wav)
+        scale = wav.float().square().mean(dim=(-1, -2), keepdim=True).sqrt().detach().clamp_min(1.0e-8)
+        return F.l1_loss(est_mix.float() / scale, wav.float() / scale)
 
     def _low_frequency_l1(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         if self.fs is None:
@@ -68,18 +103,24 @@ class CompositeSupTask(SupTask):
             f"{log_prefix}/loss_supervised": supervised_loss,
         }
 
+        aux_est, aux_ref = self._prepare_auxiliary_sources(wav, est, ref)
+
         if self.mixture_consistency_weight > 0.0:
-            mixture_loss = F.l1_loss(est.sum(dim=1), wav)
+            mixture_loss = self._mixture_consistency_l1(wav, est)
             loss = loss + self.mixture_consistency_weight * mixture_loss
             log_dict[f"{log_prefix}/loss_mixture_consistency"] = mixture_loss
 
         if self.low_frequency_weight > 0.0:
-            low_freq_loss = self._low_frequency_l1(est, ref)
+            low_freq_loss = self._low_frequency_l1(aux_est, aux_ref) if aux_est.shape[0] > 0 else est.sum() * 0.0
             loss = loss + self.low_frequency_weight * low_freq_loss
             log_dict[f"{log_prefix}/loss_low_frequency"] = low_freq_loss
 
         if self.composite_loss.enabled:
-            composite_loss, component_losses = self.composite_loss(est, ref)
+            if aux_est.shape[0] > 0:
+                composite_loss, component_losses = self.composite_loss(aux_est, aux_ref)
+            else:
+                composite_loss = est.sum() * 0.0
+                component_losses = {}
             loss = loss + composite_loss
             log_dict[f"{log_prefix}/loss_composite_spectral"] = composite_loss
             for name, value in component_losses.items():

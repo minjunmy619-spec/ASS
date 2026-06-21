@@ -47,12 +47,17 @@ from spectral_feature_compression.core.model.source_aware_melband_student_sfc_2d
 from spectral_feature_compression.core.model.source_aware_residual_sfc_2d import (
     build_source_aware_residual_sfc_system as _build_source_aware_residual_sfc_system,
 )
+from spectral_feature_compression.core.model.source_aware_sfc_locoformer_teacher import (
+    build_source_aware_sfc_locoformer_teacher_system as _build_source_aware_sfc_locoformer_teacher_system,
+)
 from spectral_feature_compression.core.model.source_split_sfc_2d import (
     build_source_split_sfc_system as _build_source_split_sfc_system,
 )
 from spectral_feature_compression.core.model.sparse_unet_mel_sfc_2d import (
     build_sparse_unet_mel_sfc_system as _build_sparse_unet_mel_sfc_system,
 )
+
+build_source_aware_sfc_locoformer_teacher_system = _build_source_aware_sfc_locoformer_teacher_system
 
 
 def build_sfc_locoformer_lite_plus_system(
@@ -69,11 +74,13 @@ def build_sfc_locoformer_lite_plus_system(
     d_model: int = 96,
     n_layers: int = 4,
     n_heads: int = 4,
+    encoder_heads: int | None = None,
     attention_dim: int | None = None,
     ffn_type: str | Sequence[str] = ("swiglu_conv1d", "swiglu_conv1d"),
     ffn_hidden_dim: int | Sequence[int] | None = None,
     conv1d_kernel: int = 8,
     conv1d_shift: int = 1,
+    num_groups: int = 4,
     dropout: float = 0.1,
     flash_attention: bool = True,
     masking: bool = True,
@@ -86,6 +93,7 @@ def build_sfc_locoformer_lite_plus_system(
     """Proposal A: SFC-CA encoder/decoder with a compact TF-Locoformer core."""
 
     attention_dim = d_model if attention_dim is None else attention_dim
+    encoder_heads = n_heads if encoder_heads is None else encoder_heads
     ffn_type_arg: str | Sequence[str]
     if isinstance(ffn_type, str):
         ffn_type_arg = [ffn_type]
@@ -106,8 +114,8 @@ def build_sfc_locoformer_lite_plus_system(
         n_bands=n_bands,
         band_config=band_config,
         query_type=query_type,
-        n_heads=n_heads,
-        slope=[1] * n_heads,
+        n_heads=encoder_heads,
+        slope=[1] * encoder_heads,
         learnable_slope=False,
         learnable_pos_bias=True,
         mask_outside_bands=False,
@@ -122,8 +130,8 @@ def build_sfc_locoformer_lite_plus_system(
         n_bands=n_bands,
         band_config=band_config,
         query_type=query_type,
-        n_heads=n_heads,
-        slope=[1] * n_heads,
+        n_heads=encoder_heads,
+        slope=[1] * encoder_heads,
         learnable_slope=False,
         learnable_pos_bias=True,
         mask_outside_bands=False,
@@ -136,7 +144,7 @@ def build_sfc_locoformer_lite_plus_system(
         n_layers=n_layers,
         emb_dim=d_model,
         norm_type="rmsgroupnorm",
-        num_groups=4,
+        num_groups=num_groups,
         tf_order="ft",
         n_heads=n_heads,
         flash_attention=flash_attention,

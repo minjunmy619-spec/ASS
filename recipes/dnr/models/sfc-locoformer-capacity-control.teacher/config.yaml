@@ -1,0 +1,42 @@
+_base_: ../source-aware-sfc-locoformer.teacher/config.yaml
+
+# Run B: capacity-matched late-split control. Data, losses, optimizer, seed, and
+# update budget are inherited unchanged from Run C.
+working_directory: ./logs/sfc-locoformer-capacity-control-teacher
+
+capacity_model:
+  _target_: spectral_feature_compression.core.model.proposed_separation_models.build_sfc_locoformer_lite_plus_system
+  n_fft: ${n_fft}
+  hop_length: ${hop_length}
+  fs: ${sr}
+  n_src: ${n_src}
+  n_chan: ${n_chan}
+  n_bands: 80
+  band_config: musical
+  query_type: learnable
+  d_inner: 112
+  d_model: 144
+  n_layers: 8
+  n_heads: 8
+  encoder_heads: 4
+  attention_dim: 144
+  ffn_type: [swiglu_conv1d, swiglu_conv1d]
+  ffn_hidden_dim: [224, 224]
+  conv1d_kernel: 8
+  conv1d_shift: 1
+  num_groups: 8
+  dropout: 0.1
+  flash_attention: true
+  masking: true
+  checkpointing: true
+  scaling: true
+  css_segment_size: 12
+  css_shift_size: 6
+  css_batch_size: 1
+
+# Replace the inherited mapping instead of recursively merging incompatible
+# source-aware builder arguments into this late-split builder.
+teacher_model: ${capacity_model}
+
+task:
+  mixture_consistency_weight: 0.1

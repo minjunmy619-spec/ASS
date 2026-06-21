@@ -52,7 +52,17 @@ class EncoderBase(nn.Module):
 
         self._instantiate_conv_layers()
 
-        assert band_config in ["musical", "tribark", "bark", "erb", "mel"]
+        assert band_config in [
+            "musical",
+            "tribark",
+            "bark",
+            "erb",
+            "mel",
+            "vocal",
+            "speech_vocal",
+            "vocal64",
+            "speech_vocal64",
+        ]
         self.band_indices, _, _ = get_band_specs(band_config, n_fft, sample_rate, n_bands=n_bands)
 
         # check if all the frequency bins are included
@@ -179,7 +189,17 @@ class DecoderBase(nn.Module):
         self._instantiate_conv_layers()
 
         # query position setup
-        assert band_config in ["musical", "tribark", "bark", "erb", "mel"]
+        assert band_config in [
+            "musical",
+            "tribark",
+            "bark",
+            "erb",
+            "mel",
+            "vocal",
+            "speech_vocal",
+            "vocal64",
+            "speech_vocal64",
+        ]
         self.band_indices, _, _ = get_band_specs(band_config, n_fft, sample_rate, n_bands=n_bands)
 
         # check if all the frequency bins are included

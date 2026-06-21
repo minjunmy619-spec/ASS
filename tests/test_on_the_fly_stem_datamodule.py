@@ -106,6 +106,67 @@ def test_on_the_fly_stem_dataset_returns_fixed_duration_and_consistent_mix(tmp_p
     assert torch.count_nonzero(ref[:, 0].abs().sum(dim=-1)).item() == 3
 
 
+def test_on_the_fly_stem_dataset_normalizes_active_sources_before_gain(tmp_path: Path) -> None:
+    pools = _make_source_pools(tmp_path)
+    synthesis = _base_synthesis()
+    synthesis["normalize_sources"] = True
+    dataset = OnTheFlyStemDataset(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=1.0,
+        dataset_length=1,
+        seed=123,
+        **synthesis,
+    )
+
+    wav, ref, _ = cast(tuple[torch.Tensor, torch.Tensor, dict[str, Any]], dataset[0])
+    source_rms = ref[:, 0].square().mean(dim=-1).sqrt()
+
+    torch.testing.assert_close(source_rms, torch.ones_like(source_rms), rtol=1.0e-5, atol=1.0e-5)
+    torch.testing.assert_close(wav, ref.sum(dim=0), rtol=0.0, atol=0.0)
+
+
+def test_on_the_fly_stem_dataset_retries_inactive_crops(tmp_path: Path) -> None:
+    pools = _make_source_pools(tmp_path)
+    path = tmp_path / "speech" / "speech_activity.wav"
+    samples = np.concatenate((np.zeros(2000, dtype=np.float32), np.full(2000, 0.5, dtype=np.float32)))
+    sf.write(path, samples, 8000)
+    dataset = OnTheFlyStemDataset(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.125,
+        dataset_length=1,
+        source_activity_threshold=0.1,
+        crop_retry=2,
+    )
+
+    class SequenceRng:
+        def __init__(self) -> None:
+            self.starts = iter((0, 3000))
+
+        def randint(self, _lo: int, _hi: int) -> int:
+            return next(self.starts)
+
+    audio = dataset._load_audio(path, SequenceRng(), max_samples=1000)  # type: ignore[arg-type]
+
+    assert float(audio.square().mean().sqrt().item()) >= 0.49
+
+    dataset.source_activity_threshold = 1.0
+
+    class FallbackRng:
+        def __init__(self) -> None:
+            self.starts = iter((0, 1500))
+
+        def randint(self, _lo: int, _hi: int) -> int:
+            return next(self.starts)
+
+    fallback = dataset._load_audio(path, FallbackRng(), max_samples=1000)  # type: ignore[arg-type]
+
+    assert float(fallback.square().mean().sqrt().item()) >= 0.3
+
+
 def test_on_the_fly_stem_dataset_loads_sources_from_manifest_csv(tmp_path: Path) -> None:
     _make_source_pools(tmp_path)
     for stem in _STEMS:

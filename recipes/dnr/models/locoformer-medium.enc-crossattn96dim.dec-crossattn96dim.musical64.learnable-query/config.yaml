@@ -1,72 +1,168 @@
 _base_: ../locoformer-small.enc-crossattn64dim.dec-crossattn64dim.musical64.learnable-query/config.yaml
 
-
 emb_dim: 128
 
+sr: 24000
+n_fft: 2048
+hop_length: 512
+
+trainer:
+    _target_: spectral_feature_compression.common.seeded_trainer.build_seeded_trainer
+    seed: ${seed}
+    max_epochs: 20
+    gradient_clip_val: 5.0
+    use_distributed_sampler: true
+
+# Use an interpolation to replace, rather than merge with, the inherited HDF5
+# datamodule mapping.
+teacher_datamodule:
+    _target_: spectral_feature_compression.common.datamodules.on_the_fly_stem_datamodule.OnTheFlyStemDataModule
+    sr: ${sr}
+    duration: 6.0
+    batch_size: 4
+    val_batch_size: 1
+    num_workers: 4
+    dataset_length: 200000
+    val_dataset_length: 2000
+    source_order: [speech, music, effects]
+    source_pools:
+        speech:
+            - /data1/speech1
+            - /data1/speech2
+        music:
+            - /data1/music1
+            - /data1/music2
+        effects:
+            - /data1/effects1
+            - /data1/effects2
+            - /data1/effects3
+    synthesis:
+        backend: dry_mix
+        mixture_duration: ${teacher_datamodule.duration}
+        active_stem_count:
+            mode: weighted
+            weights:
+                0: 0.00
+                1: 0.01
+                2: 0.14
+                3: 0.85
+        clips_per_active_stem:
+            speech: [1, 2]
+            music: [1, 1]
+            effects: [1, 4]
+        short_clip_policy: concatenate
+        same_stem_placement:
+            mode: random_sequential
+            initial_offset_sec_range: [0.0, 0.5]
+            gap_sec_range: [0.0, 0.5]
+            overlap_sec_range: [0.0, 0.25]
+            allow_self_overlap: true
+            max_self_overlap: 2
+        stem_gain_db:
+            speech: [-6, 6]
+            music: [-8, 4]
+            effects: [-10, 6]
+        normalize_sources: true
+        source_activity_threshold: 1.0e-4
+        crop_retry: 16
+        peak_norm_db: -1.0
+        peak_norm_mode: scale_down
+
+datamodule: ${teacher_datamodule}
+
 task:
-  model:
+    _target_: spectral_feature_compression.core.tasks.composite_sup_task.CompositeSupTask
+    fs: ${sr}
+    # Required at launch, for example:
+    # task.pretrained_model_path=/path/to/current-best.ckpt
+    pretrained_model_path: ???
+    ema_weight: 0.999
+    ema_update_freq: 1
+    mixture_consistency_weight: 0.1
+    low_frequency_weight: 0.2
+    low_frequency_hz: 300.0
+    complex_ri_weight: 0.5
+    log_magnitude_weight: 0.2
+    multi_resolution_stft_weight: 0.3
+    multi_resolution_stft_resolutions:
+        - [512, 128]
+        - [1024, 256]
+        - [2048, 512]
+    transient_weight: 0.08
+    normalize_active_sources_for_aux_loss: true
+    aux_activity_threshold_db: -60.0
+    normalize_mixture_consistency: true
     model:
-      _target_: spectral_feature_compression.core.model.bslocoformer.BSLocoformer
-      n_src: ${n_src}
-      n_chan: &n_chan 2
+        model:
+            _target_: spectral_feature_compression.core.model.bslocoformer.BSLocoformer
+            n_src: ${n_src}
+            n_chan: &n_chan 2
 
-      n_layers: 6
-      # general setup
-      emb_dim: ${emb_dim}
-      norm_type: rmsgroupnorm
-      num_groups: 8  # used only in RMSGroupNorm
-      tf_order: ft
-      # self-attention related
-      n_heads: 8
-      flash_attention: true  # available when using mixed precision
-      attention_dim: 128
-      # ffn related
-      ffn_type: 
-        - swiglu_conv1d
-        - swiglu_conv1d
-      ffn_hidden_dim: 
-        - 192
-        - 192
-      conv1d_kernel: 8
-      conv1d_shift: 1
-      dropout: 0.1
-      # others
-      eps: 1.0e-5
+            n_layers: 6
+            # general setup
+            emb_dim: ${emb_dim}
+            norm_type: rmsgroupnorm
+            num_groups: 8 # used only in RMSGroupNorm
+            tf_order: ft
+            # self-attention related
+            n_heads: 8
+            flash_attention: true # available when using mixed precision
+            attention_dim: 128
+            # ffn related
+            ffn_type:
+                - swiglu_conv1d
+                - swiglu_conv1d
+            ffn_hidden_dim:
+                - 192
+                - 192
+            conv1d_kernel: 8
+            conv1d_shift: 1
+            dropout: 0.1
+            # others
+            eps: 1.0e-5
 
-      encoder:
-        _target_: spectral_feature_compression.core.model.crossattn_enc_dec.CrossAttnEncoder
-        # general SFC config
-        d_inner: &d_inner 96
-        d_model: ${emb_dim}
-        n_chan: ${n_chan}
-        sample_rate: ${sr}
-        n_fft: ${n_fft}
-        n_bands: &n_bands 64
-        band_config: &band_config musical
-        query_type: &query_type learnable
-        # cross-attention related
-        n_heads: &n_heads 4
-        slope: &slope  [1, 1, 1, 1]
-        learnable_slope: &learnable_slope false
-        learnable_pos_bias: &learnable_pos_bias true
-        mask_outside_bands: &mask_outside_bands false
-        
+            encoder:
+                _target_: spectral_feature_compression.core.model.crossattn_enc_dec.CrossAttnEncoder
+                # general SFC config
+                d_inner: &d_inner 96
+                d_model: ${emb_dim}
+                n_chan: ${n_chan}
+                sample_rate: ${sr}
+                n_fft: ${n_fft}
+                n_bands: &n_bands 64
+                band_config: &band_config musical
+                query_type: &query_type learnable
+                # cross-attention related
+                n_heads: &n_heads 4
+                slope: &slope [1, 1, 1, 1]
+                learnable_slope: &learnable_slope false
+                learnable_pos_bias: &learnable_pos_bias true
+                mask_outside_bands: &mask_outside_bands false
 
-      decoder:
-        _target_: spectral_feature_compression.core.model.crossattn_enc_dec.CrossAttnDecoder
-        # general SFC config
-        d_inner: *d_inner
-        d_model: ${emb_dim}
-        n_src: ${n_src}
-        n_chan: ${n_chan}
-        sample_rate: ${sr}
-        n_fft: ${n_fft}
-        n_bands: *n_bands
-        band_config: *band_config
-        query_type: *query_type
-        # cross-attention related
-        n_heads: *n_heads
-        slope: *slope
-        learnable_slope: *learnable_slope
-        learnable_pos_bias: *learnable_pos_bias
-        mask_outside_bands: *mask_outside_bands
+            decoder:
+                _target_: spectral_feature_compression.core.model.crossattn_enc_dec.CrossAttnDecoder
+                # general SFC config
+                d_inner: *d_inner
+                d_model: ${emb_dim}
+                n_src: ${n_src}
+                n_chan: ${n_chan}
+                sample_rate: ${sr}
+                n_fft: ${n_fft}
+                n_bands: *n_bands
+                band_config: *band_config
+                query_type: *query_type
+                # cross-attention related
+                n_heads: *n_heads
+                slope: *slope
+                learnable_slope: *learnable_slope
+                learnable_pos_bias: *learnable_pos_bias
+                mask_outside_bands: *mask_outside_bands
+
+    optimizer_config:
+        optimizer_generator:
+            _partial_: true
+            _target_: torch.optim.AdamW
+            lr: 1.0e-4
+            weight_decay: 1.0e-2
+            betas: [0.9, 0.999]
+        scheduler_generator: null

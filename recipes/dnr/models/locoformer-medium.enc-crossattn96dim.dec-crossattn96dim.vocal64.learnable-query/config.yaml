@@ -1,0 +1,83 @@
+_base_: ../locoformer-medium.enc-crossattn96dim.dec-crossattn96dim.musical64.learnable-query/config.yaml
+
+# Speech/vocal-emphasis SFC bands for the 24 kHz teacher.
+# This keeps 64 bands but allocates more resolution to vocal F0/formants,
+# intelligibility, and sibilance/cymbal-confuser regions than musical64.
+teacher_datamodule:
+    synthesis:
+        # Replace full-window RMS normalization with source-specific robust
+        # normalization.  This avoids boosting sparse pseudo-separated vocal
+        # gap noise while still keeping source levels controllable.
+        normalize_sources: true
+        source_normalization:
+            target_rms: 1.0
+            mode:
+                speech: percentile_rms
+                music: full_rms
+                effects: percentile_rms
+            top_percent:
+                speech: 50.0
+                effects: 30.0
+            frame_ms: 40.0
+            hop_ms: 20.0
+            max_gain_db:
+                speech: 12.0
+                music: 8.0
+                effects: 10.0
+            # If the selected normalization RMS is below this level, do not
+            # boost the stem.  This protects against mostly-silent or noisy
+            # pseudo-label vocal clips being normalized up into audible targets.
+            min_rms_db:
+                speech: -45.0
+                music: -55.0
+                effects: -50.0
+        # Explicit SNR control after robust normalization.  Positive values mean
+        # the speech anchor is louder than the target stem; negative values allow
+        # realistic song cases where instrumental can be louder than vocal.
+        stem_snr_db:
+            enabled: true
+            anchor: speech
+            # If the speech anchor was intentionally not boosted because it is
+            # too quiet/noisy, do not force all other stems to match that tiny
+            # level.  Keep the independently sampled gains instead.
+            anchor_min_rms_db: -45.0
+            range:
+                music: [-6, 6]
+                effects: [-9, 6]
+
+task:
+    _target_: spectral_feature_compression.core.tasks.vocal_aware_sup_task.VocalAwareCompositeSupTask
+    # Speech/vocal-aware robust auxiliary losses for noisy song-vocal labels.
+    # Soft truncation prevents pseudo-label artifacts from dominating, while
+    # gradient losses improve temporal/harmonic smoothness and leakage loss keeps
+    # vocal gaps clean.
+    speech_source_index: 0
+    speech_robust_logmag_weight: 0.05
+    speech_robust_logmag_tau: 1.0
+    speech_robust_logmag_resolutions:
+        - [512, 128]
+        - [1024, 256]
+        - [2048, 512]
+    vocal_active_frame_weight: 2.0
+    speech_temporal_logmag_gradient_weight: 0.03
+    speech_frequency_logmag_gradient_weight: 0.02
+    speech_gradient_tau: 1.0
+    speech_inactive_leakage_weight: 0.05
+    speech_inactive_threshold_db: -45.0
+    speech_inactive_softness_db: 6.0
+    loss:
+        zeroref_weight: 0.5
+    model:
+        model:
+            # The on-the-fly stem dataset returns mono wav/ref tensors.  The
+            # inherited medium config set this field to 2, so force it back to
+            # the root n_chan inherited from the small/base config.
+            n_chan: ${n_chan}
+            encoder:
+                n_chan: ${n_chan}
+                n_bands: &n_bands 64
+                band_config: &band_config vocal64
+            decoder:
+                n_chan: ${n_chan}
+                n_bands: *n_bands
+                band_config: *band_config

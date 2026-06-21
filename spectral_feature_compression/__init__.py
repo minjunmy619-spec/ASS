@@ -79,6 +79,7 @@ _EXPORTS = {
     "RotarySelfAttention": f"{_MODEL}.source_aware_melband_roformer",
     "SourceAwareMelBandRoformer2D": f"{_MODEL}.source_aware_melband_roformer",
     "SourceAwareMelBandRoformerModel": f"{_MODEL}.source_aware_melband_roformer",
+    "SourceAwareSFCLocoformerTeacher": f"{_MODEL}.source_aware_sfc_locoformer_teacher",
     "SourceAwareLocoCNBBlock2d": f"{_MODEL}.source_aware_melband_loco_cnb_student_sfc_2d",
     "SourceCompetitiveDecoder2d": f"{_MODEL}.source_aware_melband_student_sfc_2d",
     "SourceCompetitiveDecoderBlock2d": f"{_MODEL}.source_aware_melband_student_sfc_2d",

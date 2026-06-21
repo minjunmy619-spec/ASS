@@ -1,0 +1,41 @@
+_base_: ../source-aware-sfc-locoformer.teacher/config.yaml
+
+# Run A: current 16M late-split architecture under exactly the same training
+# controls as Runs B and C.
+working_directory: ./logs/sfc-locoformer-current-control-teacher
+
+baseline_model:
+  _target_: spectral_feature_compression.core.model.proposed_separation_models.build_sfc_locoformer_lite_plus_system
+  n_fft: ${n_fft}
+  hop_length: ${hop_length}
+  fs: ${sr}
+  n_src: ${n_src}
+  n_chan: ${n_chan}
+  n_bands: 64
+  band_config: musical
+  query_type: learnable
+  d_inner: 96
+  d_model: 128
+  n_layers: 6
+  n_heads: 8
+  encoder_heads: 4
+  attention_dim: 128
+  ffn_type: [swiglu_conv1d, swiglu_conv1d]
+  ffn_hidden_dim: [192, 192]
+  conv1d_kernel: 8
+  conv1d_shift: 1
+  num_groups: 8
+  dropout: 0.1
+  flash_attention: true
+  masking: true
+  checkpointing: true
+  scaling: true
+  css_segment_size: 12
+  css_shift_size: 6
+  css_batch_size: 1
+
+# Replace the inherited Run C model without merging incompatible arguments.
+teacher_model: ${baseline_model}
+
+task:
+  mixture_consistency_weight: 0.1

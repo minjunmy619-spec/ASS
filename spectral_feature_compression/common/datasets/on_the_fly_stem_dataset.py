@@ -14,6 +14,7 @@ from pathlib import Path
 import random
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 import torchaudio.functional as AF
@@ -148,6 +149,10 @@ class OnTheFlyStemDataset(Dataset):
         same_stem_placement: Mapping[str, Any] | None = None,
         stem_gain_db: Mapping[str, Any] | None = None,
         stem_snr_db: Mapping[str, Any] | None = None,
+        normalize_sources: bool = False,
+        source_normalization: Mapping[str, Any] | None = None,
+        source_activity_threshold: float = 0.0,
+        crop_retry: int = 1,
         peak_norm_db: float | None = -1.0,
         peak_norm_mode: str = "scale_down",
         seed: int | None = None,
@@ -196,6 +201,16 @@ class OnTheFlyStemDataset(Dataset):
         self.peak_norm_mode = str(peak_norm_mode)
         if self.peak_norm_mode not in {"scale_down", "normalize"}:
             raise ValueError(f"peak_norm_mode must be 'scale_down' or 'normalize', got {peak_norm_mode!r}")
+        self.normalize_sources = bool(normalize_sources)
+        self.source_normalization = dict(source_normalization or {})
+        self.source_activity_threshold = float(source_activity_threshold)
+        self.crop_retry = int(crop_retry)
+        if self.source_activity_threshold < 0.0:
+            raise ValueError(
+                f"source_activity_threshold must be non-negative, got {source_activity_threshold}"
+            )
+        if self.crop_retry <= 0:
+            raise ValueError(f"crop_retry must be positive, got {crop_retry}")
 
         extensions = tuple(
             ext.lower() if str(ext).startswith(".") else f".{str(ext).lower()}" for ext in file_extensions
@@ -221,6 +236,7 @@ class OnTheFlyStemDataset(Dataset):
         self.placement = self._parse_placement(same_stem_placement)
         self.stem_gain_db = dict(stem_gain_db or {})
         self.stem_snr_db = dict(stem_snr_db or {})
+        self._validate_source_normalization_config()
 
     def _scan_source_pools(
         self,
@@ -375,18 +391,30 @@ class OnTheFlyStemDataset(Dataset):
         # Read only a needed crop when possible.  If resampling is needed, read a
         # proportional crop and trim/pad after resampling.
         read_frames = min(info.frames, max(1, int(math.ceil(max_samples * source_sr / self.sr))))
-        start = 0
-        if info.frames > read_frames:
-            start = rng.randint(0, info.frames - read_frames)
-        audio_np, _ = sf.read(path, start=start, frames=read_frames, always_2d=True, dtype="float32")
-        if audio_np.size == 0:
+        attempts = self.crop_retry if self.source_activity_threshold > 0.0 and info.frames > read_frames else 1
+        best_audio: torch.Tensor | None = None
+        best_rms = -1.0
+        for _ in range(attempts):
+            start = rng.randint(0, info.frames - read_frames) if info.frames > read_frames else 0
+            audio_np, _ = sf.read(path, start=start, frames=read_frames, always_2d=True, dtype="float32")
+            if audio_np.size == 0:
+                continue
+            audio = torch.from_numpy(audio_np.T.copy()).float().mean(dim=0, keepdim=True)
+            if source_sr != self.sr:
+                audio = AF.resample(audio, orig_freq=source_sr, new_freq=self.sr)
+            if audio.shape[-1] > max_samples:
+                audio = audio[..., :max_samples]
+            audio = audio.squeeze(0)
+            rms = float(audio.square().mean().sqrt().item()) if audio.numel() > 0 else 0.0
+            if rms > best_rms:
+                best_audio = audio
+                best_rms = rms
+            if rms >= self.source_activity_threshold:
+                return audio
+
+        if best_audio is None:
             raise ValueError(f"Could not read audio from {path}")
-        audio = torch.from_numpy(audio_np.T.copy()).float().mean(dim=0, keepdim=True)
-        if source_sr != self.sr:
-            audio = AF.resample(audio, orig_freq=source_sr, new_freq=self.sr)
-        if audio.shape[-1] > max_samples:
-            audio = audio[..., :max_samples]
-        return audio.squeeze(0)
+        return best_audio
 
     def _sample_audio(self, stem: str, rng: random.Random) -> tuple[torch.Tensor, Path]:
         path = rng.choice(self.source_files[stem])
@@ -501,6 +529,130 @@ class OnTheFlyStemDataset(Dataset):
             gain_db = _sample_uniform(rng, gain_range)
             stems[stem_idx] *= float(10.0 ** (gain_db / 20.0))
 
+    def _normalization_value_for_key(self, key: str, stem_name: str, default: Any) -> Any:
+        value = self.source_normalization.get(key, default)
+        if isinstance(value, Mapping):
+            return value.get(stem_name, default)
+        return value
+
+    def _validate_source_normalization_config(self) -> None:
+        if not self.source_normalization:
+            return
+        valid_mapping_fields = {
+            "mode",
+            "target_rms",
+            "frame_ms",
+            "hop_ms",
+            "activity_threshold_db",
+            "top_percent",
+            "max_gain_db",
+            "min_gain_db",
+            "min_rms_db",
+        }
+        for field, value in self.source_normalization.items():
+            if isinstance(value, Mapping):
+                if field not in valid_mapping_fields:
+                    raise ValueError(
+                        f"source_normalization.{field} is a per-source mapping, but only "
+                        f"{sorted(valid_mapping_fields)} support per-source mappings"
+                    )
+                _validate_mapping_keys(value, self.source_order, name=f"source_normalization.{field}")
+
+        valid_modes = {"full_rms", "active_rms", "percentile_rms", "none"}
+        mode_cfg = self.source_normalization.get("mode", "full_rms")
+        modes = mode_cfg.values() if isinstance(mode_cfg, Mapping) else [mode_cfg]
+        for mode in modes:
+            if str(mode) not in valid_modes:
+                raise ValueError(f"source_normalization.mode must be one of {sorted(valid_modes)}, got {mode!r}")
+
+        for stem_name in self.source_order:
+            target_rms = float(self._normalization_value_for_key("target_rms", stem_name, 1.0))
+            if target_rms <= 0.0:
+                raise ValueError(f"source_normalization.target_rms for {stem_name!r} must be positive")
+            frame_ms = float(self._normalization_value_for_key("frame_ms", stem_name, 40.0))
+            hop_ms = float(self._normalization_value_for_key("hop_ms", stem_name, 20.0))
+            if frame_ms <= 0.0 or hop_ms <= 0.0:
+                raise ValueError(f"source_normalization frame_ms/hop_ms for {stem_name!r} must be positive")
+            top_percent = float(self._normalization_value_for_key("top_percent", stem_name, 50.0))
+            if not 0.0 < top_percent <= 100.0:
+                raise ValueError(f"source_normalization.top_percent for {stem_name!r} must be in (0, 100]")
+
+    def _frame_rms(self, stem: torch.Tensor, frame_size: int, hop_size: int) -> torch.Tensor:
+        if stem.numel() < frame_size:
+            padded = F.pad(stem, (0, frame_size - stem.numel()))
+            frames = padded.unfold(0, frame_size, hop_size)
+        else:
+            frames = stem.unfold(0, frame_size, hop_size)
+            tail_start = max(0, stem.numel() - frame_size)
+            if frames.shape[0] == 0 or tail_start > (frames.shape[0] - 1) * hop_size:
+                frames = torch.cat([frames, stem[tail_start:].unfold(0, frame_size, hop_size)], dim=0)
+        return frames.float().square().mean(dim=-1).sqrt()
+
+    def _source_rms_for_normalization(self, stem: torch.Tensor, stem_name: str) -> torch.Tensor:
+        mode = str(self._normalization_value_for_key("mode", stem_name, "full_rms"))
+        eps = stem.new_tensor(1.0e-8)
+        if mode == "none":
+            return stem.new_zeros(())
+        if mode == "full_rms":
+            return stem.float().square().mean().sqrt()
+
+        frame_ms = float(self._normalization_value_for_key("frame_ms", stem_name, 40.0))
+        hop_ms = float(self._normalization_value_for_key("hop_ms", stem_name, 20.0))
+        frame_size = max(1, int(round(frame_ms * self.sr / 1000.0)))
+        hop_size = max(1, int(round(hop_ms * self.sr / 1000.0)))
+        frame_rms = self._frame_rms(stem, frame_size=frame_size, hop_size=hop_size)
+        if frame_rms.numel() == 0:
+            return stem.float().square().mean().sqrt()
+
+        if mode == "active_rms":
+            threshold_db = float(self._normalization_value_for_key("activity_threshold_db", stem_name, -45.0))
+            threshold = float(10.0 ** (threshold_db / 20.0))
+            selected = frame_rms[frame_rms >= threshold]
+            if selected.numel() == 0:
+                selected = frame_rms.topk(k=1).values
+            return selected.square().mean().sqrt()
+
+        if mode == "percentile_rms":
+            top_percent = float(self._normalization_value_for_key("top_percent", stem_name, 50.0))
+            if not 0.0 < top_percent <= 100.0:
+                raise ValueError(f"source_normalization.top_percent for {stem_name!r} must be in (0, 100]")
+            k = max(1, int(math.ceil(frame_rms.numel() * top_percent / 100.0)))
+            selected = frame_rms.topk(k=k, largest=True).values
+            return selected.square().mean().sqrt()
+
+        raise ValueError(f"Unsupported source normalization mode: {mode!r}")
+
+    def _normalize_active_sources(self, stems: torch.Tensor, active_stems: list[str]) -> None:
+        if not self.normalize_sources:
+            return
+        for stem_idx, stem_name in enumerate(self.source_order):
+            if stem_name not in active_stems:
+                continue
+            rms = self._source_rms_for_normalization(stems[stem_idx], stem_name)
+            if float(rms.item()) <= 0.0:
+                continue
+            rms_value = float(rms.clamp_min(1.0e-8).item())
+            target_rms = float(self._normalization_value_for_key("target_rms", stem_name, 1.0))
+            gain = target_rms / rms_value
+
+            # If the measured normalization RMS is extremely low, the source is
+            # often mostly silence or pseudo-label residue.  In that case do not
+            # boost it toward target_rms; otherwise low-level vocal-gap noise can
+            # become a strong supervised target.  Attenuation is still allowed.
+            min_rms_db = self._normalization_value_for_key("min_rms_db", stem_name, None)
+            if min_rms_db is not None:
+                min_rms = float(10.0 ** (float(min_rms_db) / 20.0))
+                if rms_value < min_rms and gain > 1.0:
+                    continue
+
+            max_gain_db = self._normalization_value_for_key("max_gain_db", stem_name, None)
+            if max_gain_db is not None:
+                gain = min(gain, float(10.0 ** (float(max_gain_db) / 20.0)))
+            min_gain_db = self._normalization_value_for_key("min_gain_db", stem_name, None)
+            if min_gain_db is not None:
+                gain = max(gain, float(10.0 ** (float(min_gain_db) / 20.0)))
+            stems[stem_idx] *= gain
+
     def _apply_relative_snr(self, stems: torch.Tensor, active_stems: list[str], rng: random.Random) -> None:
         cfg = self.stem_snr_db
         if not cfg or not bool(cfg.get("enabled", False)) or len(active_stems) < 2:
@@ -511,7 +663,13 @@ class OnTheFlyStemDataset(Dataset):
         else:
             anchor_name = anchor_cfg
         anchor_idx = self.source_order.index(anchor_name)
-        anchor_rms = stems[anchor_idx].square().mean().sqrt().clamp_min(1.0e-8)
+        anchor_rms_raw = stems[anchor_idx].square().mean().sqrt()
+        anchor_min_rms_db = cfg.get("anchor_min_rms_db", None)
+        if anchor_min_rms_db is not None:
+            anchor_min_rms = float(10.0 ** (float(anchor_min_rms_db) / 20.0))
+            if float(anchor_rms_raw.item()) < anchor_min_rms:
+                return
+        anchor_rms = anchor_rms_raw.clamp_min(1.0e-8)
         ranges = cfg.get("range", {})
         if not isinstance(ranges, Mapping):
             raise ValueError("stem_snr_db.range must be a mapping from stem name to dB range")
@@ -558,6 +716,7 @@ class OnTheFlyStemDataset(Dataset):
             stems[stem_idx] = stem_audio
             metadata["source_paths"][stem_name] = paths
 
+        self._normalize_active_sources(stems, active_stems)
         self._apply_independent_gain(stems, active_stems, rng)
         self._apply_relative_snr(stems, active_stems, rng)
         stems = self._apply_peak_norm(stems)
