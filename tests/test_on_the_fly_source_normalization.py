@@ -1,5 +1,6 @@
-import pytest
 import torch
+
+import pytest
 
 from spectral_feature_compression.common.datasets.on_the_fly_stem_dataset import OnTheFlyStemDataset
 
@@ -56,6 +57,40 @@ def test_source_normalization_rejects_unknown_per_source_key():
     ds = _dataset({"mode": {"spech": "full_rms"}})
     with pytest.raises(ValueError, match="unknown stem"):
         ds._validate_source_normalization_config()
+
+
+def test_source_normalization_rejects_unknown_scalar_field():
+    ds = _dataset({"max_gian_db": 12.0})
+    with pytest.raises(ValueError, match="unknown fields"):
+        ds._validate_source_normalization_config()
+
+
+def test_quiet_normalization_rejection_cannot_be_undone_by_random_gain():
+    ds = _dataset(
+        {
+            "target_rms": 1.0,
+            "mode": {"speech": "full_rms"},
+            "min_rms_db": {"speech": -45.0},
+            "max_gain_db": {"speech": 12.0},
+        }
+    )
+    ds.stem_gain_db = {"speech": [6.0, 6.0], "music": [0.0, 0.0]}
+    ds.stem_snr_db = {
+        "enabled": True,
+        "anchor": "speech",
+        "anchor_min_rms_db": -45.0,
+        "range": {"music": [0.0, 0.0]},
+    }
+    stems = torch.zeros(3, 1000, dtype=torch.float32)
+    stems[0] = 0.004
+    stems[1] = 1.0
+
+    snr_ineligible = ds._normalize_active_sources(stems, ["speech", "music"])
+    ds._apply_independent_gain(stems, ["speech", "music"], rng=None)
+    ds._apply_relative_snr(stems, ["speech", "music"], rng=None, snr_ineligible_stems=snr_ineligible)
+
+    assert "speech" in snr_ineligible
+    torch.testing.assert_close(stems[1], torch.ones_like(stems[1]))
 
 
 def test_relative_snr_skips_when_anchor_is_too_quiet():

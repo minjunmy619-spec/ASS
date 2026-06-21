@@ -1,5 +1,7 @@
 import torch
 
+import pytest
+
 from spectral_feature_compression.core.model.bandit_split import get_band_specs
 from spectral_feature_compression.core.model.crossattn_enc_dec import CrossAttnDecoder, CrossAttnEncoder
 
@@ -38,6 +40,12 @@ def test_speech_vocal_alias_matches_vocal64():
     vocal, _, _ = get_band_specs("vocal64", 2048, 24000, n_bands=64)
     speech_vocal, _, _ = get_band_specs("speech_vocal64", 2048, 24000, n_bands=64)
     assert speech_vocal == vocal
+
+
+@pytest.mark.parametrize("sample_rate", [16000, 44100, 48000])
+def test_vocal64_rejects_unsupported_sample_rates(sample_rate):
+    with pytest.raises(ValueError, match="fs=24000 only"):
+        get_band_specs("vocal64", 2048, sample_rate, n_bands=64)
 
 
 def test_crossattn_enc_dec_accept_vocal64():

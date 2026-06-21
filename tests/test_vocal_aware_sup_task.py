@@ -2,13 +2,14 @@ from pathlib import Path
 import sys
 
 import torch
+
 from torchaudio.transforms import Spectrogram
 
 _LOCAL_AIACCEL = Path(__file__).resolve().parents[1] / "aiaccel"
 if _LOCAL_AIACCEL.is_dir() and str(_LOCAL_AIACCEL) not in sys.path:
     sys.path.insert(0, str(_LOCAL_AIACCEL))
 
-from spectral_feature_compression.core.tasks.vocal_aware_sup_task import VocalAwareCompositeSupTask
+from spectral_feature_compression.core.tasks.vocal_aware_sup_task import VocalAwareCompositeSupTask  # noqa: E402
 
 
 def _task(**kwargs):
@@ -26,6 +27,58 @@ def _task(**kwargs):
     task.speech_robust_logmag_resolutions = kwargs.get("speech_robust_logmag_resolutions", ((256, 64),))
     task.stft = torch.nn.Sequential(Spectrogram(n_fft=256, hop_length=64, power=None))
     return task
+
+
+def _dummy_band_model(value: float) -> torch.nn.Module:
+    wrapper = torch.nn.Module()
+    wrapper.model = torch.nn.Module()
+    wrapper.model.shared = torch.nn.Parameter(torch.full((1,), value))
+    for name in ("encoder", "decoder"):
+        module = torch.nn.Module()
+        module.block = torch.nn.Module()
+        module.block.mixer = torch.nn.Module()
+        module.block.mixer.pos_bias = torch.nn.Module()
+        module.block.mixer.pos_bias.pos_bias = torch.nn.Parameter(torch.full((1,), value))
+        setattr(wrapper.model, name, module)
+    wrapper.model.encoder.query = torch.nn.Parameter(torch.full((1,), value))
+    return wrapper
+
+
+def test_vocal_warm_start_preserves_band_dependent_tensors(tmp_path: Path):
+    checkpoint_model = _dummy_band_model(1.0)
+    checkpoint_path = tmp_path / "musical.ckpt"
+    torch.save(
+        {"state_dict": {f"model.{key}": value for key, value in checkpoint_model.state_dict().items()}},
+        checkpoint_path,
+    )
+    vocal_model = _dummy_band_model(2.0)
+
+    VocalAwareCompositeSupTask(
+        model=vocal_model,
+        loss=torch.nn.L1Loss(),
+        n_fft=256,
+        hop_length=64,
+        optimizer_config=object(),
+        pretrained_model_path=str(checkpoint_path),
+        preserve_initialized_band_layout_on_pretrained_load=True,
+    )
+
+    state = vocal_model.state_dict()
+    assert state["model.shared"].item() == 1.0
+    assert state["model.encoder.query"].item() == 2.0
+    assert state["model.encoder.block.mixer.pos_bias.pos_bias"].item() == 2.0
+    assert state["model.decoder.block.mixer.pos_bias.pos_bias"].item() == 2.0
+
+    same_layout_model = _dummy_band_model(3.0)
+    VocalAwareCompositeSupTask(
+        model=same_layout_model,
+        loss=torch.nn.L1Loss(),
+        n_fft=256,
+        hop_length=64,
+        optimizer_config=object(),
+        pretrained_model_path=str(checkpoint_path),
+    )
+    assert same_layout_model.state_dict()["model.encoder.query"].item() == 1.0
 
 
 def test_soft_truncated_l1_saturates_large_errors():

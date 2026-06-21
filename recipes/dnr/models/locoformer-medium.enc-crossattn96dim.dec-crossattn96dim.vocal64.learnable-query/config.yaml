@@ -65,6 +65,9 @@ task:
     speech_inactive_leakage_weight: 0.05
     speech_inactive_threshold_db: -45.0
     speech_inactive_softness_db: 6.0
+    # The required warm-start checkpoint uses musical64. Retain the freshly
+    # initialized vocal64 encoder query and encoder/decoder position biases.
+    preserve_initialized_band_layout_on_pretrained_load: true
     loss:
         zeroref_weight: 0.5
     model:

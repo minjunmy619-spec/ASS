@@ -23,6 +23,34 @@ class VocalAwareCompositeSupTask(CompositeSupTask):
     - inactive speech leakage penalty, not truncated, to keep vocal gaps clean.
     """
 
+    _BAND_DEPENDENT_MODEL_KEYS = (
+        "model.encoder.query",
+        "model.encoder.block.mixer.pos_bias.pos_bias",
+        "model.encoder.block.mixer.pos_bias.attention_mask",
+        "model.decoder.block.mixer.pos_bias.pos_bias",
+        "model.decoder.block.mixer.pos_bias.attention_mask",
+    )
+
+    def load_pretrained_weight(self) -> None:
+        """Warm-start shared weights while retaining the configured vocal band map."""
+
+        if self.pretrained_model_path is None:
+            return
+        if not self.preserve_initialized_band_layout_on_pretrained_load:
+            super().load_pretrained_weight()
+            return
+        current_state = self.model.state_dict()
+        preserved = {
+            key: current_state[key].detach().clone()
+            for key in self._BAND_DEPENDENT_MODEL_KEYS
+            if key in current_state
+        }
+        super().load_pretrained_weight()
+        loaded_state = self.model.state_dict()
+        with torch.no_grad():
+            for key, value in preserved.items():
+                loaded_state[key].copy_(value)
+
     def __init__(
         self,
         *args,
@@ -37,8 +65,12 @@ class VocalAwareCompositeSupTask(CompositeSupTask):
         speech_inactive_leakage_weight: float = 0.0,
         speech_inactive_threshold_db: float = -45.0,
         speech_inactive_softness_db: float = 6.0,
+        preserve_initialized_band_layout_on_pretrained_load: bool = False,
         **kwargs,
     ):
+        self.preserve_initialized_band_layout_on_pretrained_load = bool(
+            preserve_initialized_band_layout_on_pretrained_load
+        )
         super().__init__(*args, **kwargs)
         self.speech_source_index = int(speech_source_index)
         self.speech_robust_logmag_weight = float(speech_robust_logmag_weight)
@@ -118,7 +150,8 @@ class VocalAwareCompositeSupTask(CompositeSupTask):
 
             if self.speech_robust_logmag_weight > 0.0:
                 err = (est_log - ref_log).abs()
-                logmag_losses.append((self._soft_truncated_l1(err, self.speech_robust_logmag_tau) * frame_weight).mean())
+                robust_error = self._soft_truncated_l1(err, self.speech_robust_logmag_tau)
+                logmag_losses.append((robust_error * frame_weight).mean())
 
             if self.speech_temporal_logmag_gradient_weight > 0.0 and est_log.shape[-1] > 1:
                 est_dt = est_log[..., 1:] - est_log[..., :-1]

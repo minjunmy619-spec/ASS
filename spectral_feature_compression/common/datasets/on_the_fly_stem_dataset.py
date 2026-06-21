@@ -538,7 +538,7 @@ class OnTheFlyStemDataset(Dataset):
     def _validate_source_normalization_config(self) -> None:
         if not self.source_normalization:
             return
-        valid_mapping_fields = {
+        valid_fields = {
             "mode",
             "target_rms",
             "frame_ms",
@@ -549,13 +549,14 @@ class OnTheFlyStemDataset(Dataset):
             "min_gain_db",
             "min_rms_db",
         }
+        unknown_fields = sorted(set(self.source_normalization) - valid_fields)
+        if unknown_fields:
+            raise ValueError(
+                f"source_normalization contains unknown fields: {unknown_fields}. "
+                f"Valid fields are: {sorted(valid_fields)}"
+            )
         for field, value in self.source_normalization.items():
             if isinstance(value, Mapping):
-                if field not in valid_mapping_fields:
-                    raise ValueError(
-                        f"source_normalization.{field} is a per-source mapping, but only "
-                        f"{sorted(valid_mapping_fields)} support per-source mappings"
-                    )
                 _validate_mapping_keys(value, self.source_order, name=f"source_normalization.{field}")
 
         valid_modes = {"full_rms", "active_rms", "percentile_rms", "none"}
@@ -590,7 +591,6 @@ class OnTheFlyStemDataset(Dataset):
 
     def _source_rms_for_normalization(self, stem: torch.Tensor, stem_name: str) -> torch.Tensor:
         mode = str(self._normalization_value_for_key("mode", stem_name, "full_rms"))
-        eps = stem.new_tensor(1.0e-8)
         if mode == "none":
             return stem.new_zeros(())
         if mode == "full_rms":
@@ -622,9 +622,10 @@ class OnTheFlyStemDataset(Dataset):
 
         raise ValueError(f"Unsupported source normalization mode: {mode!r}")
 
-    def _normalize_active_sources(self, stems: torch.Tensor, active_stems: list[str]) -> None:
+    def _normalize_active_sources(self, stems: torch.Tensor, active_stems: list[str]) -> set[str]:
+        snr_ineligible_stems: set[str] = set()
         if not self.normalize_sources:
-            return
+            return snr_ineligible_stems
         for stem_idx, stem_name in enumerate(self.source_order):
             if stem_name not in active_stems:
                 continue
@@ -643,6 +644,7 @@ class OnTheFlyStemDataset(Dataset):
             if min_rms_db is not None:
                 min_rms = float(10.0 ** (float(min_rms_db) / 20.0))
                 if rms_value < min_rms and gain > 1.0:
+                    snr_ineligible_stems.add(stem_name)
                     continue
 
             max_gain_db = self._normalization_value_for_key("max_gain_db", stem_name, None)
@@ -652,8 +654,15 @@ class OnTheFlyStemDataset(Dataset):
             if min_gain_db is not None:
                 gain = max(gain, float(10.0 ** (float(min_gain_db) / 20.0)))
             stems[stem_idx] *= gain
+        return snr_ineligible_stems
 
-    def _apply_relative_snr(self, stems: torch.Tensor, active_stems: list[str], rng: random.Random) -> None:
+    def _apply_relative_snr(
+        self,
+        stems: torch.Tensor,
+        active_stems: list[str],
+        rng: random.Random,
+        snr_ineligible_stems: set[str] | None = None,
+    ) -> None:
         cfg = self.stem_snr_db
         if not cfg or not bool(cfg.get("enabled", False)) or len(active_stems) < 2:
             return
@@ -662,6 +671,8 @@ class OnTheFlyStemDataset(Dataset):
             anchor_name = rng.choice(active_stems)
         else:
             anchor_name = anchor_cfg
+        if snr_ineligible_stems is not None and anchor_name in snr_ineligible_stems:
+            return
         anchor_idx = self.source_order.index(anchor_name)
         anchor_rms_raw = stems[anchor_idx].square().mean().sqrt()
         anchor_min_rms_db = cfg.get("anchor_min_rms_db", None)
@@ -716,9 +727,9 @@ class OnTheFlyStemDataset(Dataset):
             stems[stem_idx] = stem_audio
             metadata["source_paths"][stem_name] = paths
 
-        self._normalize_active_sources(stems, active_stems)
+        snr_ineligible_stems = self._normalize_active_sources(stems, active_stems)
         self._apply_independent_gain(stems, active_stems, rng)
-        self._apply_relative_snr(stems, active_stems, rng)
+        self._apply_relative_snr(stems, active_stems, rng, snr_ineligible_stems)
         stems = self._apply_peak_norm(stems)
 
         ref = stems[:, None, :].contiguous()

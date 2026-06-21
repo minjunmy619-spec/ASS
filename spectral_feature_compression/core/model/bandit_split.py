@@ -274,7 +274,7 @@ class SpeechVocalBandsplitSpecification(BandsplitSpecification):
 
     For ``fs=24000, nfft=2048, n_bands=64`` this produces exactly the fixed
     ranges proposed in ``sfc_teacher_song_quality_deep_research_20260620.md``.
-    For other FFT sizes/sample rates the same Hz design is converted to bins.
+    Other FFT sizes are supported at the same 24 kHz sample rate.
     """
 
     _SEGMENTS_64 = (
@@ -288,6 +288,8 @@ class SpeechVocalBandsplitSpecification(BandsplitSpecification):
 
     def __init__(self, nfft: int, fs: int, n_bands: int = 64) -> None:
         super().__init__(nfft=nfft, fs=fs)
+        if fs != 24000:
+            raise ValueError(f"SpeechVocalBandsplitSpecification supports fs=24000 only; got fs={fs}")
         if n_bands != 64:
             raise ValueError(
                 "SpeechVocalBandsplitSpecification currently supports n_bands=64 only; "
