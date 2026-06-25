@@ -111,6 +111,17 @@ def _split_model_output(output: Any) -> tuple[torch.Tensor, dict[str, Any]]:
     raise TypeError(f"Unsupported model output type: {type(output).__name__}")
 
 
+def _is_unexpected_keyword_type_error(exc: TypeError, keyword: str) -> bool:
+    message = str(exc)
+    patterns = (
+        f"unexpected keyword argument '{keyword}'",
+        f'unexpected keyword argument "{keyword}"',
+        f"got an unexpected keyword argument '{keyword}'",
+        f'got an unexpected keyword argument "{keyword}"',
+    )
+    return any(pattern in message for pattern in patterns)
+
+
 def _find_band_spec(root: nn.Module | None) -> nn.Module | None:
     if root is None:
         return None
@@ -156,6 +167,16 @@ class TeacherStudentDistillationTask(SupTask):
         source_activity_db: float = -50.0,
         source_activity_active_weight: float = 1.0,
         source_activity_inactive_weight: float = 0.25,
+        source_order: Sequence[str] | None = None,
+        source_loss_weights: Sequence[float] | Mapping[str, float] | None = None,
+        source_loss_weight_normalization: str = "subset_mean",
+        source_weighted_snr_loss_weight: float = 0.0,
+        explicit_source_loss_weight: float = 0.0,
+        residual_source_loss_weight: float = 0.0,
+        residual_source_index: int | None = None,
+        robust_label_loss_weight: float = 0.0,
+        robust_label_loss: str = "charbonnier",
+        robust_label_eps: float = 1.0e-3,
         complex_ri_weight: float = 0.0,
         log_magnitude_weight: float = 0.0,
         multi_resolution_stft_weight: float = 0.0,
@@ -163,6 +184,10 @@ class TeacherStudentDistillationTask(SupTask):
         transient_weight: float = 0.0,
         teacher_mask_loss_weight: float = 0.0,
         teacher_logit_loss_weight: float = 0.0,
+        request_model_aux: bool = False,
+        require_model_aux: bool = False,
+        mask_aux_alignment: str = "strict",
+        mask_aux_max_frame_mismatch: int = 0,
         mask_loss_eps: float = 1.0e-4,
         mask_loss_max: float = 4.0,
         latent_distillation_weight: float = 0.0,
@@ -200,6 +225,51 @@ class TeacherStudentDistillationTask(SupTask):
         )
         if latent_distillation_loss not in {"l1", "l2"}:
             raise ValueError("latent_distillation_loss must be 'l1' or 'l2'")
+        for name, value in {
+            "teacher_loss_weight": teacher_loss_weight,
+            "mixture_consistency_weight": mixture_consistency_weight,
+            "low_frequency_weight": low_frequency_weight,
+            "silent_source_weight": silent_source_weight,
+            "source_activity_loss_weight": source_activity_loss_weight,
+            "robust_label_loss_weight": robust_label_loss_weight,
+            "complex_ri_weight": complex_ri_weight,
+            "log_magnitude_weight": log_magnitude_weight,
+            "multi_resolution_stft_weight": multi_resolution_stft_weight,
+            "transient_weight": transient_weight,
+            "teacher_mask_loss_weight": teacher_mask_loss_weight,
+            "teacher_logit_loss_weight": teacher_logit_loss_weight,
+            "latent_distillation_weight": latent_distillation_weight,
+        }.items():
+            if value < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+        robust_label_loss = str(robust_label_loss).lower()
+        if robust_label_loss not in {"charbonnier", "l1"}:
+            raise ValueError("robust_label_loss must be 'charbonnier' or 'l1'")
+        if robust_label_eps <= 0.0:
+            raise ValueError(f"robust_label_eps must be positive, got {robust_label_eps}")
+        if mask_loss_eps <= 0.0:
+            raise ValueError(f"mask_loss_eps must be positive, got {mask_loss_eps}")
+        if mask_loss_max <= 0.0:
+            raise ValueError(f"mask_loss_max must be positive, got {mask_loss_max}")
+        mask_aux_alignment = str(mask_aux_alignment).lower()
+        if mask_aux_alignment not in {"strict", "shared_prefix"}:
+            raise ValueError("mask_aux_alignment must be 'strict' or 'shared_prefix'")
+        if mask_aux_max_frame_mismatch < 0:
+            raise ValueError(f"mask_aux_max_frame_mismatch must be non-negative, got {mask_aux_max_frame_mismatch}")
+        for name, value in {
+            "source_weighted_snr_loss_weight": source_weighted_snr_loss_weight,
+            "explicit_source_loss_weight": explicit_source_loss_weight,
+            "residual_source_loss_weight": residual_source_loss_weight,
+        }.items():
+            if value < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+        if residual_source_index is not None and residual_source_index < 0:
+            raise ValueError(f"residual_source_index must be non-negative, got {residual_source_index}")
+        source_loss_weight_normalization = str(source_loss_weight_normalization).lower()
+        if source_loss_weight_normalization not in {"subset_mean", "full_mean", "none"}:
+            raise ValueError(
+                "source_loss_weight_normalization must be one of 'subset_mean', 'full_mean', or 'none'"
+            )
         band_mapping = "none" if distillation_band_mapping is None else str(distillation_band_mapping).lower()
         band_mapping_aliases = {
             "off": "none",
@@ -228,8 +298,21 @@ class TeacherStudentDistillationTask(SupTask):
         self.source_activity_db = source_activity_db
         self.source_activity_active_weight = source_activity_active_weight
         self.source_activity_inactive_weight = source_activity_inactive_weight
+        self.source_order = tuple(source_order or ("speech", "music", "effects"))
+        self.source_loss_weight_normalization = source_loss_weight_normalization
+        self.source_weighted_snr_loss_weight = float(source_weighted_snr_loss_weight)
+        self.explicit_source_loss_weight = float(explicit_source_loss_weight)
+        self.residual_source_loss_weight = float(residual_source_loss_weight)
+        self.residual_source_index = residual_source_index
+        self.robust_label_loss_weight = robust_label_loss_weight
+        self.robust_label_loss = robust_label_loss
+        self.robust_label_eps = robust_label_eps
         self.teacher_mask_loss_weight = teacher_mask_loss_weight
         self.teacher_logit_loss_weight = teacher_logit_loss_weight
+        self.request_model_aux = bool(request_model_aux)
+        self.require_model_aux = bool(require_model_aux)
+        self.mask_aux_alignment = mask_aux_alignment
+        self.mask_aux_max_frame_mismatch = int(mask_aux_max_frame_mismatch)
         self.mask_loss_eps = mask_loss_eps
         self.mask_loss_max = mask_loss_max
         self.latent_distillation_weight = latent_distillation_weight
@@ -243,6 +326,11 @@ class TeacherStudentDistillationTask(SupTask):
         self._student_latents: dict[str, torch.Tensor] = {}
         self._teacher_latents: dict[str, torch.Tensor] = {}
         self._latent_hook_handles: list[Any] = []
+        self.register_buffer(
+            "_source_loss_weights",
+            self._build_source_loss_weights(source_loss_weights),
+            persistent=False,
+        )
         self.composite_loss = CompositeSeparationSpectralLoss(
             n_fft=n_fft,
             hop_length=hop_length,
@@ -266,6 +354,127 @@ class TeacherStudentDistillationTask(SupTask):
         )
 
         self._register_latent_hooks()
+
+    def _build_source_loss_weights(
+        self,
+        source_loss_weights: Sequence[float] | Mapping[str, float] | None,
+    ) -> torch.Tensor | None:
+        if source_loss_weights is None:
+            return None
+        if isinstance(source_loss_weights, Mapping):
+            unknown = sorted(set(source_loss_weights) - set(self.source_order))
+            if unknown:
+                raise ValueError(
+                    f"source_loss_weights contains unknown sources: {unknown}. "
+                    f"Valid sources are: {list(self.source_order)}"
+                )
+            weights = [float(source_loss_weights.get(source_name, 1.0)) for source_name in self.source_order]
+        else:
+            weights = [float(weight) for weight in source_loss_weights]
+        if not weights:
+            raise ValueError("source_loss_weights must not be empty")
+        if len(weights) != len(self.source_order):
+            raise ValueError(
+                f"source_loss_weights has {len(weights)} entries, but source_order has {len(self.source_order)}"
+            )
+        if any(weight <= 0.0 for weight in weights):
+            raise ValueError(f"source_loss_weights values must be positive, got {weights}")
+        return torch.tensor(weights, dtype=torch.float32)
+
+    def _source_weights_for(
+        self,
+        value: torch.Tensor,
+        source_indices: Sequence[int] | None = None,
+    ) -> torch.Tensor | None:
+        weights = self._source_loss_weights
+        if weights is None:
+            return None
+        full_mean = weights.mean().clamp_min(1.0e-8)
+        if source_indices is not None:
+            indices = torch.tensor(tuple(int(idx) for idx in source_indices), device=weights.device, dtype=torch.long)
+            weights = weights.index_select(0, indices)
+        if weights.numel() != value.shape[1]:
+            raise ValueError(
+                f"source_loss_weights has {weights.numel()} entries, but estimate has {value.shape[1]} sources"
+            )
+        weights = weights.to(device=value.device, dtype=value.dtype)
+        if self.source_loss_weight_normalization == "subset_mean":
+            return weights / weights.mean().clamp_min(1.0e-8)
+        if self.source_loss_weight_normalization == "full_mean":
+            return weights / full_mean.to(device=value.device, dtype=value.dtype)
+        return weights
+
+    def _source_weighted_reduce(
+        self,
+        per_source_loss: torch.Tensor,
+        source_indices: Sequence[int] | None = None,
+    ) -> torch.Tensor:
+        weights = self._source_weights_for(per_source_loss, source_indices=source_indices)
+        if weights is None:
+            return per_source_loss.mean()
+        return (per_source_loss * weights.view(1, -1)).mean()
+
+    def _source_weighted_l1(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        per_source_loss = (est - ref).abs().mean(dim=(-1, -2))
+        return self._source_weighted_reduce(per_source_loss)
+
+    def _robust_label_loss(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        diff = est - ref
+        if self.robust_label_loss == "l1":
+            per_element = diff.abs()
+        else:
+            eps = float(self.robust_label_eps)
+            per_element = torch.sqrt(diff.square() + eps * eps) - eps
+        per_source_loss = per_element.mean(dim=(-1, -2))
+        return self._source_weighted_reduce(per_source_loss)
+
+    def _robust_source_subset_loss(
+        self,
+        est: torch.Tensor,
+        ref: torch.Tensor,
+        source_indices: Sequence[int],
+    ) -> torch.Tensor:
+        indices = tuple(int(idx) for idx in source_indices)
+        if not indices:
+            return est.new_zeros(())
+        subset_est = est[:, indices]
+        subset_ref = ref[:, indices]
+        diff = subset_est - subset_ref
+        if self.robust_label_loss == "l1":
+            per_element = diff.abs()
+        else:
+            eps = float(self.robust_label_eps)
+            per_element = torch.sqrt(diff.square() + eps * eps) - eps
+        per_source_loss = per_element.mean(dim=(-1, -2))
+        return self._source_weighted_reduce(per_source_loss, source_indices=indices)
+
+    def _source_weighted_snr_loss(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        err_power = (est.float() - ref.float()).square().mean(dim=(-1, -2))
+        ref_power = ref.float().square().mean(dim=(-1, -2))
+        est_power = est.float().square().mean(dim=(-1, -2))
+        active = ref_power > 10 ** (self.silent_source_db / 10.0)
+        eps = 1.0e-8
+        active_loss = 10.0 * torch.log10(err_power + eps) - 10.0 * torch.log10(ref_power + eps)
+        inactive_loss = 10.0 * torch.log10(est_power + eps)
+        per_source_loss = torch.where(active, active_loss, inactive_loss)
+        return self._source_weighted_reduce(per_source_loss.to(dtype=est.dtype))
+
+    def _residual_source_index(self, n_src: int) -> int:
+        index = int(n_src - 1 if self.residual_source_index is None else self.residual_source_index)
+        if not 0 <= index < n_src:
+            raise ValueError(f"residual_source_index={index} is out of range for {n_src} sources")
+        return index
+
+    def _explicit_source_indices(self, n_src: int) -> tuple[int, ...]:
+        residual_index = self._residual_source_index(n_src)
+        return tuple(idx for idx in range(n_src) if idx != residual_index)
+
+    def _new_scalar_zero(self) -> torch.Tensor:
+        for tensor in self.parameters():
+            return tensor.new_zeros(())
+        for tensor in self.buffers():
+            return tensor.new_zeros(())
+        return torch.zeros((), device=self.device)
 
     def _register_latent_hooks(self) -> None:
         if self.latent_distillation_weight <= 0.0:
@@ -317,7 +526,22 @@ class TeacherStudentDistillationTask(SupTask):
         *,
         css_validation: bool,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        output = model.css(wav, ref=ref) if log_prefix != "training" and css_validation else model(wav)
+        use_css = log_prefix != "training" and css_validation
+        if use_css:
+            output = model.css(wav, ref=ref)
+        elif self.request_model_aux:
+            try:
+                output = model(wav, return_aux=True)
+            except TypeError as exc:
+                if not _is_unexpected_keyword_type_error(exc, "return_aux"):
+                    raise
+                if self.require_model_aux:
+                    raise RuntimeError(
+                        "request_model_aux=True and require_model_aux=True, but the model does not accept return_aux"
+                    ) from exc
+                output = model(wav)
+        else:
+            output = model(wav)
         return _split_model_output(output)
 
     def _teacher_forward(
@@ -367,6 +591,9 @@ class TeacherStudentDistillationTask(SupTask):
         active_weight = per_source_l1.new_tensor(self.source_activity_active_weight)
         inactive_weight = per_source_l1.new_tensor(self.source_activity_inactive_weight)
         weights = torch.where(active, active_weight, inactive_weight)
+        source_weights = self._source_weights_for(per_source_l1)
+        if source_weights is not None:
+            weights = weights * source_weights.view(1, -1)
         return (per_source_l1 * weights).sum() / weights.sum().clamp_min(1.0)
 
     def _spectral_mask(self, est: torch.Tensor, wav: torch.Tensor) -> torch.Tensor:
@@ -382,6 +609,56 @@ class TeacherStudentDistillationTask(SupTask):
             if tensor is not None:
                 return tensor
         return None
+
+    def _aux_tensor_and_domain(
+        self,
+        aux: Mapping[str, Any],
+        keys: Sequence[str],
+    ) -> tuple[torch.Tensor | None, str | None]:
+        for key in keys:
+            tensor = _first_tensor(aux.get(key))
+            if tensor is None:
+                continue
+
+            domain = aux.get(f"{key}_domain")
+            if not isinstance(domain, str):
+                domains = aux.get("aux_domains")
+                if isinstance(domains, Mapping):
+                    domain = domains.get(key)
+            return tensor, domain if isinstance(domain, str) else None
+        return None, None
+
+    def _mask_to_logit_domain(
+        self,
+        mask: torch.Tensor,
+        *,
+        target_domain: str,
+        target_aux: Mapping[str, Any],
+    ) -> torch.Tensor | None:
+        transform = target_aux.get("mask_logits_transform")
+        if not isinstance(transform, str):
+            return None
+        if target_domain != target_aux.get("mask_logits_domain"):
+            return None
+        if transform != "sigmoid_tanh_complex_mask":
+            return None
+        if mask.ndim != 4 or mask.shape[1] % 2 != 0:
+            return None
+
+        real_scale = float(target_aux.get("mask_logits_real_scale", 1.0))
+        imag_scale = float(target_aux.get("mask_logits_imag_scale", 1.0))
+        if real_scale <= 0.0 or imag_scale <= 0.0:
+            return None
+
+        eps = float(self.mask_loss_eps)
+        real = (mask[:, 0::2, :, :] / real_scale).clamp(eps, 1.0 - eps)
+        imag = (mask[:, 1::2, :, :] / imag_scale).clamp(-1.0 + eps, 1.0 - eps)
+        real_logits = torch.logit(real)
+        imag_logits = 0.5 * (torch.log1p(imag) - torch.log1p(-imag))
+        logits = mask.new_empty(mask.shape)
+        logits[:, 0::2, :, :] = real_logits
+        logits[:, 1::2, :, :] = imag_logits
+        return logits
 
     def _linear_map_last_dim(self, value: torch.Tensor, target_size: int) -> torch.Tensor:
         source_size = int(value.shape[-1])
@@ -485,6 +762,35 @@ class TeacherStudentDistillationTask(SupTask):
                 return student_value, teacher_value
         raise ValueError(f"{name} distillation shape mismatch: {student_value.shape} vs {teacher_value.shape}")
 
+    def _align_mask_aux_tensors(
+        self,
+        student_value: torch.Tensor,
+        teacher_value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mask_aux_alignment == "strict":
+            return student_value, teacher_value
+        if student_value.ndim != 4 or teacher_value.ndim != 4:
+            return student_value, teacher_value
+        if student_value.shape[0] != teacher_value.shape[0]:
+            return student_value, teacher_value
+
+        shared_channels = min(int(student_value.shape[1]), int(teacher_value.shape[1]))
+        shared_frames = min(int(student_value.shape[2]), int(teacher_value.shape[2]))
+        if shared_channels <= 0 or shared_frames <= 0:
+            return student_value, teacher_value
+        frame_mismatch = abs(int(student_value.shape[2]) - int(teacher_value.shape[2]))
+        if frame_mismatch > self.mask_aux_max_frame_mismatch:
+            raise ValueError(
+                "mask/logit aux frame mismatch exceeds configured tolerance: "
+                f"{student_value.shape[2]} vs {teacher_value.shape[2]} "
+                f"(max {self.mask_aux_max_frame_mismatch})"
+            )
+        if student_value.shape[1] != shared_channels or student_value.shape[2] != shared_frames:
+            student_value = student_value[:, :shared_channels, :shared_frames, :]
+        if teacher_value.shape[1] != shared_channels or teacher_value.shape[2] != shared_frames:
+            teacher_value = teacher_value[:, :shared_channels, :shared_frames, :]
+        return student_value, teacher_value
+
     def _mask_or_logit_loss(
         self,
         est: torch.Tensor,
@@ -496,25 +802,72 @@ class TeacherStudentDistillationTask(SupTask):
         logit: bool,
     ) -> torch.Tensor:
         if logit:
-            student_value = self._aux_tensor(student_aux, ("mask_logits", "logits"))
-            teacher_value = self._aux_tensor(teacher_aux, ("mask_logits", "logits"))
-            if student_value is None or teacher_value is None:
+            student_value, student_domain = self._aux_tensor_and_domain(student_aux, ("mask_logits", "logits"))
+            teacher_value, teacher_domain = self._aux_tensor_and_domain(teacher_aux, ("mask_logits", "logits"))
+            if (
+                student_value is not None
+                and student_domain is not None
+                and (teacher_value is None or teacher_domain != student_domain)
+            ):
+                teacher_mask, teacher_mask_domain = self._aux_tensor_and_domain(teacher_aux, ("mask", "masks"))
+                if teacher_mask is not None and teacher_mask_domain == "packed_complex_mask":
+                    converted_teacher = self._mask_to_logit_domain(
+                        teacher_mask,
+                        target_domain=student_domain,
+                        target_aux=student_aux,
+                    )
+                    if converted_teacher is not None:
+                        teacher_value = converted_teacher
+                        teacher_domain = student_domain
+            if (
+                teacher_value is not None
+                and teacher_domain is not None
+                and (student_value is None or student_domain != teacher_domain)
+            ):
+                student_mask, student_mask_domain = self._aux_tensor_and_domain(student_aux, ("mask", "masks"))
+                if student_mask is not None and student_mask_domain == "packed_complex_mask":
+                    converted_student = self._mask_to_logit_domain(
+                        student_mask,
+                        target_domain=teacher_domain,
+                        target_aux=teacher_aux,
+                    )
+                    if converted_student is not None:
+                        student_value = converted_student
+                        student_domain = teacher_domain
+            if (
+                student_value is None
+                or teacher_value is None
+                or student_domain is None
+                or teacher_domain is None
+                or student_domain != teacher_domain
+            ):
                 # Most waveform separators in this repo return estimates only. In
                 # that case, logit distillation intentionally falls back to
                 # waveform-derived spectral pseudo-masks instead of internal mask
-                # logits.
+                # logits. Raw aux logits are compared only when both models
+                # declare the same logit domain.
                 student_mask = self._spectral_mask(est, wav).clamp(self.mask_loss_eps, 1.0 - self.mask_loss_eps)
                 teacher_mask = self._spectral_mask(teacher_est, wav).clamp(self.mask_loss_eps, 1.0 - self.mask_loss_eps)
                 student_value = torch.logit(student_mask)
                 teacher_value = torch.logit(teacher_mask)
         else:
-            student_value = self._aux_tensor(student_aux, ("mask", "masks"))
-            teacher_value = self._aux_tensor(teacher_aux, ("mask", "masks"))
-            if student_value is None or teacher_value is None:
+            student_value, student_domain = self._aux_tensor_and_domain(student_aux, ("mask", "masks"))
+            teacher_value, teacher_domain = self._aux_tensor_and_domain(teacher_aux, ("mask", "masks"))
+            if (
+                student_value is None
+                or teacher_value is None
+                or (
+                    student_domain is not None
+                    and teacher_domain is not None
+                    and student_domain != teacher_domain
+                )
+            ):
                 # Match spectral pseudo-masks when true model masks are not
-                # exposed by the model output contract.
+                # exposed by the model output contract or declare incompatible
+                # domains.
                 student_value = self._spectral_mask(est, wav)
                 teacher_value = self._spectral_mask(teacher_est, wav)
+        student_value, teacher_value = self._align_mask_aux_tensors(student_value, teacher_value)
         student_value, teacher_value = self._align_distillation_tensors(
             student_value,
             teacher_value,
@@ -567,7 +920,7 @@ class TeacherStudentDistillationTask(SupTask):
 
         if not losses:
             if self.latent_allow_missing:
-                return next(self.model.parameters()).new_zeros(())
+                return self._new_scalar_zero()
             raise ValueError("latent_distillation_weight is enabled but no latent pairs were available")
         return torch.stack(losses).mean()
 
@@ -597,9 +950,29 @@ class TeacherStudentDistillationTask(SupTask):
 
         if self.teacher_loss_weight > 0.0:
             teacher_est_value, _ = get_teacher()
-            teacher_loss = F.l1_loss(est, teacher_est_value.detach())
+            teacher_loss = self._source_weighted_l1(est, teacher_est_value.detach())
             loss = loss + self.teacher_loss_weight * teacher_loss
             log_dict[f"{log_prefix}/loss_teacher"] = teacher_loss
+
+        if self.robust_label_loss_weight > 0.0:
+            robust_label_loss = self._robust_label_loss(est, ref)
+            loss = loss + self.robust_label_loss_weight * robust_label_loss
+            log_dict[f"{log_prefix}/loss_robust_label"] = robust_label_loss
+
+        if self.source_weighted_snr_loss_weight > 0.0:
+            source_weighted_snr_loss = self._source_weighted_snr_loss(est, ref)
+            loss = loss + self.source_weighted_snr_loss_weight * source_weighted_snr_loss
+            log_dict[f"{log_prefix}/loss_source_weighted_snr"] = source_weighted_snr_loss
+
+        if self.explicit_source_loss_weight > 0.0:
+            explicit_source_loss = self._robust_source_subset_loss(est, ref, self._explicit_source_indices(ref.shape[1]))
+            loss = loss + self.explicit_source_loss_weight * explicit_source_loss
+            log_dict[f"{log_prefix}/loss_explicit_sources"] = explicit_source_loss
+
+        if self.residual_source_loss_weight > 0.0:
+            residual_source_loss = self._robust_source_subset_loss(est, ref, (self._residual_source_index(ref.shape[1]),))
+            loss = loss + self.residual_source_loss_weight * residual_source_loss
+            log_dict[f"{log_prefix}/loss_residual_source"] = residual_source_loss
 
         if self.teacher_mask_loss_weight > 0.0:
             teacher_est_value, teacher_aux_value = get_teacher()

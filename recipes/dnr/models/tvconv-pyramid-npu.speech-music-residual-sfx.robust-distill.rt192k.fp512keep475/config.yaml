@@ -1,8 +1,4 @@
-# Standalone performance-first DnR teacher/reference model.
-# This recipe intentionally does not start from NPU constraints.  It uses
-# full-frequency non-causal STFT chunks, overlapped adaptive mel-band SFC
-# tokenization, axial rotary attention, explicit source streams, source-axis
-# competition, complex mask + residual reconstruction, and mixture consistency.
+_base_: ${base_config_path}/train_base.yaml
 
 seed: 2026
 
@@ -12,45 +8,34 @@ hop_length: 512
 n_src: 3
 n_chan: 1
 
-melband_roformer_n_bands: 128
-melband_roformer_d_model: 192
-melband_roformer_n_heads: 8
-melband_roformer_source_attention_heads: 1
-melband_roformer_encoder_layers: 8
-melband_roformer_decoder_layers: 4
-melband_roformer_ffn_mult: 4
-melband_roformer_dropout: 0.1
-melband_roformer_conv_kernel_size: [5, 5]
-melband_roformer_routing_kernel_size: [3, 5]
-melband_roformer_low_freq_hz: 1000.0
-melband_roformer_low_freq_band_fraction: 0.45
-melband_roformer_overlap_factor: 1.5
-melband_roformer_low_freq_overlap_factor: 2.0
-melband_roformer_include_logmag_features: true
-melband_roformer_masking: true
-melband_roformer_residual_output: true
-melband_roformer_residual_scale_init: 0.05
-melband_roformer_mixture_consistency: true
-melband_roformer_routing_normalization: softmax
-melband_roformer_layer_scale_init: 0.1
+teacher_checkpoint_path: null
+teacher_n_fft: ${n_fft}
+teacher_hop_length: ${hop_length}
+
+tvconv_base_channels: 64
+tvconv_bottleneck_channels: 160
+tvconv_n_down: 4
+tvconv_n_blocks: 6
+tvconv_expansion: 3
+tvconv_time_kernel: 3
+tvconv_time_dilation_cycle: [1, 1, 2, 2, 2, 1]
+tvconv_band_kernel: 3
+tvconv_capacity_hidden: 0
+tvconv_mask_hidden: 128
+tvconv_source_kernel: 5
+tvconv_real_mask_scale: 1.5
+tvconv_imag_mask_scale: 0.12
 
 trainer:
-  _target_: lightning.Trainer
-  default_root_dir: ${working_directory}
-  logger:
-    _target_: lightning.pytorch.loggers.TensorBoardLogger
-    save_dir: ${working_directory}
-    name: ''
-    version: ''
   max_epochs: 150
   check_val_every_n_epoch: 1
   gradient_clip_val: 2.0
-  sync_batchnorm: true
+  sync_batchnorm: True
   deterministic: false
   limit_train_batches: 1354
   limit_val_batches: 10
-  benchmark: true
-  use_distributed_sampler: false
+  benchmark: True
+  use_distributed_sampler: False
   precision: bf16-mixed
   callbacks:
     - _target_: lightning.pytorch.callbacks.ModelCheckpoint
@@ -58,7 +43,7 @@ trainer:
       save_top_k: 5
       monitor: validation/loss
       mode: min
-      save_last: true
+      save_last: True
     - _target_: lightning.pytorch.callbacks.RichProgressBar
       refresh_rate: 5
     - _target_: lightning.pytorch.callbacks.RichModelSummary
@@ -72,7 +57,7 @@ datamodule:
     - /data1/manifests/validation_sources.csv
   test_source_manifest_csv:
     - /data1/manifests/test_sources.csv
-  batch_size: 1
+  batch_size: 4
   val_batch_size: 1
   test_batch_size: 1
   sr: ${sr}
@@ -230,52 +215,117 @@ datamodule:
             effects: [-10, 8]
 
 task:
-  _target_: spectral_feature_compression.core.tasks.composite_sup_task.CompositeSupTask
+  _target_: spectral_feature_compression.core.tasks.distillation_task.TeacherStudentDistillationTask
   n_fft: ${n_fft}
   hop_length: ${hop_length}
   fs: ${sr}
   css_validation: true
   ema_weight: 0.999
   ema_update_freq: 1
-  mixture_consistency_weight: 0.1
-  low_frequency_weight: 0.2
+  require_teacher_checkpoint: true
+  teacher_checkpoint_path: ${teacher_checkpoint_path}
+  teacher_css_validation: true
+  teacher_loss_weight: 0.65
+  mixture_consistency_weight: 0.0
+  low_frequency_weight: 0.25
   low_frequency_hz: 300.0
-  complex_ri_weight: 0.5
+  silent_source_weight: 0.05
+  silent_source_db: -60.0
+  source_activity_loss_weight: 0.16
+  source_activity_db: -50.0
+  source_activity_active_weight: 1.0
+  source_activity_inactive_weight: 0.20
+  source_order: [speech, music, effects]
+  source_loss_weights:
+    speech: 1.6
+    music: 1.25
+    effects: 0.85
+  source_loss_weight_normalization: full_mean
+  source_weighted_snr_loss_weight: 0.35
+  explicit_source_loss_weight: 0.10
+  residual_source_loss_weight: 0.20
+  residual_source_index: 2
+  robust_label_loss_weight: 0.20
+  robust_label_loss: charbonnier
+  robust_label_eps: 0.001
+  complex_ri_weight: 0.45
   log_magnitude_weight: 0.2
-  multi_resolution_stft_weight: 0.3
+  multi_resolution_stft_weight: 0.25
   multi_resolution_stft_resolutions:
     - [512, 128]
     - [1024, 256]
     - [2048, 512]
   transient_weight: 0.08
+  teacher_mask_loss_weight: 0.15
+  teacher_logit_loss_weight: 0.05
+  request_model_aux: true
+  require_model_aux: true
+  mask_aux_alignment: shared_prefix
+  mask_aux_max_frame_mismatch: 4
+  distillation_band_mapping: linear
+  latent_distillation_weight: 0.0
+  student_latent_modules: []
+  teacher_latent_modules: []
+  latent_allow_missing: true
   model:
-    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_source_aware_melband_roformer_teacher_system
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_tvconv_pyramid_npu_separator_system
     n_fft: ${n_fft}
     hop_length: ${hop_length}
     fs: ${sr}
     n_src: ${n_src}
     n_chan: ${n_chan}
-    n_bands: ${melband_roformer_n_bands}
-    d_model: ${melband_roformer_d_model}
-    n_heads: ${melband_roformer_n_heads}
-    source_attention_heads: ${melband_roformer_source_attention_heads}
-    n_encoder_layers: ${melband_roformer_encoder_layers}
-    n_decoder_layers: ${melband_roformer_decoder_layers}
-    ffn_mult: ${melband_roformer_ffn_mult}
-    dropout: ${melband_roformer_dropout}
-    conv_kernel_size: ${melband_roformer_conv_kernel_size}
-    routing_kernel_size: ${melband_roformer_routing_kernel_size}
-    low_freq_hz: ${melband_roformer_low_freq_hz}
-    low_freq_band_fraction: ${melband_roformer_low_freq_band_fraction}
-    overlap_factor: ${melband_roformer_overlap_factor}
-    low_freq_overlap_factor: ${melband_roformer_low_freq_overlap_factor}
-    include_logmag_features: ${melband_roformer_include_logmag_features}
-    masking: ${melband_roformer_masking}
-    residual_output: ${melband_roformer_residual_output}
-    residual_scale_init: ${melband_roformer_residual_scale_init}
-    mixture_consistency: ${melband_roformer_mixture_consistency}
-    routing_normalization: ${melband_roformer_routing_normalization}
-    layer_scale_init: ${melband_roformer_layer_scale_init}
+    core_n_src: 2
+    residual_source_enabled: true
+    residual_source_index: 2
+    base_channels: ${tvconv_base_channels}
+    bottleneck_channels: ${tvconv_bottleneck_channels}
+    n_down: ${tvconv_n_down}
+    n_blocks: ${tvconv_n_blocks}
+    expansion: ${tvconv_expansion}
+    time_kernel: ${tvconv_time_kernel}
+    time_dilation_cycle: ${tvconv_time_dilation_cycle}
+    band_kernel: ${tvconv_band_kernel}
+    capacity_hidden: ${tvconv_capacity_hidden}
+    mask_hidden: ${tvconv_mask_hidden}
+    source_kernel: ${tvconv_source_kernel}
+    real_mask_scale: ${tvconv_real_mask_scale}
+    imag_mask_scale: ${tvconv_imag_mask_scale}
+    scaling: false
+    freq_preprocess_enabled: true
+    freq_preprocess_keep_bins: 475
+    freq_preprocess_target_bins: 512
+    freq_preprocess_mode: triangular
+    css_segment_size: 12
+    css_shift_size: 6
+    css_batch_size: 1
+  teacher_model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_source_aware_melband_roformer_teacher_system
+    n_fft: ${teacher_n_fft}
+    hop_length: ${teacher_hop_length}
+    fs: ${sr}
+    n_src: ${n_src}
+    n_chan: ${n_chan}
+    n_bands: 128
+    d_model: 192
+    n_heads: 8
+    source_attention_heads: 1
+    n_encoder_layers: 8
+    n_decoder_layers: 4
+    ffn_mult: 4
+    dropout: 0.1
+    conv_kernel_size: [5, 5]
+    routing_kernel_size: [3, 5]
+    low_freq_hz: 1000.0
+    low_freq_band_fraction: 0.45
+    overlap_factor: 1.5
+    low_freq_overlap_factor: 2.0
+    include_logmag_features: true
+    masking: true
+    residual_output: true
+    residual_scale_init: 0.05
+    mixture_consistency: true
+    routing_normalization: softmax
+    layer_scale_init: 0.1
     scaling: true
     css_segment_size: 12
     css_shift_size: 6
@@ -290,17 +340,17 @@ task:
   optimizer_config:
     _target_: aiaccel.torch.lightning.OptimizerConfig
     optimizer_generator:
-      _partial_: true
+      _partial_: True
       _target_: torch.optim.AdamW
-      lr: 3.e-4
+      lr: 4.e-4
       weight_decay: 1.e-2
       betas: [0.9, 0.999]
     scheduler_generator:
-      _partial_: true
+      _partial_: True
       _target_: spectral_feature_compression.common.lr_schedulers.warmup.WarmUpStepLR
       warmup_steps: 10000
-      decay_start_step: 150000
-      decay_stop_step: 260000
+      decay_start_step: 170000
+      decay_stop_step: 280000
       step_size: 1354
       decay: 0.98
     scheduler_interval: step

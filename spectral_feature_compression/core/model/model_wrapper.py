@@ -54,7 +54,14 @@ class ModelWrapper(nn.Module):
         with autocast(device_type="cuda", enabled=False):
             x = self.stft(wav)[..., : wav.shape[-1] // self.hop_length]
 
-        est_stft = self.model(x, **kwargs)
+        model_output = self.model(x, **kwargs)
+        if isinstance(model_output, tuple):
+            est_stft, *aux_items = model_output
+            return_aux = True
+        else:
+            est_stft = model_output
+            aux_items = []
+            return_aux = False
 
         with autocast(device_type="cuda", enabled=False):
             est = self.istft(est_stft, wav.shape[-1])  # [B, N, M, T]
@@ -62,6 +69,8 @@ class ModelWrapper(nn.Module):
         if self.scaling:
             est = est * scale
 
+        if return_aux:
+            return (est, *aux_items)
         return est
 
     def css(self, speech_mix: torch.Tensor, **kwargs):

@@ -142,13 +142,22 @@ class OnlineModelWrapper(nn.Module):
             # x: (..., F, T_pad), complex STFT with explicit causal boundary padding.
             x = self.stft(wav_pad)
 
-        est_stft = self.model(x, **kwargs)
+        model_output = self.model(x, **kwargs)
+        if isinstance(model_output, tuple):
+            est_stft, *aux_items = model_output
+            return_aux = True
+        else:
+            est_stft = model_output
+            aux_items = []
+            return_aux = False
 
         with autocast(device_type="cuda", enabled=False):
             est_pad = self.istft(est_stft, wav_pad.shape[-1])
 
         est = est_pad[..., left_pad : left_pad + wav.shape[-1]]
 
+        if return_aux:
+            return (est, *aux_items)
         return est
 
     def css(self, speech_mix: torch.Tensor, **kwargs):

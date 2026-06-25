@@ -76,6 +76,7 @@ _EXPORTS = {
     "OnlineSourceAwareMelBandStrongStudentSFCModel": f"{_MODEL}.source_aware_melband_strong_student_sfc_2d",
     "OnlineSourceAwareMelBandStudentSFC2D": f"{_MODEL}.source_aware_melband_student_sfc_2d",
     "OnlineSourceAwareMelBandStudentSFCModel": f"{_MODEL}.source_aware_melband_student_sfc_2d",
+    "TVConvPyramidNPUSeparator2D": f"{_MODEL}.tvconv_pyramid_npu_separator_2d",
     "RotarySelfAttention": f"{_MODEL}.source_aware_melband_roformer",
     "SourceAwareMelBandRoformer2D": f"{_MODEL}.source_aware_melband_roformer",
     "SourceAwareMelBandRoformerModel": f"{_MODEL}.source_aware_melband_roformer",

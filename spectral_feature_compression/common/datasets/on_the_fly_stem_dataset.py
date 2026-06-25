@@ -149,6 +149,7 @@ class OnTheFlyStemDataset(Dataset):
         same_stem_placement: Mapping[str, Any] | None = None,
         stem_gain_db: Mapping[str, Any] | None = None,
         stem_snr_db: Mapping[str, Any] | None = None,
+        synthesis_profiles: Sequence[Mapping[str, Any]] | None = None,
         normalize_sources: bool = False,
         source_normalization: Mapping[str, Any] | None = None,
         source_activity_threshold: float = 0.0,
@@ -236,7 +237,66 @@ class OnTheFlyStemDataset(Dataset):
         self.placement = self._parse_placement(same_stem_placement)
         self.stem_gain_db = dict(stem_gain_db or {})
         self.stem_snr_db = dict(stem_snr_db or {})
+        self.synthesis_profiles = self._parse_synthesis_profiles(synthesis_profiles)
         self._validate_source_normalization_config()
+
+    def _parse_synthesis_profiles(
+        self,
+        profiles: Sequence[Mapping[str, Any]] | None,
+    ) -> tuple[dict[str, Any], ...]:
+        if profiles is None:
+            return ()
+
+        valid_fields = {
+            "name",
+            "weight",
+            "active_stem_count",
+            "stem_sampling_weights",
+            "clips_per_active_stem",
+            "stem_gain_db",
+            "stem_snr_db",
+        }
+        parsed = []
+        for idx, raw_profile in enumerate(profiles):
+            if not isinstance(raw_profile, Mapping):
+                raise ValueError(f"synthesis_profiles[{idx}] must be a mapping")
+            profile = dict(raw_profile)
+            unknown = sorted(set(profile) - valid_fields)
+            if unknown:
+                raise ValueError(
+                    f"synthesis profile {profile.get('name', idx)!r} contains unknown fields: {unknown}. "
+                    f"Valid fields are: {sorted(valid_fields)}"
+                )
+            profile["name"] = str(profile.get("name", f"profile_{idx}"))
+            profile["weight"] = float(profile.get("weight", 1.0))
+            if profile["weight"] < 0.0:
+                raise ValueError(f"synthesis profile {profile['name']!r} has negative weight")
+
+            for field in ("stem_sampling_weights", "stem_gain_db", "clips_per_active_stem"):
+                value = profile.get(field)
+                if isinstance(value, Mapping):
+                    _validate_mapping_keys(value, self.source_order, name=f"synthesis_profiles.{profile['name']}.{field}")
+
+            snr_cfg = profile.get("stem_snr_db")
+            if isinstance(snr_cfg, Mapping) and isinstance(snr_cfg.get("range"), Mapping):
+                _validate_mapping_keys(
+                    snr_cfg["range"],
+                    self.source_order,
+                    name=f"synthesis_profiles.{profile['name']}.stem_snr_db.range",
+                )
+
+            if profile["weight"] > 0.0:
+                parsed.append(profile)
+
+        if profiles and not parsed:
+            raise ValueError("synthesis_profiles must contain at least one positive-weight profile")
+        return tuple(parsed)
+
+    def _sample_synthesis_profile(self, rng: random.Random) -> Mapping[str, Any] | None:
+        if not self.synthesis_profiles:
+            return None
+        weights = [float(profile["weight"]) for profile in self.synthesis_profiles]
+        return rng.choices(self.synthesis_profiles, weights=weights, k=1)[0]
 
     def _scan_source_pools(
         self,
@@ -349,8 +409,8 @@ class OnTheFlyStemDataset(Dataset):
             return random.Random()
         return random.Random(int(self.seed) + int(index))
 
-    def _sample_active_count(self, rng: random.Random) -> int:
-        cfg = self.active_stem_count
+    def _sample_active_count(self, rng: random.Random, active_stem_count: Any | None = None) -> int:
+        cfg = self.active_stem_count if active_stem_count is None else active_stem_count
         n_stems = len(self.source_order)
         if isinstance(cfg, Mapping):
             mode = str(cfg.get("mode", "weighted"))
@@ -376,8 +436,13 @@ class OnTheFlyStemDataset(Dataset):
             return max(0, min(n_stems, rng.choice(values)))
         return max(0, min(n_stems, int(cfg)))
 
-    def _sample_clip_count(self, stem: str, rng: random.Random) -> int:
-        cfg = self.clips_per_active_stem
+    def _sample_clip_count(
+        self,
+        stem: str,
+        rng: random.Random,
+        clips_per_active_stem: Mapping[str, Any] | int | Sequence[int] | None = None,
+    ) -> int:
+        cfg = self.clips_per_active_stem if clips_per_active_stem is None else clips_per_active_stem
         value = cfg.get(stem, 1) if isinstance(cfg, Mapping) else cfg
         lo, hi = _as_int_range(value, default=(1, 1))
         return max(1, rng.randint(lo, hi))
@@ -494,7 +559,12 @@ class OnTheFlyStemDataset(Dataset):
             stem[start : start + length] = clip[:length].float()
         return stem, [str(path)]
 
-    def _build_stem(self, stem_name: str, rng: random.Random) -> tuple[torch.Tensor, list[str]]:
+    def _build_stem(
+        self,
+        stem_name: str,
+        rng: random.Random,
+        clips_per_active_stem: Mapping[str, Any] | int | Sequence[int] | None = None,
+    ) -> tuple[torch.Tensor, list[str]]:
         if self.short_clip_policy == "pad":
             return self._build_padded_stem(stem_name, rng)
         if self.short_clip_policy == "pad_or_concatenate":
@@ -508,7 +578,7 @@ class OnTheFlyStemDataset(Dataset):
             repeats = math.ceil(self.n_samples / int(clip.numel()))
             return clip.repeat(repeats)[: self.n_samples].float(), [str(path)]
 
-        n_clips = self._sample_clip_count(stem_name, rng)
+        n_clips = self._sample_clip_count(stem_name, rng, clips_per_active_stem)
         clips = []
         paths = []
         for _ in range(n_clips):
@@ -521,11 +591,18 @@ class OnTheFlyStemDataset(Dataset):
             raise ValueError(f"Unsupported same_stem_placement mode: {self.placement.mode!r}")
         return self._place_sequential(clips, rng), paths
 
-    def _apply_independent_gain(self, stems: torch.Tensor, active_stems: list[str], rng: random.Random) -> None:
+    def _apply_independent_gain(
+        self,
+        stems: torch.Tensor,
+        active_stems: list[str],
+        rng: random.Random,
+        stem_gain_db: Mapping[str, Any] | None = None,
+    ) -> None:
+        gain_cfg = self.stem_gain_db if stem_gain_db is None else stem_gain_db
         for stem_idx, stem_name in enumerate(self.source_order):
             if stem_name not in active_stems:
                 continue
-            gain_range = _range_for_key(self.stem_gain_db, stem_name, (0.0, 0.0))
+            gain_range = _range_for_key(gain_cfg, stem_name, (0.0, 0.0))
             gain_db = _sample_uniform(rng, gain_range)
             stems[stem_idx] *= float(10.0 ** (gain_db / 20.0))
 
@@ -662,8 +739,9 @@ class OnTheFlyStemDataset(Dataset):
         active_stems: list[str],
         rng: random.Random,
         snr_ineligible_stems: set[str] | None = None,
+        stem_snr_db: Mapping[str, Any] | None = None,
     ) -> None:
-        cfg = self.stem_snr_db
+        cfg = self.stem_snr_db if stem_snr_db is None else stem_snr_db
         if not cfg or not bool(cfg.get("enabled", False)) or len(active_stems) < 2:
             return
         anchor_cfg = str(cfg.get("anchor", "random_active"))
@@ -708,10 +786,14 @@ class OnTheFlyStemDataset(Dataset):
 
     def __getitem__(self, index: int):
         rng = self._rng_for_index(index)
-        active_count = self._sample_active_count(rng)
+        profile = self._sample_synthesis_profile(rng)
+        active_count = self._sample_active_count(
+            rng,
+            None if profile is None else profile.get("active_stem_count"),
+        )
         active_stems = _weighted_sample_without_replacement(
             self.source_order,
-            self.stem_sampling_weights,
+            self.stem_sampling_weights if profile is None else profile.get("stem_sampling_weights", self.stem_sampling_weights),
             active_count,
             rng,
         )
@@ -721,15 +803,32 @@ class OnTheFlyStemDataset(Dataset):
             "active_stems": list(active_stems),
             "source_paths": {stem: [] for stem in self.source_order},
         }
+        if profile is not None:
+            metadata["synthesis_profile"] = profile["name"]
         for stem_name in active_stems:
             stem_idx = self.source_order.index(stem_name)
-            stem_audio, paths = self._build_stem(stem_name, rng)
+            stem_audio, paths = self._build_stem(
+                stem_name,
+                rng,
+                None if profile is None else profile.get("clips_per_active_stem"),
+            )
             stems[stem_idx] = stem_audio
             metadata["source_paths"][stem_name] = paths
 
         snr_ineligible_stems = self._normalize_active_sources(stems, active_stems)
-        self._apply_independent_gain(stems, active_stems, rng)
-        self._apply_relative_snr(stems, active_stems, rng, snr_ineligible_stems)
+        self._apply_independent_gain(
+            stems,
+            active_stems,
+            rng,
+            None if profile is None else profile.get("stem_gain_db"),
+        )
+        self._apply_relative_snr(
+            stems,
+            active_stems,
+            rng,
+            snr_ineligible_stems,
+            None if profile is None else profile.get("stem_snr_db"),
+        )
         stems = self._apply_peak_norm(stems)
 
         ref = stems[:, None, :].contiguous()

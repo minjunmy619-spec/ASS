@@ -524,17 +524,29 @@ class FrequencyPreprocessedOnlineModel(nn.Module):
             return y2d
         return self.pcen_preprocessor.invert_output_gain(y2d, gain, n_src=self.core_n_src)
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs):
         kwargs.pop("ref", None)
+        return_aux = bool(kwargs.pop("return_aux", False))
         mixture2d = pack_complex_stft_as_2d(x)
         x2d, dc2d = self.split_dc_2d(mixture2d)
         core_ref = self.preprocess_2d(x2d)
         core_in, gain, _pcen_state = self.preprocess_core_input_2d(core_ref)
-        y2d = self.core(core_in, **kwargs)
+        if return_aux:
+            core_output = self.core(core_in, return_aux=True, **kwargs)
+        else:
+            core_output = self.core(core_in, **kwargs)
+        if isinstance(core_output, tuple):
+            y2d, aux = core_output
+        else:
+            y2d = core_output
+            aux = {}
         y2d = self.invert_core_output_gain(y2d, gain)
         y2d = self.restore_dc_2d(self.postprocess_2d(y2d), dc2d)
         y2d = self.append_residual_source_2d(y2d, mixture2d)
-        return unpack_2d_to_complex_stft(y2d, n_src=self.n_src, n_chan=self.n_chan)
+        estimate = unpack_2d_to_complex_stft(y2d, n_src=self.n_src, n_chan=self.n_chan)
+        if return_aux:
+            return estimate, aux
+        return estimate
 
     def _split_stream_state(self, state, *, batch_size: int, device=None, dtype=None):
         if self.pcen_preprocessor is None:

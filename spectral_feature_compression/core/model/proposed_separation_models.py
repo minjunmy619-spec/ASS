@@ -56,8 +56,12 @@ from spectral_feature_compression.core.model.source_split_sfc_2d import (
 from spectral_feature_compression.core.model.sparse_unet_mel_sfc_2d import (
     build_sparse_unet_mel_sfc_system as _build_sparse_unet_mel_sfc_system,
 )
+from spectral_feature_compression.core.model.tvconv_pyramid_npu_separator_2d import (
+    build_tvconv_pyramid_npu_separator_system as _build_tvconv_pyramid_npu_separator_system,
+)
 
 build_source_aware_sfc_locoformer_teacher_system = _build_source_aware_sfc_locoformer_teacher_system
+build_tvconv_pyramid_npu_separator_system = _build_tvconv_pyramid_npu_separator_system
 
 
 def build_sfc_locoformer_lite_plus_system(

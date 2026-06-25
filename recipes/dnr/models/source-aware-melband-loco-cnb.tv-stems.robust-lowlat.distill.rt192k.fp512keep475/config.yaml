@@ -1,0 +1,22 @@
+_base_: ../source-aware-melband-loco-cnb.student-npu-residual-sfx-lowlat.distill.rt192k.fp512keep475/config.yaml
+
+# TV adaptive-audio training objective for the low-latency strict-NPU student.
+# Deployment model stays the source-aware MelBand Loco-CNB residual-SFX student:
+# core predicts speech/music masks and reconstructs effects as mixture residual.
+
+task:
+    source_order: [speech, music, effects]
+    source_loss_weights:
+        speech: 1.6
+        music: 1.25
+        effects: 0.85
+    robust_label_loss_weight: 0.20
+    robust_label_loss: charbonnier
+    robust_label_eps: 0.001
+    teacher_loss_weight: 0.65
+    source_activity_loss_weight: 0.16
+    source_activity_active_weight: 1.0
+    source_activity_inactive_weight: 0.20
+    low_frequency_weight: 0.25
+    transient_weight: 0.08
+    teacher_mask_loss_weight: 0.15

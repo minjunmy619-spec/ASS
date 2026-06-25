@@ -1,3 +1,5 @@
+import random
+
 import torch
 
 import pytest
@@ -124,3 +126,41 @@ def test_relative_snr_uses_speech_anchor_after_normalization():
     effects_rms = stems[2].square().mean().sqrt()
     assert torch.isclose(music_rms / speech_rms, torch.tensor(10.0 ** (-6.0 / 20.0)), atol=1e-5)
     assert torch.isclose(effects_rms / speech_rms, torch.tensor(1.0), atol=1e-5)
+
+
+def test_synthesis_profile_controls_active_count_gain_and_relative_snr():
+    ds = _dataset({"target_rms": 1.0, "mode": "full_rms"})
+    ds.synthesis_profiles = ds._parse_synthesis_profiles(
+        [
+            {
+                "name": "commentary_focus",
+                "weight": 1.0,
+                "active_stem_count": {"mode": "fixed", "value": 2},
+                "stem_sampling_weights": {"speech": 8.0, "music": 1.0, "effects": 8.0},
+                "stem_gain_db": {"speech": [6.0, 6.0], "effects": [0.0, 0.0]},
+                "stem_snr_db": {
+                    "enabled": True,
+                    "anchor": "speech",
+                    "range": {"effects": [12.0, 12.0]},
+                },
+            }
+        ]
+    )
+    profile = ds._sample_synthesis_profile(random.Random(0))
+    assert profile is not None
+    assert profile["name"] == "commentary_focus"
+    assert ds._sample_active_count(random.Random(0), profile["active_stem_count"]) == 2
+
+    stems = torch.ones(3, 1000, dtype=torch.float32)
+    ds._apply_independent_gain(stems, ["speech", "effects"], random.Random(0), profile["stem_gain_db"])
+    ds._apply_relative_snr(stems, ["speech", "effects"], random.Random(0), stem_snr_db=profile["stem_snr_db"])
+
+    speech_rms = stems[0].square().mean().sqrt()
+    effects_rms = stems[2].square().mean().sqrt()
+    assert torch.isclose(effects_rms / speech_rms, torch.tensor(10.0 ** (-12.0 / 20.0)), atol=1e-5)
+
+
+def test_synthesis_profile_rejects_unknown_stem_key():
+    ds = _dataset({"target_rms": 1.0, "mode": "full_rms"})
+    with pytest.raises(ValueError, match="unknown stem"):
+        ds._parse_synthesis_profiles([{"name": "bad", "stem_gain_db": {"dialog": [0.0, 0.0]}}])

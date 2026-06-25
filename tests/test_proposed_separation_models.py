@@ -6,6 +6,7 @@ import tempfile
 import torch
 
 import pytest
+from omegaconf import OmegaConf
 
 from BandSFCNetNPU.presets import build_band_sfc_net_npu_preset
 from spectral_feature_compression.core.loss.composite_separation import CompositeSeparationSpectralLoss
@@ -34,6 +35,7 @@ from spectral_feature_compression.core.model.proposed_separation_models import (
     build_source_aware_melband_roformer_teacher_system,
     build_source_aware_residual_sfc_system,
     build_sparse_unet_mel_sfc_music_system,
+    build_tvconv_pyramid_npu_separator_system,
 )
 from spectral_feature_compression.core.model.residual_refinement_sfc_2d import OnlineResidualRefinementSFC2D
 from spectral_feature_compression.core.model.source_aware_melband_loco_cnb_student_sfc_2d import (
@@ -49,6 +51,7 @@ from spectral_feature_compression.core.model.source_aware_melband_student_sfc_2d
 from spectral_feature_compression.core.model.source_aware_residual_sfc_2d import OnlineSourceAwareResidualSFC2D
 from spectral_feature_compression.core.model.source_split_sfc_2d import OnlineSourceSplitSFC2D
 from spectral_feature_compression.core.model.sparse_unet_mel_sfc_2d import SparseUNetMelSFC2D
+from spectral_feature_compression.core.model.tvconv_pyramid_npu_separator_2d import TVConvPyramidNPUSeparator2D
 from spectral_feature_compression.core.tasks.distillation_task import (
     TeacherStudentDistillationTask,
     _load_model_checkpoint,
@@ -68,6 +71,7 @@ def test_source_aware_melband_public_lazy_exports() -> None:
     assert sfc.OnlineSourceAwareMelBandStudentSFC2D is OnlineSourceAwareMelBandStudentSFC2D
     assert sfc.OnlineSourceAwareMelBandStrongStudentSFC2D is OnlineSourceAwareMelBandStrongStudentSFC2D
     assert sfc.OnlineSourceAwareMelBandLocoCNBStudentSFC2D is OnlineSourceAwareMelBandLocoCNBStudentSFC2D
+    assert sfc.TVConvPyramidNPUSeparator2D is TVConvPyramidNPUSeparator2D
 
 
 def test_band_sfc_rt_plus_forward_and_streaming_shape() -> None:
@@ -141,6 +145,123 @@ def test_middle_and_edge_proposal_builders_expose_waveform_wrappers() -> None:
     assert edge.model.n_src == 2
 
 
+def test_tvconv_pyramid_npu_forward_streaming_and_recipe_budget() -> None:
+    torch.manual_seed(0)
+    core = TVConvPyramidNPUSeparator2D(
+        n_freq=64,
+        n_src=2,
+        n_chan=1,
+        base_channels=16,
+        bottleneck_channels=32,
+        n_down=3,
+        n_blocks=2,
+        expansion=2,
+        time_kernel=3,
+        time_dilation_cycle=(1, 2),
+        band_kernel=3,
+        mask_hidden=16,
+        real_mask_scale=1.5,
+    ).eval()
+    x = torch.randn(1, 2, 5, 64)
+    with torch.no_grad():
+        y, aux = core(x, return_aux=True)
+        state = core.init_stream_state(batch_size=1, dtype=x.dtype)
+        frames = []
+        for frame_idx in range(x.shape[2]):
+            frame, state = core.forward_stream(x[:, :, frame_idx : frame_idx + 1, :], state)
+            frames.append(frame)
+        y_stream = torch.cat(frames, dim=2)
+    assert tuple(y.shape) == (1, 4, 5, 64)
+    assert tuple(aux["mask"].shape) == (1, 4, 5, 64)
+    assert tuple(aux["mask_logits"].shape) == (1, 4, 5, 64)
+    assert core.source_head.real_mask_scale == pytest.approx(1.5)
+    torch.testing.assert_close(y_stream, y, rtol=1e-5, atol=1e-5)
+
+    config_path = Path(
+        "recipes/dnr/models/tvconv-pyramid-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml"
+    )
+    config = OmegaConf.load(config_path)
+    assert str(config.datamodule._target_).endswith("OnTheFlyStemDataModule")
+    assert len(config.datamodule.synthesis.synthesis_profiles) == 4
+    assert config.task.mixture_consistency_weight == 0.0
+    assert config.task.request_model_aux is True
+    assert config.task.require_model_aux is True
+    assert config.task.teacher_logit_loss_weight == pytest.approx(0.05)
+    assert config.task.distillation_band_mapping == "linear"
+    assert config.task.mask_aux_alignment == "shared_prefix"
+    assert config.task.source_loss_weight_normalization == "full_mean"
+    assert config.task.source_weighted_snr_loss_weight > 0.0
+    assert config.task.residual_source_loss_weight > 0.0
+
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert str(resolve_value(model_cfg["_target_"], context)).endswith("build_tvconv_pyramid_npu_separator_system")
+    assert resolve_value(model_cfg["n_down"], context) == 4
+    assert resolve_value(model_cfg["capacity_hidden"], context) == 0
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    recipe_core = system.model.core
+    assert recipe_core.n_freq == 512
+    assert recipe_core.n_down == 4
+    assert recipe_core.n_blocks == 6
+    assert recipe_core.source_head.real_mask_scale == pytest.approx(1.5)
+    params = sum(p.numel() for p in recipe_core.parameters())
+    assert 2_000_000 <= params <= 8_000_000
+    assert recipe_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+    assert system.model.residual_source_enabled is True
+
+
+def test_tvconv_pyramid_waveform_wrapper_returns_aux_masks() -> None:
+    torch.manual_seed(0)
+    model = build_tvconv_pyramid_npu_separator_system(
+        n_fft=64,
+        hop_length=16,
+        fs=8000,
+        n_src=3,
+        n_chan=1,
+        core_n_src=2,
+        base_channels=8,
+        bottleneck_channels=16,
+        n_down=2,
+        n_blocks=1,
+        expansion=2,
+        time_kernel=3,
+        time_dilation_cycle=(1,),
+        band_kernel=3,
+        mask_hidden=8,
+        real_mask_scale=1.5,
+        residual_source_enabled=True,
+        residual_source_index=2,
+        freq_preprocess_enabled=False,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 512)
+
+    with torch.no_grad():
+        est, aux = model(wav, return_aux=True)
+
+    assert tuple(est.shape) == (1, 3, 1, 512)
+    assert set(aux) == {
+        "mask",
+        "mask_domain",
+        "mask_logits",
+        "mask_logits_domain",
+        "mask_logits_transform",
+        "mask_logits_real_scale",
+        "mask_logits_imag_scale",
+    }
+    assert aux["mask_domain"] == "packed_complex_mask"
+    assert aux["mask_logits_domain"] == "tvconv_pyramid_complex_mask_logits"
+    assert aux["mask_logits_transform"] == "sigmoid_tanh_complex_mask"
+    assert aux["mask_logits_real_scale"] == pytest.approx(1.5)
+    assert aux["mask_logits_imag_scale"] == pytest.approx(0.12)
+    assert aux["mask"].ndim == 4
+    assert aux["mask"].shape[1] == 4
+    assert aux["mask"].shape[-1] == 33
+
+
 def test_source_aware_melband_roformer_teacher_forward_and_recipe() -> None:
     torch.manual_seed(0)
     model = build_source_aware_melband_roformer_teacher_system(
@@ -166,7 +287,15 @@ def test_source_aware_melband_roformer_teacher_forward_and_recipe() -> None:
     wav = torch.randn(1, 1, 256)
     with torch.no_grad():
         est = model(wav)
+        aux_est, aux = model(wav, return_aux=True)
     assert tuple(est.shape) == (1, 2, 1, 256)
+    torch.testing.assert_close(aux_est, est, rtol=1e-5, atol=1e-5)
+    assert set(aux) == {"mask", "mask_domain", "mask_logits", "mask_logits_domain"}
+    assert aux["mask_domain"] == "packed_complex_mask"
+    assert aux["mask_logits_domain"] == "source_aware_melband_roformer_complex_mask_logits"
+    assert aux["mask"].ndim == 4
+    assert aux["mask"].shape[1] == 4
+    torch.testing.assert_close(aux["mask_logits"], aux["mask"])
 
     core = SourceAwareMelBandRoformer2D(
         n_freq=33,
@@ -213,6 +342,23 @@ def test_source_aware_melband_roformer_teacher_forward_and_recipe() -> None:
     assert tuple(masks.shape) == (1, 4, 4, 33)
 
     config_path = Path("recipes/dnr/models/source-aware-melband-roformer.teacher/config.yaml")
+    student_config_path = Path(
+        "recipes/dnr/models/tvconv-pyramid-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml"
+    )
+    raw_config = OmegaConf.load(config_path)
+    student_config = OmegaConf.load(student_config_path)
+    assert "_base_" not in raw_config
+    assert str(raw_config.datamodule._target_).endswith("OnTheFlyStemDataModule")
+    assert raw_config.datamodule.batch_size == 1
+    assert raw_config.datamodule.val_batch_size == student_config.datamodule.val_batch_size
+    assert raw_config.datamodule.test_batch_size == student_config.datamodule.test_batch_size
+    assert OmegaConf.to_container(raw_config.datamodule.synthesis, resolve=True) == OmegaConf.to_container(
+        student_config.datamodule.synthesis,
+        resolve=True,
+    )
+    assert raw_config.trainer._target_ == "lightning.Trainer"
+    assert raw_config.task.loss._target_.endswith("ThresSNRLossWithInactiveSource")
+
     top = merge_top_level_scalars(config_path)
     model_cfg = merge_task_model_mapping(config_path)
     context = {**top, **model_cfg}
@@ -855,6 +1001,16 @@ def test_source_aware_melband_loco_cnb_student_npu_forward_streaming_and_recipe(
     lowlat_distill_context = {**lowlat_distill_top, **lowlat_distill_model_cfg}
     assert resolve_value(lowlat_distill_model_cfg["cnb_merge_dilations"], lowlat_distill_context) is True
     assert resolve_value(lowlat_distill_model_cfg["mixture_consistency"], lowlat_distill_context) is False
+
+    tv_path = Path(
+        "recipes/dnr/models/source-aware-melband-loco-cnb.tv-stems.robust-lowlat.distill.rt192k.fp512keep475/config.yaml"
+    )
+    tv_text = tv_path.read_text(encoding="utf-8")
+    assert "source_loss_weights" in tv_text
+    assert "robust_label_loss_weight" in tv_text
+    tv_system = build_model_system_from_recipe_config(tv_path).eval()
+    assert tv_system.model.core.cnb_merge_dilations is True
+    assert tv_system.model.residual_source_enabled is True
 
 
 def test_source_aware_melband_loco_cnb_student_npu_onnx_audit_smoke() -> None:
@@ -1835,6 +1991,57 @@ def test_distillation_task_requires_teacher_when_weighted() -> None:
         raise AssertionError("Expected teacher_loss_weight without teacher_model to fail")
 
 
+def test_distillation_task_source_weights_prioritize_speech_losses() -> None:
+    est = torch.zeros(1, 3, 1, 8)
+    ref = torch.zeros_like(est)
+    ref[:, 0] = 1.0
+
+    base_task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        robust_label_loss_weight=0.1,
+    )
+    speech_task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        source_loss_weights={"speech": 3.0, "music": 1.0, "effects": 0.5},
+        robust_label_loss_weight=0.1,
+    )
+
+    assert speech_task._robust_label_loss(est, ref) > base_task._robust_label_loss(est, ref)
+    assert speech_task._source_activity_l1(est, ref) > base_task._source_activity_l1(est, ref)
+
+
+def test_distillation_task_rejects_unknown_source_weight_name() -> None:
+    with pytest.raises(ValueError, match="unknown sources"):
+        TeacherStudentDistillationTask(
+            model=torch.nn.Identity(),
+            loss=torch.nn.L1Loss(),
+            n_fft=32,
+            hop_length=8,
+            optimizer_config=object(),  # type: ignore[arg-type]
+            source_loss_weights={"dialog": 1.0},
+        )
+
+
+def test_distillation_task_rejects_source_weight_length_mismatch() -> None:
+    with pytest.raises(ValueError, match="source_order has 3"):
+        TeacherStudentDistillationTask(
+            model=torch.nn.Identity(),
+            loss=torch.nn.L1Loss(),
+            n_fft=32,
+            hop_length=8,
+            optimizer_config=object(),  # type: ignore[arg-type]
+            source_loss_weights=(1.0, 0.5),
+        )
+
+
 def test_composite_separation_spectral_loss_is_differentiable() -> None:
     torch.manual_seed(0)
     loss_fn = CompositeSeparationSpectralLoss(
@@ -1879,6 +2086,43 @@ class _ToyBandSpecSeparator(torch.nn.Module):
         return torch.stack([wav * self.scale, wav * (1.0 - self.scale)], dim=1)
 
 
+class _ToyAuxSeparator(torch.nn.Module):
+    def __init__(
+        self,
+        scale: float,
+        *,
+        mask_channels: int,
+        mask_frames: int,
+        mask_bins: int,
+        logit_domain: str | None = "toy_logits",
+    ) -> None:
+        super().__init__()
+        self.scale = scale
+        self.mask_channels = mask_channels
+        self.mask_frames = mask_frames
+        self.mask_bins = mask_bins
+        self.logit_domain = logit_domain
+
+    def forward(self, wav: torch.Tensor, *, return_aux: bool = False) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        est = torch.stack([wav * self.scale, wav * (1.0 - self.scale)], dim=1)
+        if not return_aux:
+            return est
+        mask = wav.new_full((wav.shape[0], self.mask_channels, self.mask_frames, self.mask_bins), self.scale)
+        aux = {
+            "mask": mask,
+            "mask_domain": "packed_complex_mask",
+            "mask_logits": mask,
+        }
+        if self.logit_domain is not None:
+            aux["mask_logits_domain"] = self.logit_domain
+        return est, aux
+
+
+class _NoAuxSeparator(torch.nn.Module):
+    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+        return torch.stack([wav, wav * 0.0], dim=1)
+
+
 def test_distillation_task_supports_activity_mask_logit_and_latent_losses() -> None:
     torch.manual_seed(0)
     student = _ToyLatentSeparator(scale=0.4)
@@ -1912,6 +2156,200 @@ def test_distillation_task_supports_activity_mask_logit_and_latent_losses() -> N
         task._latent_distillation_loss(student_aux, teacher_aux),
     ]
     assert all(loss.ndim == 0 and torch.isfinite(loss) for loss in losses)
+
+
+def test_distillation_task_requests_aux_and_applies_source_specific_losses() -> None:
+    student = _ToyAuxSeparator(scale=0.4, mask_channels=4, mask_frames=3, mask_bins=5)
+    teacher = _ToyAuxSeparator(scale=0.6, mask_channels=6, mask_frames=4, mask_bins=7)
+    task = TeacherStudentDistillationTask(
+        model=student,
+        teacher_model=teacher,
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        request_model_aux=True,
+        teacher_mask_loss_weight=0.1,
+        teacher_logit_loss_weight=0.1,
+        source_order=("speech", "effects"),
+        source_loss_weights=(1.6, 0.85),
+        source_weighted_snr_loss_weight=0.1,
+        explicit_source_loss_weight=0.1,
+        residual_source_loss_weight=0.1,
+        residual_source_index=1,
+        mask_aux_alignment="shared_prefix",
+        mask_aux_max_frame_mismatch=1,
+        distillation_band_mapping="linear",
+    )
+    wav = torch.randn(2, 1, 128)
+    ref = torch.stack([wav * 0.7, wav * 0.3], dim=1)
+
+    est, student_aux = task._forward_model(task.model, wav, ref, "training", css_validation=False)
+    teacher_est, teacher_aux = task._teacher_forward(wav, ref=ref, log_prefix="training")
+    losses = [
+        task._source_weighted_snr_loss(est, ref),
+        task._robust_source_subset_loss(est, ref, (0,)),
+        task._robust_source_subset_loss(est, ref, (1,)),
+        task._mask_or_logit_loss(est, teacher_est, wav, student_aux, teacher_aux, logit=False),
+        task._mask_or_logit_loss(est, teacher_est, wav, student_aux, teacher_aux, logit=True),
+    ]
+
+    assert set(student_aux) == {"mask", "mask_domain", "mask_logits", "mask_logits_domain"}
+    assert student_aux["mask"].shape == (2, 4, 3, 5)
+    assert all(loss.ndim == 0 and torch.isfinite(loss) for loss in losses)
+
+
+def test_distillation_task_requires_model_aux_when_configured() -> None:
+    task = TeacherStudentDistillationTask(
+        model=_NoAuxSeparator(),
+        teacher_model=_NoAuxSeparator(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        request_model_aux=True,
+        require_model_aux=True,
+    )
+    wav = torch.randn(1, 1, 64)
+    ref = torch.stack([wav, wav * 0.0], dim=1)
+
+    with pytest.raises(RuntimeError, match="does not accept return_aux"):
+        task._forward_model(task.model, wav, ref, "training", css_validation=False)
+
+
+def test_distillation_task_logit_aux_requires_matching_domains() -> None:
+    task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        teacher_model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+    )
+    wav = torch.ones(1, 1, 64)
+    est = torch.stack([wav, wav], dim=1)
+    teacher_est = est.clone()
+    student_logits = torch.zeros(1, 2, 3, 4)
+    teacher_logits = torch.full_like(student_logits, 100.0)
+
+    mismatch_loss = task._mask_or_logit_loss(
+        est,
+        teacher_est,
+        wav,
+        {"mask_logits": student_logits, "mask_logits_domain": "student_raw"},
+        {"mask_logits": teacher_logits, "mask_logits_domain": "teacher_raw"},
+        logit=True,
+    )
+    matched_loss = task._mask_or_logit_loss(
+        est,
+        teacher_est,
+        wav,
+        {"mask_logits": student_logits, "mask_logits_domain": "shared_raw"},
+        {"mask_logits": teacher_logits, "mask_logits_domain": "shared_raw"},
+        logit=True,
+    )
+
+    assert mismatch_loss.item() == pytest.approx(0.0)
+    assert matched_loss > 10.0
+
+
+def test_distillation_task_converts_teacher_mask_to_student_logit_domain() -> None:
+    task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        teacher_model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+    )
+    wav = torch.ones(1, 1, 64)
+    est = torch.stack([wav, wav], dim=1)
+    teacher_est = est.clone()
+    student_logits = torch.tensor([[[[-1.0, 0.5]], [[0.25, -0.75]]]])
+    real_scale = 1.5
+    imag_scale = 0.2
+    teacher_mask = student_logits.clone()
+    teacher_mask[:, 0::2] = torch.sigmoid(student_logits[:, 0::2]) * real_scale
+    teacher_mask[:, 1::2] = torch.tanh(student_logits[:, 1::2]) * imag_scale
+
+    loss = task._mask_or_logit_loss(
+        est,
+        teacher_est,
+        wav,
+        {
+            "mask_logits": student_logits,
+            "mask_logits_domain": "tvconv_pyramid_complex_mask_logits",
+            "mask_logits_transform": "sigmoid_tanh_complex_mask",
+            "mask_logits_real_scale": real_scale,
+            "mask_logits_imag_scale": imag_scale,
+        },
+        {
+            "mask": teacher_mask,
+            "mask_domain": "packed_complex_mask",
+            "mask_logits": torch.full_like(student_logits, 100.0),
+            "mask_logits_domain": "source_aware_melband_roformer_complex_mask_logits",
+        },
+        logit=True,
+    )
+
+    assert loss.item() == pytest.approx(0.0, abs=1.0e-5)
+
+
+def test_distillation_task_mask_aux_alignment_is_explicit() -> None:
+    strict_task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        teacher_model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        distillation_band_mapping="linear",
+    )
+    shared_task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        teacher_model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        mask_aux_alignment="shared_prefix",
+        mask_aux_max_frame_mismatch=1,
+        distillation_band_mapping="linear",
+    )
+    wav = torch.randn(2, 1, 128)
+    est = torch.stack([wav * 0.7, wav * 0.3], dim=1)
+    teacher_est = est.clone()
+    student_aux = {
+        "mask": torch.zeros(2, 4, 3, 5),
+        "mask_domain": "packed_complex_mask",
+    }
+    teacher_aux = {
+        "mask": torch.ones(2, 6, 4, 7),
+        "mask_domain": "packed_complex_mask",
+    }
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        strict_task._mask_or_logit_loss(est, teacher_est, wav, student_aux, teacher_aux, logit=False)
+    loss = shared_task._mask_or_logit_loss(est, teacher_est, wav, student_aux, teacher_aux, logit=False)
+    assert loss.ndim == 0 and torch.isfinite(loss)
+
+
+def test_distillation_task_latent_allow_missing_handles_parameterless_models() -> None:
+    task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        teacher_model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        latent_distillation_weight=0.1,
+        latent_allow_missing=True,
+    )
+
+    loss = task._latent_distillation_loss({}, {})
+
+    assert loss.ndim == 0
+    assert loss.item() == pytest.approx(0.0)
 
 
 def test_distillation_task_maps_teacher_band_tensors_to_student_grid() -> None:

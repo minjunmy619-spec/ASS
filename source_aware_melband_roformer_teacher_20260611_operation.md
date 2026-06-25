@@ -147,6 +147,24 @@ transient_weight: 0.08
 This is much closer to a serious separation training setup than the previous
 student-only supervised recipe.
 
+## Follow-up Config Refresh
+
+On 2026-06-25, the teacher recipe was made standalone instead of inheriting from
+`online-soft-band-query-sfc2d.causal96dim.12l.musical64/config.yaml`.
+
+Key changes:
+
+- Inlined the inherited top-level training scalars, trainer defaults, supervised
+  loss, optimizer, and scheduler settings directly in
+  `recipes/dnr/models/source-aware-melband-roformer.teacher/config.yaml`.
+- Replaced the inherited HDF5 datamodule with the same TV-domain on-the-fly
+  stem synthesis profile used by the TVConv student recipe: football/commentary,
+  live-concert vocal/music, karaoke music-control, and general CASS profiles.
+- Kept the teacher `batch_size: 1` while matching the student's synthesis
+  distribution; the RoFormer teacher is much heavier than the NPU student.
+- Removed stale inherited online-student model keys from the teacher model
+  mapping so the config describes only the RoFormer teacher.
+
 ## Validation
 
 Focused teacher test:
@@ -227,6 +245,66 @@ ModelWrapper
 SourceAwareMelBandRoformer2D
 10958019
 True
+```
+
+Follow-up full task instantiation after standalone config refresh:
+
+```bash
+cd /home/cmj/works/ASS
+PYTHONPATH=.:aiaccel .venv/bin/python - <<'PY'
+from pathlib import Path
+from hydra.utils import instantiate
+from aiaccel.config import load_config, resolve_inherit
+p = Path('recipes/dnr/models/source-aware-melband-roformer.teacher/config.yaml')
+config = resolve_inherit(load_config(p, {
+    'config_path': str(p),
+    'working_directory': str(p.parent.resolve()),
+    'base_config_path': str(Path('aiaccel/aiaccel/torch/apps/config').resolve()),
+}))
+task = instantiate(config.task).eval()
+print(type(task).__name__)
+print(type(task.model.model.core).__name__)
+print(config.datamodule._target_)
+print([profile.name for profile in config.datamodule.synthesis.synthesis_profiles])
+PY
+```
+
+Result:
+
+```text
+CompositeSupTask
+SourceAwareMelBandRoformer2D
+spectral_feature_compression.common.datamodules.on_the_fly_stem_datamodule.OnTheFlyStemDataModule
+['football_commentary_focus', 'live_concert_vocal_music', 'karaoke_music_control', 'general_cass']
+```
+
+Follow-up focused recipe test:
+
+```bash
+cd /home/cmj/works/ASS
+.venv/bin/python -m pytest \
+  tests/test_proposed_separation_models.py::test_source_aware_melband_roformer_teacher_forward_and_recipe -q
+```
+
+Result:
+
+```text
+1 passed
+```
+
+Follow-up focused suite:
+
+```bash
+cd /home/cmj/works/ASS
+.venv/bin/python -m pytest \
+  tests/test_on_the_fly_source_normalization.py \
+  tests/test_proposed_separation_models.py -q
+```
+
+Result:
+
+```text
+49 passed
 ```
 
 ## Training command

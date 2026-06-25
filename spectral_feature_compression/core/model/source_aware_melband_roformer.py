@@ -344,8 +344,14 @@ class ReconstructionHead2d(nn.Module):
             nn.Conv2d(2 * channels, out_ch, kernel_size=1, bias=True),
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.mask(x), self.residual(x)
+    def mask_logits(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mask(x)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # The RoFormer mask head has no post-projection activation. Its final
+        # projection is both the raw mask logit and the complex mask used below.
+        mask_logits = self.mask_logits(x)
+        return mask_logits, mask_logits, self.residual(x)
 
 
 class SourceAwareMelBandRoformer2D(nn.Module):
@@ -473,7 +479,7 @@ class SourceAwareMelBandRoformer2D(nn.Module):
         est = est + correction.unsqueeze(1)
         return est.reshape(batch, 2 * self.n_src * self.n_chan, n_frames, n_freq)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, return_aux: bool = False):
         _runtime_assert(x.ndim == 4, f"Expected [B,2M,T,F], got {x.shape}")
         _runtime_assert(x.shape[1] == 2 * self.n_chan, f"Expected {2 * self.n_chan} packed channels, got {x.shape}")
         _runtime_assert(x.shape[-1] == self.n_freq, f"Expected F={self.n_freq}, got {x.shape}")
@@ -493,16 +499,32 @@ class SourceAwareMelBandRoformer2D(nn.Module):
         flat, _, _, _, _, _ = _reshape_source_tokens(source_tokens)
         query_rep = query_tokens.repeat_interleave(self.n_src, dim=0)
         fullband = self.expander(flat, query_rep)
-        masks_flat, residual_flat = self.reconstruction(fullband)
+        masks_flat, mask_logits_flat, residual_flat = self.reconstruction(fullband)
         masks = masks_flat.reshape(batch, self.n_src * 2 * self.n_chan, n_frames, self.n_freq)
+        mask_logits = mask_logits_flat.reshape(batch, self.n_src * 2 * self.n_chan, n_frames, self.n_freq)
         if not self.masking:
+            if return_aux:
+                return masks, {
+                    "mask": masks,
+                    "mask_domain": "packed_complex_mask",
+                    "mask_logits": mask_logits,
+                    "mask_logits_domain": "source_aware_melband_roformer_complex_mask_logits",
+                }
             return masks
 
         estimates = _apply_packed_complex_mask_no_repeat(x=x, y=masks, n_src=self.n_src, n_chan=self.n_chan)
         if self.residual_output:
             residual = residual_flat.reshape(batch, self.n_src * 2 * self.n_chan, n_frames, self.n_freq)
             estimates = estimates + residual * self.residual_scale
-        return self._apply_mixture_consistency(estimates, x)
+        estimates = self._apply_mixture_consistency(estimates, x)
+        if return_aux:
+            return estimates, {
+                "mask": masks,
+                "mask_domain": "packed_complex_mask",
+                "mask_logits": mask_logits,
+                "mask_logits_domain": "source_aware_melband_roformer_complex_mask_logits",
+            }
+        return estimates
 
 
 class SourceAwareMelBandRoformerModel(nn.Module):
@@ -514,11 +536,19 @@ class SourceAwareMelBandRoformerModel(nn.Module):
         self.n_src = int(n_src)
         self.n_chan = int(n_chan)
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        del kwargs
+    def forward(self, x: torch.Tensor, **kwargs):
+        return_aux = bool(kwargs.pop("return_aux", False))
         x2d = pack_complex_stft_as_2d(x)
-        y2d = self.core(x2d)
-        return unpack_2d_to_complex_stft(y2d, n_src=self.n_src, n_chan=self.n_chan)
+        core_output = self.core(x2d, return_aux=return_aux)
+        if isinstance(core_output, tuple):
+            y2d, aux = core_output
+        else:
+            y2d = core_output
+            aux = {}
+        estimate = unpack_2d_to_complex_stft(y2d, n_src=self.n_src, n_chan=self.n_chan)
+        if return_aux:
+            return estimate, aux
+        return estimate
 
 
 def build_source_aware_melband_roformer_system(
