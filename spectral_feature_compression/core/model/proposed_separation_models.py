@@ -539,6 +539,20 @@ def build_source_aware_melband_roformer_teacher_system(
     freq_preprocess_keep_bins: int | None = None,
     freq_preprocess_target_bins: int | None = None,
     freq_preprocess_mode: str | None = None,
+    postprocess_enabled: bool = False,
+    postprocess_mixture_consistency: str = "none",
+    postprocess_final_mixture_consistency: str = "none",
+    postprocess_power_beta: float = 1.0,
+    postprocess_power_smoothing: float = 0.0,
+    postprocess_wiener_blend: float = 0.0,
+    postprocess_wiener_alpha: float = 1.0,
+    postprocess_leakage_gate_enabled: bool = False,
+    postprocess_leakage_gate_threshold_db: float = 12.0,
+    postprocess_leakage_gate_attenuation_db: float = 6.0,
+    postprocess_residual_source_index: int | None = None,
+    postprocess_misi_iterations: int = 0,
+    postprocess_misi_eps: float = 1.0e-8,
+    postprocess_eps: float = 1.0e-8,
 ):
     """Performance-first source-aware MelBand RoFormer teacher."""
 
@@ -577,6 +591,20 @@ def build_source_aware_melband_roformer_teacher_system(
         css_shift_size=css_shift_size,
         css_batch_size=css_batch_size,
         online_wrapper=online_wrapper,
+        postprocess_enabled=postprocess_enabled,
+        postprocess_mixture_consistency=postprocess_mixture_consistency,
+        postprocess_final_mixture_consistency=postprocess_final_mixture_consistency,
+        postprocess_power_beta=postprocess_power_beta,
+        postprocess_power_smoothing=postprocess_power_smoothing,
+        postprocess_wiener_blend=postprocess_wiener_blend,
+        postprocess_wiener_alpha=postprocess_wiener_alpha,
+        postprocess_leakage_gate_enabled=postprocess_leakage_gate_enabled,
+        postprocess_leakage_gate_threshold_db=postprocess_leakage_gate_threshold_db,
+        postprocess_leakage_gate_attenuation_db=postprocess_leakage_gate_attenuation_db,
+        postprocess_residual_source_index=postprocess_residual_source_index,
+        postprocess_misi_iterations=postprocess_misi_iterations,
+        postprocess_misi_eps=postprocess_misi_eps,
+        postprocess_eps=postprocess_eps,
     )
 
 

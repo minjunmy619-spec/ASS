@@ -21,6 +21,10 @@ from spectral_feature_compression.core.model.frequency_preprocessing import (
     resolve_preprocessed_n_freq,
 )
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
+from spectral_feature_compression.core.model.source_separation_postprocess import (
+    build_misi_phase_consistency,
+    build_source_separation_postprocessor,
+)
 
 
 def _validate_kernel(kernel_size: int, dilation: int, *, axis: str, limit: int = 14) -> None:
@@ -520,6 +524,20 @@ def build_tvconv_pyramid_npu_separator_system(
     css_segment_size: int = 12,
     css_shift_size: int = 6,
     css_batch_size: int = 1,
+    postprocess_enabled: bool = False,
+    postprocess_mixture_consistency: str = "none",
+    postprocess_final_mixture_consistency: str = "none",
+    postprocess_power_beta: float = 1.0,
+    postprocess_power_smoothing: float = 0.0,
+    postprocess_wiener_blend: float = 0.0,
+    postprocess_wiener_alpha: float = 1.0,
+    postprocess_leakage_gate_enabled: bool = False,
+    postprocess_leakage_gate_threshold_db: float = 12.0,
+    postprocess_leakage_gate_attenuation_db: float = 6.0,
+    postprocess_residual_source_index: int | None = None,
+    postprocess_misi_iterations: int = 0,
+    postprocess_misi_eps: float = 1.0e-8,
+    postprocess_eps: float = 1.0e-8,
 ) -> OnlineModelWrapper:
     explicit_n_src = int(core_n_src) if core_n_src is not None else int(n_src) - 1
     if residual_source_enabled:
@@ -586,6 +604,24 @@ def build_tvconv_pyramid_npu_separator_system(
         residual_source_enabled=residual_source_enabled,
         residual_source_index=residual_source_index,
     )
+    postprocessor = build_source_separation_postprocessor(
+        enabled=postprocess_enabled,
+        mixture_consistency=postprocess_mixture_consistency,
+        final_mixture_consistency=postprocess_final_mixture_consistency,
+        power_beta=postprocess_power_beta,
+        power_smoothing=postprocess_power_smoothing,
+        wiener_blend=postprocess_wiener_blend,
+        wiener_alpha=postprocess_wiener_alpha,
+        leakage_gate_enabled=postprocess_leakage_gate_enabled,
+        leakage_gate_threshold_db=postprocess_leakage_gate_threshold_db,
+        leakage_gate_attenuation_db=postprocess_leakage_gate_attenuation_db,
+        residual_source_index=postprocess_residual_source_index,
+        eps=postprocess_eps,
+    )
+    phase_consistency = build_misi_phase_consistency(
+        iterations=postprocess_misi_iterations,
+        eps=postprocess_misi_eps,
+    )
     return OnlineModelWrapper(
         model=model,
         n_fft=n_fft,
@@ -595,4 +631,6 @@ def build_tvconv_pyramid_npu_separator_system(
         css_segment_size=css_segment_size,
         css_shift_size=css_shift_size,
         css_batch_size=css_batch_size,
+        postprocessor=postprocessor,
+        phase_consistency=phase_consistency,
     )

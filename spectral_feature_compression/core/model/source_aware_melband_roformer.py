@@ -44,6 +44,10 @@ from spectral_feature_compression.core.model.online_soft_band_query_sfc_2d impor
     SoftBandQueryCompressor2d,
     SoftBandQueryExpander2d,
 )
+from spectral_feature_compression.core.model.source_separation_postprocess import (
+    build_misi_phase_consistency,
+    build_source_separation_postprocessor,
+)
 
 
 def _as_pair(value: Sequence[int] | int, *, name: str) -> tuple[int, int]:
@@ -584,6 +588,20 @@ def build_source_aware_melband_roformer_system(
     css_shift_size: int = 6,
     css_batch_size: int = 1,
     online_wrapper: bool = False,
+    postprocess_enabled: bool = False,
+    postprocess_mixture_consistency: str = "none",
+    postprocess_final_mixture_consistency: str = "none",
+    postprocess_power_beta: float = 1.0,
+    postprocess_power_smoothing: float = 0.0,
+    postprocess_wiener_blend: float = 0.0,
+    postprocess_wiener_alpha: float = 1.0,
+    postprocess_leakage_gate_enabled: bool = False,
+    postprocess_leakage_gate_threshold_db: float = 12.0,
+    postprocess_leakage_gate_attenuation_db: float = 6.0,
+    postprocess_residual_source_index: int | None = None,
+    postprocess_misi_iterations: int = 0,
+    postprocess_misi_eps: float = 1.0e-8,
+    postprocess_eps: float = 1.0e-8,
 ):
     n_freq = (n_fft // 2) + 1
     model = SourceAwareMelBandRoformerModel(
@@ -614,6 +632,24 @@ def build_source_aware_melband_roformer_system(
         routing_normalization=routing_normalization,
         layer_scale_init=layer_scale_init,
     )
+    postprocessor = build_source_separation_postprocessor(
+        enabled=postprocess_enabled,
+        mixture_consistency=postprocess_mixture_consistency,
+        final_mixture_consistency=postprocess_final_mixture_consistency,
+        power_beta=postprocess_power_beta,
+        power_smoothing=postprocess_power_smoothing,
+        wiener_blend=postprocess_wiener_blend,
+        wiener_alpha=postprocess_wiener_alpha,
+        leakage_gate_enabled=postprocess_leakage_gate_enabled,
+        leakage_gate_threshold_db=postprocess_leakage_gate_threshold_db,
+        leakage_gate_attenuation_db=postprocess_leakage_gate_attenuation_db,
+        residual_source_index=postprocess_residual_source_index,
+        eps=postprocess_eps,
+    )
+    phase_consistency = build_misi_phase_consistency(
+        iterations=postprocess_misi_iterations,
+        eps=postprocess_misi_eps,
+    )
     wrapper_cls = OnlineModelWrapper if online_wrapper else ModelWrapper
     return wrapper_cls(
         model=model,
@@ -624,6 +660,8 @@ def build_source_aware_melband_roformer_system(
         css_segment_size=css_segment_size,
         css_shift_size=css_shift_size,
         css_batch_size=css_batch_size,
+        postprocessor=postprocessor,
+        phase_consistency=phase_consistency,
     )
 
 

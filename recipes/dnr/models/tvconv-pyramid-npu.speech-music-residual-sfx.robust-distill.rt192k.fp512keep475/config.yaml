@@ -298,6 +298,20 @@ task:
     css_segment_size: 12
     css_shift_size: 6
     css_batch_size: 1
+    postprocess_enabled: false
+    postprocess_mixture_consistency: power
+    postprocess_final_mixture_consistency: power
+    postprocess_power_beta: 1.0
+    postprocess_power_smoothing: 0.2
+    postprocess_wiener_blend: 0.25
+    postprocess_wiener_alpha: 1.0
+    postprocess_leakage_gate_enabled: false
+    postprocess_leakage_gate_threshold_db: 12.0
+    postprocess_leakage_gate_attenuation_db: 6.0
+    postprocess_residual_source_index: 2
+    postprocess_misi_iterations: 0
+    postprocess_misi_eps: 1.0e-8
+    postprocess_eps: 1.0e-8
   teacher_model:
     _target_: spectral_feature_compression.core.model.proposed_separation_models.build_source_aware_melband_roformer_teacher_system
     n_fft: ${teacher_n_fft}
@@ -331,6 +345,20 @@ task:
     css_shift_size: 6
     css_batch_size: 1
     online_wrapper: false
+    postprocess_enabled: false
+    postprocess_mixture_consistency: power
+    postprocess_final_mixture_consistency: power
+    postprocess_power_beta: 1.0
+    postprocess_power_smoothing: 0.2
+    postprocess_wiener_blend: 0.25
+    postprocess_wiener_alpha: 1.0
+    postprocess_leakage_gate_enabled: false
+    postprocess_leakage_gate_threshold_db: 12.0
+    postprocess_leakage_gate_attenuation_db: 6.0
+    postprocess_residual_source_index: null
+    postprocess_misi_iterations: 0
+    postprocess_misi_eps: 1.0e-8
+    postprocess_eps: 1.0e-8
   loss:
     _target_: spectral_feature_compression.core.loss.snr.ThresSNRLossWithInactiveSource
     solve_perm: false

@@ -107,12 +107,16 @@ class OnlineModelWrapper(nn.Module):
         css_segment_size: int = 6,
         css_shift_size: int = 6,
         css_batch_size: int = 1,
+        postprocessor: nn.Module | None = None,
+        phase_consistency: nn.Module | None = None,
     ):
         super().__init__()
         if scaling:
             raise ValueError("OnlineModelWrapper does not support global scaling in strict realtime mode.")
 
         self.model = model
+        self.postprocessor = postprocessor
+        self.phase_consistency = phase_consistency
         self.stft = nn.Sequential(Spectrogram(n_fft=n_fft, hop_length=hop_length, power=None, center=False))
         self.istft = CausalISTFTOLA(n_fft=n_fft, hop_length=hop_length)
 
@@ -152,6 +156,17 @@ class OnlineModelWrapper(nn.Module):
             return_aux = False
 
         with autocast(device_type="cuda", enabled=False):
+            if self.postprocessor is not None:
+                est_stft = self.postprocessor(est_stft, x)
+            if self.phase_consistency is not None:
+                est_stft = self.phase_consistency(
+                    est_stft,
+                    wav_pad,
+                    stft=self.stft,
+                    istft=self.istft,
+                    length=wav_pad.shape[-1],
+                    target_frames=x.shape[-1],
+                )
             est_pad = self.istft(est_stft, wav_pad.shape[-1])
 
         est = est_pad[..., left_pad : left_pad + wav.shape[-1]]

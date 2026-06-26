@@ -3,10 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 
+from omegaconf import OmegaConf
+
 import torch
 
 import pytest
-from omegaconf import OmegaConf
 
 from BandSFCNetNPU.presets import build_band_sfc_net_npu_preset
 from spectral_feature_compression.core.loss.composite_separation import CompositeSeparationSpectralLoss
@@ -189,6 +190,23 @@ def test_tvconv_pyramid_npu_forward_streaming_and_recipe_budget() -> None:
     assert config.task.teacher_logit_loss_weight == pytest.approx(0.05)
     assert config.task.distillation_band_mapping == "linear"
     assert config.task.mask_aux_alignment == "shared_prefix"
+    assert config.task.model.postprocess_enabled is False
+    assert config.task.model.postprocess_mixture_consistency == "power"
+    assert config.task.model.postprocess_final_mixture_consistency == "power"
+    assert config.task.model.postprocess_wiener_blend == pytest.approx(0.25)
+    assert config.task.model.postprocess_leakage_gate_enabled is False
+    assert config.task.model.postprocess_leakage_gate_threshold_db == pytest.approx(12.0)
+    assert config.task.model.postprocess_leakage_gate_attenuation_db == pytest.approx(6.0)
+    assert config.task.model.postprocess_residual_source_index == 2
+    assert config.task.model.postprocess_misi_iterations == 0
+    assert config.task.model.postprocess_misi_eps == pytest.approx(1.0e-8)
+    assert config.task.teacher_model.postprocess_enabled is False
+    assert config.task.teacher_model.postprocess_mixture_consistency == "power"
+    assert config.task.teacher_model.postprocess_final_mixture_consistency == "power"
+    assert config.task.teacher_model.postprocess_wiener_blend == pytest.approx(0.25)
+    assert config.task.teacher_model.postprocess_leakage_gate_enabled is False
+    assert config.task.teacher_model.postprocess_residual_source_index is None
+    assert config.task.teacher_model.postprocess_misi_iterations == 0
     assert config.task.source_loss_weight_normalization == "full_mean"
     assert config.task.source_weighted_snr_loss_weight > 0.0
     assert config.task.residual_source_loss_weight > 0.0
@@ -210,6 +228,8 @@ def test_tvconv_pyramid_npu_forward_streaming_and_recipe_budget() -> None:
     assert 2_000_000 <= params <= 8_000_000
     assert recipe_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
     assert system.model.residual_source_enabled is True
+    assert system.postprocessor is None
+    assert system.phase_consistency is None
 
 
 def test_tvconv_pyramid_waveform_wrapper_returns_aux_masks() -> None:
@@ -236,6 +256,11 @@ def test_tvconv_pyramid_waveform_wrapper_returns_aux_masks() -> None:
         freq_preprocess_enabled=False,
         css_segment_size=1,
         css_shift_size=1,
+        postprocess_enabled=True,
+        postprocess_final_mixture_consistency="uniform",
+        postprocess_leakage_gate_enabled=True,
+        postprocess_residual_source_index=2,
+        postprocess_misi_iterations=1,
     ).eval()
     wav = torch.randn(1, 1, 512)
 
@@ -243,6 +268,8 @@ def test_tvconv_pyramid_waveform_wrapper_returns_aux_masks() -> None:
         est, aux = model(wav, return_aux=True)
 
     assert tuple(est.shape) == (1, 3, 1, 512)
+    assert model.postprocessor is not None
+    assert model.phase_consistency is not None
     assert set(aux) == {
         "mask",
         "mask_domain",

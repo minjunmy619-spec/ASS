@@ -133,6 +133,65 @@ intended training behavior. Fixed items:
 - The TVConv complex mask head now has configurable `real_mask_scale`; the
   recipe uses `1.5` so speech/music estimates are not capped at mixture
   magnitude.
+- Added an opt-in STFT-domain postprocess stack outside the NPU core:
+  - power/uniform mixture-consistency projection,
+  - causal power smoothing for post-filter statistics,
+  - blended generalized Wiener refinement,
+  - conservative leakage gating for source-dominated TF bins,
+  - optional MISI-style phase/mixing-consistency iterations,
+  - optional residual-source replacement such as `effects = mixture - speech -
+    music`.
+  The TVConv recipe keeps `postprocess_enabled: false` by default, but carries
+  a ready ablation profile with power consistency, `0.2` power smoothing,
+  `0.25` Wiener blend, a disabled `12 dB` / `6 dB` leakage gate, and residual
+  source index `2`. MISI defaults to `postprocess_misi_iterations: 0` because
+  each iteration adds a full iSTFT/STFT pass and should be measured as a
+  host-side quality/cost ablation.
+- Follow-up code review tightened the postprocess surface:
+  - finite numeric validation now rejects `NaN`/`inf` gains, smoothing factors,
+    thresholds, and eps values before they can poison separated audio;
+  - residual-source indices and MISI iteration counts must be real integers,
+    not silently truncated floats;
+  - MISI now fails early on source-count, frame-count, or waveform-length
+    mismatches instead of surfacing as a later tensor broadcast error;
+  - the TVConv robust-distillation recipe now spells out the same disabled
+    postprocess profile for the nested RoFormer `teacher_model`, so recipe
+    parsing does not depend on hidden builder defaults.
+
+## Postprocess Usage Guide
+
+Keep the postprocess stack outside the exported NPU graph. For NPU export or
+streaming compilation, leave:
+
+```yaml
+postprocess_enabled: false
+postprocess_misi_iterations: 0
+```
+
+For offline/host-side quality ablations, enable stages in this order:
+
+1. Start with final mixture consistency:
+   `postprocess_enabled: true`, `postprocess_final_mixture_consistency: power`.
+   This is the lowest-risk way to make separated stems add back to the mixture.
+2. Add residual-source replacement for residual SFX recipes:
+   `postprocess_residual_source_index: 2`. This keeps speech/music explicit
+   and fills effects with the exact remaining mixture energy.
+3. Add light causal statistics only if it measures better:
+   `postprocess_power_smoothing: 0.1` to `0.3`,
+   `postprocess_wiener_blend: 0.1` to `0.25`.
+4. Try leakage gating conservatively:
+   keep `postprocess_leakage_gate_threshold_db` around `9` to `15` and
+   `postprocess_leakage_gate_attenuation_db` around `3` to `9`. Stronger
+   attenuation can create musical-noise artifacts in crowd/concert scenes.
+5. Try MISI last:
+   `postprocess_misi_iterations: 1` is the first useful setting. More
+   iterations are expensive because each one adds one iSTFT/STFT loop. Use it
+   for offline evaluation or a CPU/DSP host-side quality mode, not for the
+   exported NPU separator.
+
+Distillation note: postprocessing changes the wrapper waveform output. The
+auxiliary `mask` / `mask_logits` tensors remain the model's pre-postprocess
+outputs, so logit/mask distillation still compares model domains directly.
 
 ## Verification Commands
 
@@ -208,6 +267,227 @@ Full focused rerun after true-logit exposure and TVConv-domain conversion:
 Result:
 
 - `49 passed`
+
+Focused rerun after adding the opt-in STFT postprocess stack:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_model_wrapper.py::test_source_separation_postprocessor_enforces_mixture_consistency \
+  tests/test_online_model_wrapper.py::test_source_separation_postprocessor_wiener_and_residual_source \
+  tests/test_online_model_wrapper.py::test_model_wrapper_postprocessor_improves_remix_consistency \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_npu_forward_streaming_and_recipe_budget \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_waveform_wrapper_returns_aux_masks \
+  tests/test_proposed_separation_models.py::test_source_aware_melband_roformer_teacher_forward_and_recipe -q
+```
+
+Result:
+
+- `6 passed`
+
+Full focused rerun after adding the opt-in STFT postprocess stack:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_model_wrapper.py \
+  tests/test_on_the_fly_source_normalization.py \
+  tests/test_proposed_separation_models.py -q
+```
+
+Result:
+
+- `55 passed`
+
+Ruff/checks for the touched files:
+
+```bash
+.venv/bin/python -m ruff check \
+  spectral_feature_compression/core/model/source_separation_postprocess.py \
+  spectral_feature_compression/core/model/model_wrapper.py \
+  spectral_feature_compression/core/model/online_model_wrapper.py \
+  spectral_feature_compression/core/model/tvconv_pyramid_npu_separator_2d.py \
+  spectral_feature_compression/core/model/source_aware_melband_roformer.py \
+  spectral_feature_compression/core/model/proposed_separation_models.py \
+  tests/test_online_model_wrapper.py \
+  tests/test_proposed_separation_models.py
+git diff --check
+```
+
+Result:
+
+- `All checks passed`
+- `git diff --check` clean
+
+Focused rerun after adding the conservative leakage gate:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_model_wrapper.py::test_source_separation_postprocessor_leakage_gate_is_conservative \
+  tests/test_online_model_wrapper.py::test_source_separation_postprocessor_leakage_gate_keeps_final_consistency \
+  tests/test_online_model_wrapper.py::test_source_separation_postprocessor_wiener_and_residual_source \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_npu_forward_streaming_and_recipe_budget \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_waveform_wrapper_returns_aux_masks -q
+```
+
+Result:
+
+- `5 passed`
+
+Full focused rerun after adding the conservative leakage gate:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_model_wrapper.py \
+  tests/test_on_the_fly_source_normalization.py \
+  tests/test_proposed_separation_models.py -q
+```
+
+Result:
+
+- `57 passed`
+
+Focused rerun after adding the optional MISI phase/mixing-consistency stage:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_model_wrapper.py::test_misi_phase_consistency_projects_sources_back_to_mixture \
+  tests/test_online_model_wrapper.py::test_model_wrapper_phase_consistency_improves_remix_consistency \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_npu_forward_streaming_and_recipe_budget \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_waveform_wrapper_returns_aux_masks -q
+```
+
+Result:
+
+- `4 passed`
+
+Full focused rerun after adding the optional MISI phase/mixing-consistency
+stage:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_model_wrapper.py \
+  tests/test_on_the_fly_source_normalization.py \
+  tests/test_proposed_separation_models.py -q
+```
+
+Result:
+
+- `59 passed`
+
+Ruff/checks for the MISI-touched files:
+
+```bash
+.venv/bin/ruff check \
+  spectral_feature_compression/core/model/source_separation_postprocess.py \
+  spectral_feature_compression/core/model/model_wrapper.py \
+  spectral_feature_compression/core/model/online_model_wrapper.py \
+  spectral_feature_compression/core/model/tvconv_pyramid_npu_separator_2d.py \
+  spectral_feature_compression/core/model/source_aware_melband_roformer.py \
+  spectral_feature_compression/core/model/proposed_separation_models.py \
+  tests/test_online_model_wrapper.py \
+  tests/test_proposed_separation_models.py
+git diff --check
+```
+
+Result:
+
+- `All checks passed`
+- `git diff --check` clean
+
+Focused rerun after the postprocess code-review fixes:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_model_wrapper.py::test_source_separation_postprocessor_rejects_ambiguous_config_values \
+  tests/test_online_model_wrapper.py::test_misi_phase_consistency_rejects_ambiguous_config_and_shape_values \
+  tests/test_online_model_wrapper.py::test_misi_phase_consistency_projects_sources_back_to_mixture \
+  tests/test_online_model_wrapper.py::test_model_wrapper_phase_consistency_improves_remix_consistency \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_npu_forward_streaming_and_recipe_budget \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_waveform_wrapper_returns_aux_masks -q
+```
+
+Result:
+
+- `6 passed`
+
+Full focused rerun after the postprocess code-review fixes:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_model_wrapper.py \
+  tests/test_on_the_fly_source_normalization.py \
+  tests/test_proposed_separation_models.py -q
+```
+
+Result:
+
+- `61 passed`
+
+Ruff/checks after the postprocess code-review fixes:
+
+```bash
+.venv/bin/ruff check \
+  spectral_feature_compression/core/model/source_separation_postprocess.py \
+  spectral_feature_compression/core/model/model_wrapper.py \
+  spectral_feature_compression/core/model/online_model_wrapper.py \
+  spectral_feature_compression/core/model/tvconv_pyramid_npu_separator_2d.py \
+  spectral_feature_compression/core/model/source_aware_melband_roformer.py \
+  spectral_feature_compression/core/model/proposed_separation_models.py \
+  tests/test_online_model_wrapper.py \
+  tests/test_proposed_separation_models.py
+git diff --check
+```
+
+Result:
+
+- `All checks passed`
+- `git diff --check` clean
+
+Post-review streaming ONNX export rerun:
+
+```bash
+.venv/bin/python tools/online/export_onnx_online_model.py \
+  recipes/dnr/models/tvconv-pyramid-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml \
+  --out logs/npu_verify_general/tvconv_pyramid_stream.onnx \
+  --n-chan 1 \
+  --frames 1 \
+  --opset 14 \
+  --check \
+  --streaming \
+  --op-preset edge_npu_recommended \
+  --deploy-manifest-out logs/npu_verify_general/tvconv_pyramid_stream_manifest.json \
+  --state-meta-out logs/npu_verify_general/tvconv_pyramid_stream_state.json
+```
+
+Result:
+
+- ONNX checker passed.
+- Ops:
+  `Add, Concat, Constant, Conv, ConvTranspose, Identity, Mul, Relu, Sigmoid, Slice, Split, Sub, Tanh`
+- Disallowed ops: none.
+- Core export stayed `TVConvPyramidNPUSeparator2D`; no postprocess/MISI nodes
+  entered the exported graph.
+
+Post-review strict-edge audit rerun:
+
+```bash
+.venv/bin/python tools/online/audit_onnx_model.py \
+  logs/npu_verify_general/tvconv_pyramid_stream.onnx \
+  --op-preset edge_npu_recommended \
+  --state-meta logs/npu_verify_general/tvconv_pyramid_stream_state.json \
+  --budget-kib 192 \
+  --budget-dtype fp16 \
+  --risk-profile tiger_one_strict_edge
+```
+
+Result:
+
+- Streaming state fp16 estimate: `184320 B` (`180.00 KiB`), under the
+  `192 KiB` state budget.
+- Disallowed ops: none.
+- Strict-edge risks: false.
+- The audit's combined `state + ONNX initializers` budget remains false because
+  it includes model weights; the relevant streaming state I/O quota is still
+  under budget.
 
 Streaming ONNX export:
 

@@ -22,10 +22,14 @@ class ModelWrapper(nn.Module):
         css_segment_size: int = 6,
         css_shift_size: int = 6,
         css_batch_size: int = 1,
+        postprocessor: nn.Module | None = None,
+        phase_consistency: nn.Module | None = None,
     ):
         super().__init__()
 
         self.model = model
+        self.postprocessor = postprocessor
+        self.phase_consistency = phase_consistency
 
         self.stft = nn.Sequential(Spectrogram(n_fft=n_fft, hop_length=hop_length, power=None))
         self.istft = InverseSpectrogram(n_fft=n_fft, hop_length=hop_length)
@@ -64,6 +68,17 @@ class ModelWrapper(nn.Module):
             return_aux = False
 
         with autocast(device_type="cuda", enabled=False):
+            if self.postprocessor is not None:
+                est_stft = self.postprocessor(est_stft, x)
+            if self.phase_consistency is not None:
+                est_stft = self.phase_consistency(
+                    est_stft,
+                    wav,
+                    stft=self.stft,
+                    istft=self.istft,
+                    length=wav.shape[-1],
+                    target_frames=x.shape[-1],
+                )
             est = self.istft(est_stft, wav.shape[-1])  # [B, N, M, T]
 
         if self.scaling:
