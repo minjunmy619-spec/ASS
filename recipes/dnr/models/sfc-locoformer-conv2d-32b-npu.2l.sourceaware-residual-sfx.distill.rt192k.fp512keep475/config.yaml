@@ -1,0 +1,78 @@
+_base_: ../source-aware-melband-loco-cnb.student-npu-residual-sfx.distill.rt192k.fp512keep475/config.yaml
+
+# Lite-SFC direction: 32 adaptive bands, Conv2D SFC transport, and a 2-layer
+# Conv2D Locoformer separator. Speech/music are explicit complex masks; SFX is
+# reconstructed wrapper-side as mixture - speech - music.
+sfc_loco_n_bands: 32
+sfc_loco_d_model: 192
+sfc_loco_layers: 2
+sfc_loco_kernel_size: [3, 3]
+sfc_loco_routing_kernel_size: [1, 3]
+sfc_loco_dilation_cycle: [1, 2]
+sfc_loco_expansion: 2
+sfc_loco_ffn_expansion: 4
+sfc_loco_source_head_channels: 128
+sfc_loco_source_refine_layers: 1
+sfc_loco_source_kernel_size: 5
+sfc_loco_real_mask_scale: 1.5
+sfc_loco_imag_mask_scale: 0.12
+sfc_loco_low_freq_hz: 1000.0
+sfc_loco_low_freq_band_fraction: 0.45
+sfc_loco_overlap_factor: 1.5
+sfc_loco_low_freq_overlap_factor: 2.0
+sfc_loco_routing_normalization: softmax
+
+task:
+    request_model_aux: true
+    require_model_aux: true
+    mask_aux_alignment: shared_prefix
+    mask_aux_max_frame_mismatch: 1
+    source_loss_weight_normalization: full_mean
+    source_loss_weights:
+        speech: 1.4
+        music: 1.1
+        effects: 0.9
+    source_weighted_snr_loss_weight: 0.2
+    explicit_source_loss_weight: 0.1
+    residual_source_loss_weight: 0.05
+    residual_source_index: 2
+    mixture_consistency_weight: 0.0
+    model:
+        _target_: spectral_feature_compression.core.model.proposed_separation_models.build_sfc_locoformer_conv2d_32b_npu_system
+        n_fft: ${n_fft}
+        hop_length: ${hop_length}
+        fs: ${sr}
+        scaling: false
+        css_segment_size: 12
+        css_shift_size: 6
+        css_batch_size: 1
+        n_src: ${n_src}
+        n_chan: ${n_chan}
+        core_n_src: 2
+        residual_source_enabled: true
+        residual_source_index: 2
+        n_bands: ${sfc_loco_n_bands}
+        d_model: ${sfc_loco_d_model}
+        n_loco_layers: ${sfc_loco_layers}
+        n_layers: null
+        kernel_size: ${sfc_loco_kernel_size}
+        routing_kernel_size: ${sfc_loco_routing_kernel_size}
+        dilation_cycle: ${sfc_loco_dilation_cycle}
+        expansion: ${sfc_loco_expansion}
+        ffn_expansion: ${sfc_loco_ffn_expansion}
+        source_head_channels: ${sfc_loco_source_head_channels}
+        source_refine_layers: ${sfc_loco_source_refine_layers}
+        source_kernel_size: ${sfc_loco_source_kernel_size}
+        real_mask_scale: ${sfc_loco_real_mask_scale}
+        imag_mask_scale: ${sfc_loco_imag_mask_scale}
+        low_freq_hz: ${sfc_loco_low_freq_hz}
+        low_freq_band_fraction: ${sfc_loco_low_freq_band_fraction}
+        overlap_factor: ${sfc_loco_overlap_factor}
+        low_freq_overlap_factor: ${sfc_loco_low_freq_overlap_factor}
+        causal: true
+        masking: true
+        routing_normalization: ${sfc_loco_routing_normalization}
+        freq_preprocess_enabled: true
+        freq_preprocess_keep_bins: 475
+        freq_preprocess_target_bins: 512
+        freq_preprocess_mode: triangular
