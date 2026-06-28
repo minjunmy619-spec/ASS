@@ -26,6 +26,7 @@ _EXPORTS = {
     "FOAEventQueryPromptedAsymmetricSFC2D": f"{_MODEL}.foa_event_query_prompted_sfc",
     "FOAEventQueryPromptedAsymmetricSFCModel": f"{_MODEL}.foa_event_query_prompted_sfc",
     "HybridFrequencyProjector2d": f"{_MODEL}.frequency_preprocessing",
+    "LearnableQueryFrequencyProjector2d": f"{_MODEL}.frequency_preprocessing",
     "PCENGainNormalizer2d": f"{_MODEL}.frequency_preprocessing",
     "PooledChannelCapacityMixer2d": f"{_MODEL}.npu_capacity_blocks_2d",
     "AxialTransformerBlock2d": f"{_MODEL}.foa_event_query_prompted_sfc",

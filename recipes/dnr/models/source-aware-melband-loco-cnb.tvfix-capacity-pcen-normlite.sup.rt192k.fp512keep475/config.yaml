@@ -1,0 +1,21 @@
+_base_: ../source-aware-melband-loco-cnb.tvfix-capacity-nopool.sup.rt192k.fp512keep475/config.yaml
+
+# PCEN + norm-lite deployment probe.
+# PCEN is applied by the online wrapper before/after the core model, while the
+# exported core replaces reduction-heavy RMSNorm blocks with per-channel affine
+# calibration.  The raw complex RI input remains, but the internal magnitude
+# side channel is disabled to avoid its Sqrt/Add/Slice path in the core graph.
+loco_cnb_norm_type: affine
+loco_cnb_include_magnitude_features: false
+
+task:
+  model:
+    norm_type: ${loco_cnb_norm_type}
+    pcen_preprocess_enabled: true
+    pcen_smooth_coef: 0.98
+    pcen_alpha: 0.5
+    pcen_delta: 2.0
+    pcen_root: 0.5
+    pcen_eps: 1.0e-6
+    pcen_gain_floor: 0.05
+    pcen_gain_ceiling: 20.0

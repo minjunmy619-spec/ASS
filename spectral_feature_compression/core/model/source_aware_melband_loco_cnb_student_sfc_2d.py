@@ -36,9 +36,9 @@ from spectral_feature_compression.core.model.frequency_preprocessing import (
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
 from spectral_feature_compression.core.model.online_sfc_2d import (
     CausalConv2d,
-    RMSNorm2d,
     _runtime_assert,
     _validate_npu_kernel_dilation_limit,
+    build_norm2d,
     pack_complex_stft_as_2d,
     unpack_2d_to_complex_stft,
 )
@@ -103,13 +103,13 @@ class LocoPooledChannelMixer2d(nn.Module):
     block adds parameters cheaply and carries no streaming state.
     """
 
-    def __init__(self, channels: int, hidden_channels: int):
+    def __init__(self, channels: int, hidden_channels: int, *, norm_type: str = "rms"):
         super().__init__()
         if hidden_channels <= 0:
             raise ValueError(f"hidden_channels must be positive, got {hidden_channels}")
         self.channels = int(channels)
         self.hidden_channels = int(hidden_channels)
-        self.norm = RMSNorm2d(channels)
+        self.norm = build_norm2d(channels, norm_type=norm_type)
         self.expand = nn.Conv2d(channels, 2 * hidden_channels, kernel_size=1, bias=True)
         self.project = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=True)
         self.scale = nn.Parameter(torch.tensor(0.1))
@@ -133,6 +133,7 @@ class LocoLocalTFMixer2d(nn.Module):
         time_kernel: int = 3,
         band_kernel: int = 3,
         time_dilation: int = 1,
+        norm_type: str = "rms",
     ):
         super().__init__()
         if channels <= 0:
@@ -149,7 +150,7 @@ class LocoLocalTFMixer2d(nn.Module):
         self.channels = int(channels)
         self.hidden = int(hidden)
         self.ffn_hidden = int(ffn_hidden)
-        self.time_norm = RMSNorm2d(channels)
+        self.time_norm = build_norm2d(channels, norm_type=norm_type)
         self.time_in = nn.Conv2d(channels, 2 * hidden, kernel_size=1, bias=True)
         self.time_dw = CausalConv2d(
             hidden,
@@ -162,7 +163,7 @@ class LocoLocalTFMixer2d(nn.Module):
         self.time_out = nn.Conv2d(hidden, channels, kernel_size=1, bias=True)
         self.time_scale = nn.Parameter(torch.tensor(0.1))
 
-        self.band_norm = RMSNorm2d(channels)
+        self.band_norm = build_norm2d(channels, norm_type=norm_type)
         self.band_in = nn.Conv2d(channels, 2 * hidden, kernel_size=1, bias=True)
         self.band_dw = nn.Conv2d(
             hidden,
@@ -175,7 +176,7 @@ class LocoLocalTFMixer2d(nn.Module):
         self.band_out = nn.Conv2d(hidden, channels, kernel_size=1, bias=True)
         self.band_scale = nn.Parameter(torch.tensor(0.1))
 
-        self.ffn_norm = RMSNorm2d(channels)
+        self.ffn_norm = build_norm2d(channels, norm_type=norm_type)
         self.ffn_in = nn.Conv2d(channels, 2 * ffn_hidden, kernel_size=1, bias=True)
         self.ffn_out = nn.Conv2d(ffn_hidden, channels, kernel_size=1, bias=True)
         self.ffn_scale = nn.Parameter(torch.tensor(0.1))
@@ -222,7 +223,7 @@ class LocoLocalTFMixer2d(nn.Module):
 class LocoCrossBandMixer2d(nn.Module):
     """Grouped neighbouring-band mixer for compressed Mel tokens."""
 
-    def __init__(self, channels: int, *, freq_kernel: int = 3):
+    def __init__(self, channels: int, *, freq_kernel: int = 3, norm_type: str = "rms"):
         super().__init__()
         if channels <= 0:
             raise ValueError(f"channels must be positive, got {channels}")
@@ -230,7 +231,7 @@ class LocoCrossBandMixer2d(nn.Module):
             raise ValueError(f"freq_kernel must be a positive odd integer, got {freq_kernel}")
         _validate_npu_kernel_dilation_limit(freq_kernel, 1, axis="band")
         self.channels = int(channels)
-        self.norm = RMSNorm2d(channels)
+        self.norm = build_norm2d(channels, norm_type=norm_type)
         self.freq_conv = nn.Conv2d(
             channels,
             2 * channels,
@@ -266,6 +267,7 @@ class LocoFSMNBandMixer2d(nn.Module):
         kernel_t: int = 4,
         dilation_schedule: Sequence[int] = (1, 2, 3),
         merge_dilations: bool = False,
+        norm_type: str = "rms",
     ):
         super().__init__()
         if channels <= 0:
@@ -279,7 +281,7 @@ class LocoFSMNBandMixer2d(nn.Module):
         self.dilation_schedule = schedule
         self.max_context = max((self.kernel_t - 1) * dilation for dilation in schedule)
         self.merge_dilations = bool(merge_dilations)
-        self.norm = RMSNorm2d(channels)
+        self.norm = build_norm2d(channels, norm_type=norm_type)
         self.in_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
         if self.merge_dilations:
             self.memory = CausalConv2d(
@@ -354,7 +356,7 @@ class LocoFSMNBandMixer2d(nn.Module):
 class LocoCompressedBandAttentionFusion2d(nn.Module):
     """Stateless compressed-band attention using rank-4 MatMul only."""
 
-    def __init__(self, channels: int, *, num_heads: int = 4, head_dim: int = 8):
+    def __init__(self, channels: int, *, num_heads: int = 4, head_dim: int = 8, norm_type: str = "rms"):
         super().__init__()
         if num_heads <= 0 or head_dim <= 0:
             raise ValueError("num_heads and head_dim must be positive")
@@ -362,7 +364,7 @@ class LocoCompressedBandAttentionFusion2d(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = int(head_dim)
         self.inner_dim = self.num_heads * self.head_dim
-        self.norm = RMSNorm2d(channels)
+        self.norm = build_norm2d(channels, norm_type=norm_type)
         self.qkv_proj = nn.Conv2d(channels, 3 * self.inner_dim, kernel_size=1, bias=True)
         self.out_proj = nn.Conv2d(self.inner_dim, channels, kernel_size=1, bias=True)
         self.scale_value = 1.0 / float(self.head_dim) ** 0.5
@@ -403,6 +405,7 @@ class SourceAwareLocoCNBBlock2d(nn.Module):
         loco_time_kernel: int = 3,
         loco_band_kernel: int = 3,
         loco_time_dilation: int = 1,
+        norm_type: str = "rms",
     ):
         super().__init__()
         self.local = LocoLocalTFMixer2d(
@@ -412,21 +415,27 @@ class SourceAwareLocoCNBBlock2d(nn.Module):
             time_kernel=loco_time_kernel,
             band_kernel=loco_band_kernel,
             time_dilation=loco_time_dilation,
+            norm_type=norm_type,
         )
-        self.cross_band = LocoCrossBandMixer2d(channels, freq_kernel=freq_kernel)
+        self.cross_band = LocoCrossBandMixer2d(channels, freq_kernel=freq_kernel, norm_type=norm_type)
         self.narrow_band = LocoFSMNBandMixer2d(
             channels,
             kernel_t=cnb_kernel,
             dilation_schedule=cnb_dilation_schedule,
             merge_dilations=cnb_merge_dilations,
+            norm_type=norm_type,
         )
         self.band_attention = (
-            LocoCompressedBandAttentionFusion2d(channels, num_heads=num_heads, head_dim=head_dim)
+            LocoCompressedBandAttentionFusion2d(
+                channels, num_heads=num_heads, head_dim=head_dim, norm_type=norm_type
+            )
             if attention_enabled
             else None
         )
         self.pooled_mixer = (
-            LocoPooledChannelMixer2d(channels, pooled_mixer_hidden) if int(pooled_mixer_hidden) > 0 else nn.Identity()
+            LocoPooledChannelMixer2d(channels, pooled_mixer_hidden, norm_type=norm_type)
+            if int(pooled_mixer_hidden) > 0
+            else nn.Identity()
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -515,6 +524,7 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFC2D(nn.Module):
         masking: bool = True,
         mixture_consistency: bool = True,
         routing_normalization: str = "softmax",
+        norm_type: str = "rms",
     ):
         super().__init__()
         del n_fft
@@ -555,6 +565,7 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFC2D(nn.Module):
         self.mixture_consistency = bool(mixture_consistency)
         self.include_magnitude_features = bool(include_magnitude_features)
         self.include_logmag_features = bool(include_logmag_features)
+        self.norm_type = str(norm_type)
 
         feature_channels = 2 * n_chan
         if include_magnitude_features:
@@ -577,8 +588,13 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFC2D(nn.Module):
         self.band_spec = band_spec
         self.frontend = nn.Sequential(
             nn.Conv2d(feature_channels, state_channels, kernel_size=1, bias=True),
-            RMSNorm2d(state_channels),
-            StrongTokenFFN2d(state_channels, max(state_channels * 3, source_seed_hidden // 2), residual_scale=0.1),
+            build_norm2d(state_channels, norm_type=norm_type),
+            StrongTokenFFN2d(
+                state_channels,
+                max(state_channels * 3, source_seed_hidden // 2),
+                residual_scale=0.1,
+                norm_type=norm_type,
+            ),
         )
         self.router = StrongAdaptiveMelRouter2d(
             channels=state_channels,
@@ -586,6 +602,7 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFC2D(nn.Module):
             kernel_size=routing_kernel_size,
             causal=True,
             normalization=routing_normalization,
+            norm_type=norm_type,
         )
         self.backbone = nn.ModuleList(
             [
@@ -604,24 +621,26 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFC2D(nn.Module):
                     loco_time_kernel=loco_time_kernel,
                     loco_band_kernel=loco_band_kernel,
                     loco_time_dilation=loco_time_dilation,
+                    norm_type=norm_type,
                 )
                 for hidden in hidden_schedule
             ]
         )
         self.source_project = nn.Sequential(
-            RMSNorm2d(state_channels),
+            build_norm2d(state_channels, norm_type=norm_type),
             nn.Conv2d(state_channels, source_channels, kernel_size=1, bias=True),
-            RMSNorm2d(source_channels),
+            build_norm2d(source_channels, norm_type=norm_type),
         )
         self.query_project = nn.Sequential(
-            RMSNorm2d(state_channels),
+            build_norm2d(state_channels, norm_type=norm_type),
             nn.Conv2d(state_channels, source_channels, kernel_size=1, bias=True),
-            RMSNorm2d(source_channels),
+            build_norm2d(source_channels, norm_type=norm_type),
         )
         self.source_seed = StrongSourceSeed2d(
             channels=source_channels,
             n_src=n_src,
             hidden_channels=source_seed_hidden,
+            norm_type=norm_type,
         )
         self.source_decoder = StrongSourceDecoder2d(
             channels=source_channels,
@@ -631,6 +650,7 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFC2D(nn.Module):
             local_ffn_mult=source_local_ffn_mult,
             fusion_hidden_channels=source_fusion_hidden,
             band_kernel_size=loco_band_kernel if loco_band_kernel % 2 == 1 else 3,
+            norm_type=norm_type,
         )
         self.mask_head = StrongSourceMaskHead2d(
             channels=source_channels,
@@ -640,14 +660,16 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFC2D(nn.Module):
             expander_hidden_channels=expander_hidden,
             mask_hidden_channels=mask_hidden,
             fullband_kernel_size=correction_kernel_size[1],
+            norm_type=norm_type,
         )
         self.context_expander = StrongMelBandExpander2d(
             channels=source_channels,
             band_spec=band_spec,
             hidden_channels=expander_hidden,
+            norm_type=norm_type,
         )
         self.context_fuse = nn.Sequential(
-            RMSNorm2d(2 * source_channels),
+            build_norm2d(2 * source_channels, norm_type=norm_type),
             nn.Conv2d(2 * source_channels, 2 * source_channels, kernel_size=1, bias=True),
             nn.GLU(dim=1),
         )
@@ -660,6 +682,7 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFC2D(nn.Module):
             n_layers=correction_layers,
             kernel_size=correction_kernel_size,
             causal=True,
+            norm_type=norm_type,
         )
 
     def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -685,14 +708,24 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFC2D(nn.Module):
         correction = (mixture - total) / float(self.n_src)
         return torch.cat([chunk + correction for chunk in chunks], dim=1)
 
-    def _decode(self, mixture: torch.Tensor, z: torch.Tensor, query_tokens: torch.Tensor) -> torch.Tensor:
+    def _decode(self, mixture: torch.Tensor, z: torch.Tensor, query_tokens: torch.Tensor, *, return_aux: bool = False):
         source_tokens = self.source_seed(z)
         source_tokens = self.source_decoder(source_tokens, z)
         masks, source_context = self.mask_head(source_tokens, query_tokens)
         mixture_context = self.context_expander(z, query_tokens)
         correction_context = self.context_fuse(torch.cat([source_context, mixture_context], dim=1))
         masks = masks + self.correction(mixture, masks, correction_context)
+        aux = {
+            "mask": masks,
+            "mask_domain": "packed_complex_mask",
+            # This head applies the final projection directly as an unbounded
+            # complex mask, so the pre-activation and applied mask are identical.
+            "mask_logits": masks,
+            "mask_logits_domain": "source_aware_melband_loco_cnb_complex_mask_logits",
+        }
         if not self.masking:
+            if return_aux:
+                return masks, aux
             return masks
         estimates = _apply_packed_complex_mask_no_repeat(
             x=mixture,
@@ -700,14 +733,17 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFC2D(nn.Module):
             n_src=self.n_src,
             n_chan=self.n_chan,
         )
-        return self._apply_mixture_consistency(estimates, mixture)
+        y = self._apply_mixture_consistency(estimates, mixture)
+        if return_aux:
+            return y, aux
+        return y
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, return_aux: bool = False):
         _runtime_assert(x.ndim == 4, f"Expected [B,2M,T,F], got {x.shape}")
         _runtime_assert(x.shape[1] == 2 * self.n_chan, f"Expected {2 * self.n_chan} channels, got {x.shape}")
         _runtime_assert(x.shape[-1] == self.n_freq, f"Expected F={self.n_freq}, got {x.shape}")
         z, query_tokens = self._encode(x)
-        return self._decode(x, z, query_tokens)
+        return self._decode(x, z, query_tokens, return_aux=return_aux)
 
     def stream_context_frames(self) -> int:
         return self.router.stream_context_frames() + sum(block.stream_context_frames() for block in self.backbone)
@@ -803,11 +839,20 @@ class OnlineSourceAwareMelBandLocoCNBStudentSFCModel(nn.Module):
         self.n_src = int(n_src)
         self.n_chan = int(n_chan)
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        del kwargs
+    def forward(self, x: torch.Tensor, **kwargs):
+        kwargs.pop("ref", None)
+        return_aux = bool(kwargs.pop("return_aux", False))
         x2d = pack_complex_stft_as_2d(x)
-        y2d = self.core(x2d)
-        return unpack_2d_to_complex_stft(y2d, n_src=self.n_src, n_chan=self.n_chan)
+        core_output = self.core(x2d, return_aux=return_aux)
+        if isinstance(core_output, tuple):
+            y2d, aux = core_output
+        else:
+            y2d = core_output
+            aux = {}
+        estimate = unpack_2d_to_complex_stft(y2d, n_src=self.n_src, n_chan=self.n_chan)
+        if return_aux:
+            return estimate, aux
+        return estimate
 
     def init_stream_state(self, batch_size: int = 1, *, device=None, dtype=None):
         return self.core.init_stream_state(batch_size=batch_size, device=device, dtype=dtype)
@@ -904,6 +949,7 @@ def build_source_aware_melband_loco_cnb_student_sfc_system(
     masking: bool = True,
     mixture_consistency: bool = True,
     routing_normalization: str = "softmax",
+    norm_type: str = "rms",
     freq_preprocess_enabled: bool = True,
     freq_preprocess_keep_bins: int | None = 475,
     freq_preprocess_target_bins: int | None = 512,
@@ -1028,6 +1074,7 @@ def build_source_aware_melband_loco_cnb_student_sfc_system(
         masking=masking,
         mixture_consistency=mixture_consistency,
         routing_normalization=routing_normalization,
+        norm_type=norm_type,
     )
     model = FrequencyPreprocessedOnlineModel(
         core=core,

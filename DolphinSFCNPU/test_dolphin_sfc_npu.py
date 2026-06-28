@@ -136,6 +136,100 @@ def test_softmax_output_head_is_mixture_consistent() -> None:
     torch.testing.assert_close(summed, x, rtol=1e-6, atol=1e-6)
 
 
+def test_source_aware_complex_residual_returns_aux_and_preserves_mixture() -> None:
+    torch.manual_seed(0)
+    model = build_dolphin_sfc_npu_from_config(
+        preset="edge_small",
+        n_freq=65,
+        n_fft=128,
+        sample_rate=16000,
+        n_bands=16,
+        source_aware=True,
+        explicit_source_count=2,
+        source_refine_layers=1,
+        source_refine_freq_kernel=5,
+        source_head_type="complex_residual",
+        sfx_residual_mode="residual",
+    ).eval()
+    x = torch.randn(1, 2, 3, model.n_freq)
+    with torch.no_grad():
+        y, aux = model(x, return_aux=True)
+
+    assert y.shape == (1, 6, 3, model.n_freq)
+    summed = y.reshape(1, model.n_src, 2 * model.n_chan, x.shape[2], x.shape[3]).sum(dim=1)
+    torch.testing.assert_close(summed, x, rtol=1e-6, atol=1e-6)
+    assert aux["mask_domain"] == "packed_complex_mask"
+    assert aux["mask_logits_domain"] == "source_aware_dolphin_complex_mask_logits"
+    assert aux["mask_logits_transform"] == "sigmoid_tanh_complex_mask"
+    assert aux["explicit_source_count"] == 2
+    assert aux["residual_source_index"] == 2
+    assert aux["sfx_residual_mode"] == "residual"
+    assert tuple(aux["mask"].shape) == (1, 4, 3, model.n_freq)
+    assert tuple(aux["mask_logits"].shape) == (1, 4, 3, model.n_freq)
+
+
+def test_source_aware_forward_stream_matches_forward() -> None:
+    torch.manual_seed(0)
+    model = build_dolphin_sfc_npu_from_config(
+        preset="edge_small",
+        n_freq=65,
+        n_fft=128,
+        sample_rate=16000,
+        n_bands=16,
+        source_aware=True,
+        explicit_source_count=2,
+        source_refine_layers=1,
+        source_head_type="complex_residual",
+    ).eval()
+    x = torch.randn(1, 2, 5, model.n_freq)
+    with torch.no_grad():
+        full = model(x)
+        state = model.init_stream_state(batch_size=1, dtype=x.dtype)
+        chunks = []
+        for t in range(x.shape[2]):
+            y, state = model.forward_stream(x[:, :, t : t + 1, :], state)
+            chunks.append(y)
+        streamed = torch.cat(chunks, dim=2)
+    torch.testing.assert_close(streamed, full, rtol=5e-5, atol=5e-5)
+
+
+def test_source_aware_preset_fits_budget_and_uses_source_refiners() -> None:
+    model = build_dolphin_sfc_npu_preset(
+        "source_aware_6m",
+        n_freq=512,
+        n_fft=4096,
+        sample_rate=44100,
+    ).eval()
+    params = sum(p.numel() for p in model.parameters())
+    state_bytes = model.state_size_bytes(batch_size=1, dtype=torch.float16)
+    assert PARAM_LOWER_LIMIT <= params <= PARAM_UPPER_LIMIT
+    assert state_bytes <= STATE_BUDGET_BYTES
+    assert model.n_bands == 56
+    assert model.explicit_source_count == 2
+    assert model.source_head_type == "complex_residual"
+    assert model.sfx_residual_mode == "residual"
+
+
+def test_training_wrapper_returns_source_aware_aux() -> None:
+    system = build_dolphin_sfc_npu_system(
+        n_fft=128,
+        hop_length=32,
+        fs=16000,
+        preset="edge_small",
+        n_bands=16,
+        source_aware=True,
+        explicit_source_count=2,
+        source_refine_layers=1,
+        source_head_type="complex_residual",
+    ).eval()
+    x = torch.complex(torch.randn(1, 1, 65, 3), torch.randn(1, 1, 65, 3))
+    with torch.no_grad():
+        estimate, aux = system.model(x, return_aux=True)
+    assert estimate.shape == (1, 3, 1, 65, 3)
+    assert aux["mask_domain"] == "packed_complex_mask"
+    assert aux["mask_logits_domain"] == "source_aware_dolphin_complex_mask_logits"
+
+
 def test_query_variant_presets_forward_stream_match() -> None:
     torch.manual_seed(0)
     for preset in ("edge_small_soft_query", "edge_small_crossattn_query"):

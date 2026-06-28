@@ -1,0 +1,6 @@
+_base_: ../tvconv-pyramid-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+
+task:
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_tvconv_pyramid_sfclite_query_npu_separator_system
+    freq_preprocess_mode: learnable_query

@@ -1,0 +1,12 @@
+_base_: ../source-aware-melband-loco-cnb.tvfix-nopool.robust-lowlat.distill.rt192k.fp512keep475/config.yaml
+
+# Recommended retraining candidate after the TV recipe audit.
+# Keep the streaming-state backbone unchanged, remove pooled mixers, and move
+# capacity into source-aware decoding / full-band mask prediction.
+loco_cnb_source_channels: 80
+loco_cnb_source_layers: 5
+loco_cnb_source_fusion_hidden: 320
+loco_cnb_source_seed_hidden: 320
+loco_cnb_expander_hidden: 192
+loco_cnb_mask_hidden: 256
+loco_cnb_correction_channels: 24

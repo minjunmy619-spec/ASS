@@ -6,8 +6,11 @@ from BandSCNetNPU.training_wrapper import build_band_scnet_npu_system
 from BandSFCNetNPU.training_wrapper import build_band_sfc_net_npu_system
 from spectral_feature_compression.core.model.frequency_preprocessing import (
     FrequencyPreprocessedOnlineModel,
+    LearnableQueryFrequencyProjector2d,
     PCENGainNormalizer2d,
     build_frequency_preprocessor,
+    build_hybrid_frequency_bin_frequencies,
+    build_hybrid_frequency_matrices,
     build_pcen_preprocessor,
     resolve_frequency_input_n_freq,
     resolve_preprocessed_n_freq,
@@ -143,6 +146,60 @@ def test_build_frequency_preprocessor_keeps_requested_size():
     assert projector.keep_bins == 475
 
 
+def test_hybrid_log_and_piecewise_high_modes_have_valid_nonuniform_coverage():
+    n_freq = 1025
+    keep_bins = 475
+    target_bins = 512
+    n_fft = 2048
+    sample_rate = 24000
+
+    for mode in ("hybrid_log_high", "hybrid_piecewise_high"):
+        analysis, synthesis = build_hybrid_frequency_matrices(
+            n_freq,
+            keep_bins=keep_bins,
+            target_bins=target_bins,
+            mode=mode,
+        )
+        assert tuple(analysis.shape) == (target_bins, n_freq)
+        assert tuple(synthesis.shape) == (n_freq, target_bins)
+        torch.testing.assert_close(analysis[:keep_bins, :keep_bins], torch.eye(keep_bins))
+        torch.testing.assert_close(synthesis[:keep_bins, :keep_bins], torch.eye(keep_bins))
+        torch.testing.assert_close(analysis[keep_bins:].sum(dim=1), torch.ones(target_bins - keep_bins))
+        torch.testing.assert_close(synthesis[keep_bins:].sum(dim=1), torch.ones(n_freq - keep_bins))
+
+        projector = build_frequency_preprocessor(
+            n_freq,
+            enabled=True,
+            keep_bins=keep_bins,
+            target_bins=target_bins,
+            mode=mode,
+        )
+        assert projector is not None
+        assert projector.manifest()["mode"] == mode
+
+    log_freqs = build_hybrid_frequency_bin_frequencies(
+        n_freq,
+        keep_bins=keep_bins,
+        target_bins=target_bins,
+        n_fft=n_fft,
+        sample_rate=sample_rate,
+        mode="hybrid_log_high",
+    )
+    log_steps = log_freqs[keep_bins + 1 :] - log_freqs[keep_bins:-1]
+    assert log_steps[:8].mean() < log_steps[-8:].mean()
+
+    piecewise_freqs = build_hybrid_frequency_bin_frequencies(
+        n_freq,
+        keep_bins=keep_bins,
+        target_bins=target_bins,
+        n_fft=n_fft,
+        sample_rate=sample_rate,
+        mode="hybrid_piecewise_high",
+    )
+    piecewise_steps = piecewise_freqs[keep_bins + 1 :] - piecewise_freqs[keep_bins:-1]
+    assert piecewise_steps[:16].mean() < piecewise_steps[-8:].mean()
+
+
 def test_build_frequency_preprocessor_can_bypass_dc_bin():
     assert resolve_frequency_input_n_freq(1025, dc_bypass_enabled=True) == 1024
     assert (
@@ -166,6 +223,33 @@ def test_build_frequency_preprocessor_can_bypass_dc_bin():
     assert projector is not None
     assert projector.n_freq_in == 1024
     assert projector.n_freq_out == 512
+
+
+def test_learnable_query_frequency_preprocessor_uses_tied_decoder_query():
+    torch.manual_seed(0)
+    projector = build_frequency_preprocessor(
+        33,
+        enabled=True,
+        keep_bins=16,
+        target_bins=21,
+        mode="learnable_query",
+    )
+    assert isinstance(projector, LearnableQueryFrequencyProjector2d)
+    assert projector.frequency_query.requires_grad
+    assert tuple(projector.frequency_query.shape) == (21, 33)
+
+    x = torch.randn(2, 3, 4, 33)
+    y = projector.analysis(x)
+    z = projector.synthesis(y)
+    flat_y = y.reshape(-1, 21)
+    expected = (flat_y @ projector.frequency_query).reshape(2, 3, 4, 33)
+    torch.testing.assert_close(z, expected, rtol=1e-6, atol=1e-6)
+
+    loss = z.square().mean()
+    loss.backward()
+    assert projector.frequency_query.grad is not None
+    assert projector.manifest()["type"] == "sfc_lite_learnable_query"
+    assert projector.manifest()["tied_synthesis_query"] is True
 
 
 @torch.inference_mode()

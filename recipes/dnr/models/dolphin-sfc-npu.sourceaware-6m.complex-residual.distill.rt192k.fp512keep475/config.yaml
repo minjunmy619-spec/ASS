@@ -1,0 +1,36 @@
+_base_: ../dolphin-sfc-npu.slim-6m.distill.rt192k.fp512keep475/config.yaml
+
+# Source-aware DolphinSFCNPU quality-recovery candidate.
+# The shared Dolphin trunk stays compressed and cache-bounded; speech/music get
+# explicit per-source compressed-token refinement and complex masks, while SFX
+# is reconstructed as the exact residual by default.
+freq_preprocess_enabled: true
+freq_preprocess_keep_bins: 475
+freq_preprocess_target_bins: 512
+freq_preprocess_mode: triangular
+
+task:
+  request_model_aux: true
+  require_model_aux: true
+  mask_aux_alignment: shared_prefix
+  mask_aux_max_frame_mismatch: 1
+  source_loss_weights:
+    speech: 1.4
+    music: 1.1
+    effects: 0.9
+  source_weighted_snr_loss_weight: 0.2
+  explicit_source_loss_weight: 0.1
+  residual_source_loss_weight: 0.05
+  residual_source_index: 2
+  model:
+    preset: source_aware_6m
+    source_aware: true
+    source_head_type: complex_residual
+    sfx_residual_mode: residual
+    source_refine_layers: 2
+    source_refine_freq_kernel: 5
+    source_refine_expansion: 2
+    freq_preprocess_enabled: true
+    freq_preprocess_keep_bins: 475
+    freq_preprocess_target_bins: 512
+    freq_preprocess_mode: triangular

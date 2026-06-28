@@ -157,6 +157,253 @@ intended training behavior. Fixed items:
   - the TVConv robust-distillation recipe now spells out the same disabled
     postprocess profile for the nested RoFormer `teacher_model`, so recipe
     parsing does not depend on hidden builder defaults.
+- Added two recurrent TVConv pyramid variants:
+  - `build_tvconv_pyramid_convgru_npu_separator_system`
+  - `build_tvconv_pyramid_convlstm_npu_separator_system`
+  These use one ConvGRU/ConvLSTM bottleneck layer by default and replace the
+  last two temporal-conv blocks instead of adding recurrent state on top of the
+  full baseline cache. This keeps the streaming state safely below the 192 KiB
+  quota while adding true recurrent sequence memory.
+- Added an SFC-lite learnable-query frequency-preprocessing variant:
+  - `build_tvconv_pyramid_sfclite_query_npu_separator_system`
+  - `freq_preprocess_mode: learnable_query`
+  It replaces the fixed triangular high-frequency projection with one
+  learnable encoder query matrix. The decoder uses the same query matrix
+  directly, so there is no separate decoder table to drift away from the
+  encoder transport.
+
+## Recurrent TVConv Variant Guide
+
+The recurrent cells live at the compressed bottleneck frequency grid. For the
+current `n_fft=2048`, frequency preprocessing maps the core to `512` bins and
+the frequency pyramid compresses:
+
+```text
+512 -> 256 -> 128 -> 64 -> 32
+```
+
+So one recurrent hidden tensor has:
+
+```text
+B * 160 channels * 1 frame * 32 bins
+```
+
+The default recurrent recipes use:
+
+```yaml
+tvconv_recurrent_layers: 1
+tvconv_recurrent_band_kernel: 3
+tvconv_recurrent_replace_blocks: 2
+```
+
+That means the six baseline temporal conv blocks become:
+
+```text
+4 causal temporal-band conv blocks + 1 recurrent bottleneck layer
+```
+
+Expected state cost for the full recipe:
+
+```text
+baseline TVConv: 180 KiB
+ConvGRU variant: 130 KiB
+ConvLSTM variant: 140 KiB
+```
+
+Use the prepared configs:
+
+```bash
+recipes/dnr/models/tvconv-pyramid-convgru-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+recipes/dnr/models/tvconv-pyramid-convlstm-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+```
+
+Recommended experiment order:
+
+1. Train/evaluate ConvGRU first. It has one recurrent state, fewer gates, and
+   should be less prone to long hangover artifacts.
+2. Try ConvLSTM second if ConvGRU improves continuity but still loses longer
+   vocal/music phrasing. It costs one extra cell state and has a little more
+   gate compute.
+3. Keep `recurrent_replace_blocks: 2` for first NPU experiments. Reducing it to
+   `1` increases local temporal-conv context but pushes the state closer to the
+   DSP quota, especially for LSTM.
+
+Export note: recurrent gate splits use fixed-size `torch.split(...,
+self.channels, dim=1)`. Do not replace these with `torch.chunk`; `chunk`
+exported dynamic `Shape/Gather/Slice` bounds and triggered strict-edge audit
+risks before it was fixed.
+
+## SFC-Lite Query Frequency Variant Guide
+
+Use this variant when testing whether SFC-style learnable frequency transport
+improves separation quality over the fixed triangular `fp512keep475`
+projection:
+
+```bash
+recipes/dnr/models/tvconv-pyramid-sfclite-query-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+```
+
+Builder:
+
+```python
+spectral_feature_compression.core.model.proposed_separation_models.build_tvconv_pyramid_sfclite_query_npu_separator_system
+```
+
+The projector lives in:
+
+```text
+spectral_feature_compression/core/model/frequency_preprocessing.py
+```
+
+Implementation details:
+
+- The learnable tensor is `frequency_query` with shape
+  `[target_bins, n_freq_in]`.
+- It is initialized from the existing hybrid triangular projection, so the
+  first training step starts from the stable `keep low bins + compress high
+  bins` behavior.
+- Analysis uses `x @ frequency_query.T`.
+- Synthesis uses `z @ frequency_query`.
+- There is intentionally no independent `synthesis_matrix` parameter.
+- Standalone ONNX round-trip export of the projector used only `MatMul`,
+  `Reshape`, and `Constant`: two MatMuls total for analysis plus tied
+  synthesis, with no disallowed ops under `edge_npu_recommended`.
+
+Deployment note: the current streaming ONNX helper exports `model.core`, so the
+TVConv NPU core graph is unchanged by this wrapper-side frequency projection.
+If the wrapper preprocessing is exported separately, the learnable-query
+projector is a small dense-matrix preprocessing/postprocessing pair rather than
+an attention block.
+
+## Source-Aware SFC-Lite ConvGRU TVConv Guide
+
+Use this recipe as the deploy-first stronger student candidate:
+
+```bash
+recipes/dnr/models/tvconv-pyramid-sourceaware-sfclite-convgru-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+```
+
+Builder:
+
+```python
+spectral_feature_compression.core.model.proposed_separation_models.build_tvconv_pyramid_sourceaware_sfclite_convgru_npu_separator_system
+```
+
+Design intent:
+
+- Keep the low-node TVConv frequency pyramid and ConvGRU bottleneck.
+- Keep SFC-lite learnable-query frequency projection at the wrapper.
+- Spend extra capacity in one folded source-aware Conv2D mask head instead of a
+  many-block source decoder stack.
+- Avoid runtime normalization reductions in the source head; use Conv2D, ReLU,
+  Add/Mul, Sigmoid/Tanh only.
+
+Recipe knobs:
+
+```yaml
+tvconv_recurrent_layers: 1
+tvconv_recurrent_band_kernel: 3
+tvconv_recurrent_replace_blocks: 2
+tvconv_source_head_type: folded_source_aware
+tvconv_source_mixer_layers: 1
+tvconv_mask_hidden: 384
+```
+
+Measured from the recipe:
+
+```text
+core parameters: 3,716,555
+wrapper parameters including learnable-query frequency projection: 4,241,355
+fp16 streaming state: 133,120 B (130 KiB)
+streaming ONNX core nodes: 276
+streaming ONNX core fp16 initializers: 7.08 MiB
+```
+
+The source head exposes true logits using:
+
+```text
+mask_domain: packed_complex_mask
+mask_logits_domain: tvconv_pyramid_folded_source_aware_complex_mask_logits
+mask_logits_transform: sigmoid_tanh_complex_mask
+```
+
+This is the preferred next training candidate if the parameter budget is
+`3-8M` but the NPU still penalizes high node count and memory-heavy reduction
+patterns.
+
+## Node-Lite Strong Student Guide
+
+The original source-aware mel-band strong student stayed under the old 192 KiB
+fp16 layer-cache target, but the measured model was only about `1.38M`
+parameters. The first relaxed-depth attempt reached `6.75M` parameters but
+exported `2,618` nodes, which is too large for this NPU profile.
+
+Use the node-lite recipe first:
+
+```bash
+recipes/dnr/models/source-aware-melband-roformer.student-npu-strong-nodelite.distill.tv-fp512keep475/config.yaml
+```
+
+This recipe keeps the original strong student's layer counts and cache shape,
+then buys capacity with wider stateless source/mask projections:
+
+```yaml
+strong_student_n_bands: 80
+strong_student_d_model: 48
+strong_student_encoder_layers: 2
+strong_student_source_layers: 5
+strong_student_correction_layers: 1
+strong_student_source_fusion_hidden: 768
+strong_student_source_seed_hidden: 768
+strong_student_expander_hidden: 384
+strong_student_mask_hidden: 768
+strong_student_correction_channels: 24
+strong_student_mixture_consistency: false
+```
+
+Measured from the node-lite recipe:
+
+```text
+core parameters: 6,115,613
+fp16 streaming state: 190,464 B (186 KiB)
+streaming ONNX nodes: 1,823
+```
+
+The deeper relaxed-cache recipe remains available only as a quality ablation
+when node count is less important:
+
+```bash
+recipes/dnr/models/source-aware-melband-roformer.student-npu-strong-relaxed.distill.tv-fp512keep475/config.yaml
+```
+
+Measured from the relaxed-depth recipe:
+
+```text
+core parameters: 6,748,226
+fp16 streaming state: 614,400 B (600 KiB)
+streaming ONNX nodes: 2,618
+state tensors:
+  [1, 144, 2, 96]
+  [1, 144, 4, 96]
+  [1, 144, 2, 96]
+  [1, 96, 2, 512]
+  [1, 96, 2, 512]
+```
+
+Training choices:
+
+- The model predicts all three stems explicitly.
+- Hard model-side mixture consistency is disabled to avoid uniformly pushing
+  teacher/label noise into every stem.
+- The task keeps a small waveform mixture-consistency loss
+  (`mixture_consistency_weight: 0.05`).
+- Speech/music/effects source weights are inherited from the TVConv robust
+  recipe style: `1.6`, `1.25`, `0.85`.
+- `request_model_aux` stays `false` because this strong student does not expose
+  true mask/logit aux yet; teacher mask/logit losses fall back to
+  waveform-derived spectral pseudo-masks.
+- `include_logmag_features` is disabled because it exported ONNX `Log`, which
+  is outside the current NPU allowlist.
 
 ## Postprocess Usage Guide
 
@@ -441,6 +688,354 @@ Result:
 
 - `All checks passed`
 - `git diff --check` clean
+
+Focused recurrent TVConv validation:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_recurrent_recipe_variants_parse_and_build \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_recurrent_bottleneck_streaming_matches_forward \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_recurrent_waveform_builders -q
+```
+
+Result:
+
+- `6 passed`
+
+Full focused rerun after adding recurrent TVConv variants:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_model_wrapper.py \
+  tests/test_on_the_fly_source_normalization.py \
+  tests/test_proposed_separation_models.py -q
+```
+
+Result:
+
+- `67 passed`
+
+Ruff/checks after adding recurrent TVConv variants:
+
+```bash
+.venv/bin/ruff check \
+  spectral_feature_compression/core/model/tvconv_pyramid_npu_separator_2d.py \
+  spectral_feature_compression/core/model/proposed_separation_models.py \
+  tests/test_proposed_separation_models.py
+git diff --check
+```
+
+Result:
+
+- `All checks passed`
+- `git diff --check` clean
+
+Focused SFC-lite query variant validation:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_frequency_preprocessing.py::test_learnable_query_frequency_preprocessor_uses_tied_decoder_query \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_sfclite_query_recipe_and_builder -q
+```
+
+Result:
+
+- `2 passed`
+
+Full focused rerun after adding the SFC-lite query variant:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_frequency_preprocessing.py \
+  tests/test_proposed_separation_models.py -q
+```
+
+Result:
+
+- `60 passed`
+
+Affected rerun after lint cleanup:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_online_frequency_preprocessing.py \
+  tests/test_proposed_separation_models.py::test_tvconv_pyramid_sfclite_query_recipe_and_builder -q
+```
+
+Result:
+
+- `14 passed`
+
+Ruff/checks after adding the SFC-lite query variant:
+
+```bash
+.venv/bin/ruff check \
+  spectral_feature_compression/core/model/frequency_preprocessing.py \
+  spectral_feature_compression/core/model/tvconv_pyramid_npu_separator_2d.py \
+  spectral_feature_compression/core/model/proposed_separation_models.py \
+  spectral_feature_compression/__init__.py \
+  tests/test_online_frequency_preprocessing.py \
+  tests/test_proposed_separation_models.py
+git diff --check
+```
+
+Result:
+
+- `All checks passed`
+- `git diff --check` clean
+
+Standalone SFC-lite query projector ONNX round-trip audit:
+
+```bash
+.venv/bin/python - <<'PY'
+from pathlib import Path
+import torch
+import onnx
+from spectral_feature_compression.core.model.frequency_preprocessing import build_frequency_preprocessor
+from tools.online.export_onnx_online_model import audit_onnx_graph, get_allowed_ops
+
+class RoundTrip(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.projector = build_frequency_preprocessor(
+            33,
+            enabled=True,
+            keep_bins=16,
+            target_bins=21,
+            mode="learnable_query",
+        )
+
+    def forward(self, x):
+        y = self.projector.analysis(x)
+        return self.projector.synthesis(y)
+
+out = Path("/tmp/sfclite_query_projector_roundtrip.onnx")
+model = RoundTrip().eval()
+dummy = torch.randn(1, 2, 4, 33)
+torch.onnx.export(
+    model,
+    (dummy,),
+    str(out),
+    export_params=True,
+    opset_version=14,
+    do_constant_folding=True,
+    input_names=["x"],
+    output_names=["y"],
+    dynamic_axes=None,
+    dynamo=False,
+)
+onnx_model = onnx.load(out)
+onnx.checker.check_model(onnx_model)
+audit = audit_onnx_graph(onnx_model, allowed_ops=get_allowed_ops("edge_npu_recommended"))
+print(audit)
+out.unlink(missing_ok=True)
+PY
+```
+
+Audit result:
+
+- Ops: `Constant, MatMul, Reshape`
+- Op counts: `Constant: 4`, `Reshape: 4`, `MatMul: 2`
+- Initializers: `2`
+- Initializer bytes: `5544`
+- Disallowed ops: none
+
+Node-lite strong student recipe validation:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_proposed_separation_models.py::test_source_aware_melband_roformer_strong_student_npu_forward_streaming_and_recipe -q
+```
+
+Result:
+
+- `1 passed`
+
+Resolved node-lite recipe/model stats:
+
+```text
+recipe: recipes/dnr/models/source-aware-melband-roformer.student-npu-strong-nodelite.distill.tv-fp512keep475/config.yaml
+datamodule: OnTheFlyStemDataModule
+synthesis profiles: 4
+task: TeacherStudentDistillationTask
+model: build_source_aware_melband_roformer_strong_student_npu_system
+core: OnlineSourceAwareMelBandStrongStudentSFC2D
+core params: 6,115,613
+fp16 state: 190,464 B (186 KiB)
+```
+
+Node-lite strong student streaming ONNX export and audit:
+
+```bash
+.venv/bin/python tools/online/export_onnx_online_model.py \
+  recipes/dnr/models/source-aware-melband-roformer.student-npu-strong-nodelite.distill.tv-fp512keep475/config.yaml \
+  --out /tmp/strong_nodelite_student_core_stream.onnx \
+  --n-chan 1 \
+  --frames 1 \
+  --freqs 512 \
+  --opset 14 \
+  --check \
+  --streaming \
+  --op-preset edge_npu_recommended \
+  --externalize-band-constants \
+  --state-meta-out /tmp/strong_nodelite_student_core_stream_state.json \
+  --deploy-manifest-out /tmp/strong_nodelite_student_core_stream_manifest.json \
+  --constants-out /tmp/strong_nodelite_student_core_stream_constants.npz
+
+.venv/bin/python tools/online/audit_onnx_model.py \
+  /tmp/strong_nodelite_student_core_stream.onnx \
+  --op-preset edge_npu_recommended \
+  --state-meta /tmp/strong_nodelite_student_core_stream_state.json \
+  --budget-kib 192 \
+  --budget-dtype fp16 \
+  --risk-profile tiger_one_strict_edge
+```
+
+Audit result:
+
+- ONNX checker passed.
+- Ops:
+  `Add, Concat, Constant, Conv, Div, Identity, MatMul, Mul, ReduceMean,
+  ReduceSum, Sigmoid, Slice, Softmax, Split, Sqrt, Sub, Transpose`
+- Disallowed ops: none.
+- Strict-edge risks: false.
+- Node count: `1,823`
+- Initializers: `246 tensors`, `24,453,784 B`.
+- fp16 streaming state: `190,464 B (186 KiB)`.
+- Externalized band constants: `245,760 B (240 KiB)`.
+- The `192 KiB` budget is used as the streaming state/cache target; model
+  weights and externalized constants are tracked as separate deployment payloads.
+- Note: enabling `strong_student_include_logmag_features: true` introduced one
+  ONNX `Log` node and was reverted to keep the allowlist clean.
+
+Relaxed-depth strong student comparison:
+
+- Recipe:
+  `recipes/dnr/models/source-aware-melband-roformer.student-npu-strong-relaxed.distill.tv-fp512keep475/config.yaml`
+- Core params: `6,748,226`
+- fp16 state: `614,400 B (600 KiB)`
+- Streaming ONNX nodes: `2,618`
+- Status: export-clean, but too many graph nodes for the target NPU preference.
+
+Source-aware SFC-lite ConvGRU TVConv streaming ONNX export and audit:
+
+```bash
+.venv/bin/python tools/online/export_onnx_online_model.py \
+  recipes/dnr/models/tvconv-pyramid-sourceaware-sfclite-convgru-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml \
+  --out /tmp/tvconv_sourceaware_sfclite_convgru_stream.onnx \
+  --n-chan 1 \
+  --frames 1 \
+  --opset 14 \
+  --check \
+  --streaming \
+  --op-preset edge_npu_recommended \
+  --state-meta-out /tmp/tvconv_sourceaware_sfclite_convgru_state.json \
+  --deploy-manifest-out /tmp/tvconv_sourceaware_sfclite_convgru_manifest.json
+
+.venv/bin/python tools/online/audit_onnx_model.py \
+  /tmp/tvconv_sourceaware_sfclite_convgru_stream.onnx \
+  --op-preset edge_npu_recommended \
+  --state-meta /tmp/tvconv_sourceaware_sfclite_convgru_state.json \
+  --budget-kib 192 \
+  --budget-dtype fp16 \
+  --risk-profile tiger_one_strict_edge
+```
+
+Result:
+
+- ONNX checker passed.
+- Ops:
+  `Add, Concat, Constant, Conv, ConvTranspose, Identity, Mul, Relu, Sigmoid, Slice, Split, Sub, Tanh`
+- Streaming ONNX nodes: `276`
+- Streaming state fp16 estimate: `133120 B` (`130.00 KiB`).
+- ONNX core initializer fp16 estimate: `7.08 MiB`.
+- Disallowed ops: none.
+- Strict-edge risks: false.
+
+ONE import/opt/quant:
+
+```bash
+LIBROOT=/home/cmj/works/ONE/build/compiler
+export LD_LIBRARY_PATH="$LIBROOT/luci/import:$LIBROOT/luci/export:$LIBROOT/luci/pass:$LIBROOT/luci/service:$LIBROOT/luci/lang:$LIBROOT/luci/env:$LIBROOT/luci/profile:$LIBROOT/luci/plan:$LIBROOT/luci/log:$LIBROOT/luci/logex:$LIBROOT/luci-compute:$LIBROOT/luci-interpreter/src:$LIBROOT/dio-hdf5:$LIBROOT/loco:$LD_LIBRARY_PATH"
+/home/cmj/works/ONE/build/compiler/one-cmds/onecc \
+  -C /home/cmj/works/ASS/logs/npu_verify_general/tvconv_sourceaware_sfclite_convgru_onecc/config.cfg
+```
+
+Artifact result:
+
+- Import:
+  `logs/npu_verify_general/tvconv_sourceaware_sfclite_convgru_onecc/tvconv_sourceaware_sfclite_convgru_stream.circle`
+- Optimize:
+  `logs/npu_verify_general/tvconv_sourceaware_sfclite_convgru_onecc/tvconv_sourceaware_sfclite_convgru_stream.opt.circle`
+- Quantize:
+  `logs/npu_verify_general/tvconv_sourceaware_sfclite_convgru_onecc/tvconv_sourceaware_sfclite_convgru_stream.q.circle`
+- Current artifact sizes: `15M`, `15M`, and `3.9M`.
+
+ConvGRU streaming ONNX export and audit:
+
+```bash
+.venv/bin/python tools/online/export_onnx_online_model.py \
+  recipes/dnr/models/tvconv-pyramid-convgru-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml \
+  --out logs/npu_verify_general/tvconv_pyramid_convgru_stream.onnx \
+  --n-chan 1 \
+  --frames 1 \
+  --opset 14 \
+  --check \
+  --streaming \
+  --op-preset edge_npu_recommended \
+  --deploy-manifest-out logs/npu_verify_general/tvconv_pyramid_convgru_stream_manifest.json \
+  --state-meta-out logs/npu_verify_general/tvconv_pyramid_convgru_stream_state.json
+
+.venv/bin/python tools/online/audit_onnx_model.py \
+  logs/npu_verify_general/tvconv_pyramid_convgru_stream.onnx \
+  --op-preset edge_npu_recommended \
+  --state-meta logs/npu_verify_general/tvconv_pyramid_convgru_stream_state.json \
+  --budget-kib 192 \
+  --budget-dtype fp16 \
+  --risk-profile tiger_one_strict_edge
+```
+
+Result:
+
+- ONNX checker passed.
+- Ops:
+  `Add, Concat, Constant, Conv, ConvTranspose, Identity, Mul, Relu, Sigmoid, Slice, Split, Sub, Tanh`
+- Streaming state fp16 estimate: `133120 B` (`130.00 KiB`).
+- Disallowed ops: none.
+- Strict-edge risks: false.
+
+ConvLSTM streaming ONNX export and audit:
+
+```bash
+.venv/bin/python tools/online/export_onnx_online_model.py \
+  recipes/dnr/models/tvconv-pyramid-convlstm-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml \
+  --out logs/npu_verify_general/tvconv_pyramid_convlstm_stream.onnx \
+  --n-chan 1 \
+  --frames 1 \
+  --opset 14 \
+  --check \
+  --streaming \
+  --op-preset edge_npu_recommended \
+  --deploy-manifest-out logs/npu_verify_general/tvconv_pyramid_convlstm_stream_manifest.json \
+  --state-meta-out logs/npu_verify_general/tvconv_pyramid_convlstm_stream_state.json
+
+.venv/bin/python tools/online/audit_onnx_model.py \
+  logs/npu_verify_general/tvconv_pyramid_convlstm_stream.onnx \
+  --op-preset edge_npu_recommended \
+  --state-meta logs/npu_verify_general/tvconv_pyramid_convlstm_stream_state.json \
+  --budget-kib 192 \
+  --budget-dtype fp16 \
+  --risk-profile tiger_one_strict_edge
+```
+
+Result:
+
+- ONNX checker passed.
+- Ops:
+  `Add, Concat, Constant, Conv, ConvTranspose, Identity, Mul, Relu, Sigmoid, Slice, Split, Sub, Tanh`
+- Streaming state fp16 estimate: `143360 B` (`140.00 KiB`).
+- Disallowed ops: none.
+- Strict-edge risks: false.
 
 Post-review streaming ONNX export rerun:
 

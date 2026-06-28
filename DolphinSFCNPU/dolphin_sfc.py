@@ -35,6 +35,7 @@ Why this shape is chosen:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from copy import deepcopy
 import math
 
@@ -735,6 +736,71 @@ class DolphinSFCNPUSlimDecoderStage(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Source-aware compressed-token refinement
+# ---------------------------------------------------------------------------
+
+
+class DolphinSourceTokenRefinementBlock2d(nn.Module):
+    """Stateless per-source compressed-token refinement block."""
+
+    def __init__(self, channels: int, freq_kernel: int = 5, expansion: int = 2):
+        super().__init__()
+        if freq_kernel % 2 == 0:
+            raise ValueError(f"freq_kernel must be odd; got {freq_kernel}.")
+        if (freq_kernel - 1) >= 14:
+            raise ValueError("freq_kernel violates AGENT.md rule 5.")
+        if expansion < 1:
+            raise ValueError(f"expansion must be >= 1, got {expansion}.")
+
+        hidden = channels * expansion
+        self.norm = RMSNorm2d(channels)
+        self.in_proj = nn.Conv2d(channels, hidden * 2, kernel_size=1, bias=True)
+        self.freq_dw = nn.Conv2d(
+            hidden,
+            hidden,
+            kernel_size=(1, freq_kernel),
+            padding=(0, freq_kernel // 2),
+            groups=hidden,
+            bias=True,
+        )
+        self.out_proj = nn.Conv2d(hidden, channels, kernel_size=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a, b = self.in_proj(self.norm(x)).chunk(2, dim=1)
+        y = a * torch.sigmoid(b)
+        y = F.silu(self.freq_dw(y))
+        return x + self.out_proj(y)
+
+
+class DolphinSourceTokenRefiner2d(nn.Module):
+    """Per-source token/head refinement on the compressed band axis."""
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        layers: int = 2,
+        freq_kernel: int = 5,
+        expansion: int = 2,
+    ):
+        super().__init__()
+        if layers < 0:
+            raise ValueError(f"layers must be non-negative, got {layers}.")
+        self.in_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.blocks = nn.ModuleList(
+            DolphinSourceTokenRefinementBlock2d(channels, freq_kernel=freq_kernel, expansion=expansion)
+            for _ in range(layers)
+        )
+        self.out_norm = RMSNorm2d(channels)
+
+    def forward(self, shared_tokens: torch.Tensor) -> torch.Tensor:
+        x = F.silu(self.in_proj(shared_tokens))
+        for block in self.blocks:
+            x = block(x)
+        return self.out_norm(x)
+
+
+# ---------------------------------------------------------------------------
 # Top-level separator
 # ---------------------------------------------------------------------------
 
@@ -1091,6 +1157,295 @@ def apply_source_gain_mask_4d(
     return torch.cat(outputs, dim=1)
 
 
+class SourceAwareDolphinSFCNPUSeparator(DolphinSFCNPUSeparator):
+    """
+    DolphinSFCNPU variant with source-aware compressed-token refinement.
+
+    The shared Dolphin/SFC trunk still operates on compressed K-band tokens.
+    Speech/music are refined by separate stateless token refiners and predicted
+    as explicit masks; the final source is reconstructed from the residual by
+    default to preserve mixture consistency.
+    """
+
+    def __init__(
+        self,
+        *args,
+        explicit_source_count: int | None = None,
+        residual_source_index: int | None = None,
+        source_refine_layers: int = 2,
+        source_refine_freq_kernel: int = 5,
+        source_refine_expansion: int = 2,
+        source_head_type: str = "complex_residual",
+        sfx_residual_mode: str = "residual",
+        real_mask_scale: float = 1.0,
+        imag_mask_scale: float = 0.12,
+        **kwargs,
+    ):
+        if source_head_type not in {"real_residual", "complex_residual"}:
+            raise ValueError(
+                "source_head_type must be 'real_residual' or 'complex_residual', "
+                f"got {source_head_type!r}."
+            )
+        if sfx_residual_mode not in {"residual", "gated_residual"}:
+            raise ValueError(
+                "sfx_residual_mode must be 'residual' or 'gated_residual', "
+                f"got {sfx_residual_mode!r}."
+            )
+        super().__init__(*args, **kwargs)
+
+        if self.n_src < 2:
+            raise ValueError(f"Source-aware Dolphin requires at least two sources, got {self.n_src}.")
+        if explicit_source_count is None:
+            explicit_source_count = self.n_src - 1
+        if explicit_source_count != self.n_src - 1:
+            raise ValueError(
+                "Source-aware Dolphin currently expects exactly one residual source; "
+                f"got explicit_source_count={explicit_source_count}, n_src={self.n_src}."
+            )
+        if residual_source_index is None:
+            residual_source_index = self.n_src - 1
+        if residual_source_index != explicit_source_count:
+            raise ValueError(
+                "Source-aware Dolphin keeps explicit sources first and residual source last; "
+                f"got residual_source_index={residual_source_index}, explicit_source_count={explicit_source_count}."
+            )
+        if real_mask_scale <= 0.0:
+            raise ValueError(f"real_mask_scale must be positive, got {real_mask_scale}.")
+        if imag_mask_scale < 0.0:
+            raise ValueError(f"imag_mask_scale must be non-negative, got {imag_mask_scale}.")
+
+        self.explicit_source_count = int(explicit_source_count)
+        self.residual_source_index = int(residual_source_index)
+        self.source_head_type = str(source_head_type)
+        self.sfx_residual_mode = str(sfx_residual_mode)
+        self.real_mask_scale = float(real_mask_scale)
+        self.imag_mask_scale = float(imag_mask_scale)
+
+        self.out_proj = nn.Identity()
+        self.source_refiners = nn.ModuleList(
+            [
+                DolphinSourceTokenRefiner2d(
+                    self.widths[0],
+                    layers=source_refine_layers,
+                    freq_kernel=source_refine_freq_kernel,
+                    expansion=source_refine_expansion,
+                )
+                for _ in range(self.explicit_source_count)
+            ]
+        )
+        head_channels = self.n_chan if self.source_head_type == "real_residual" else 2 * self.n_chan
+        self.source_heads = nn.ModuleList(
+            [
+                nn.Conv2d(self.widths[0], head_channels, kernel_size=1, bias=True)
+                for _ in range(self.explicit_source_count)
+            ]
+        )
+        self.residual_gate_head = (
+            nn.Conv2d(self.widths[0], self.n_chan, kernel_size=1, bias=True)
+            if self.sfx_residual_mode == "gated_residual"
+            else None
+        )
+        self._init_source_heads()
+
+    def _init_source_heads(self) -> None:
+        eps = 1.0e-4
+        source_gain = min(max(1.0 / float(self.n_src), eps), 1.0 - eps)
+        source_logit = math.log(source_gain / (1.0 - source_gain))
+        with torch.no_grad():
+            for head in self.source_heads:
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
+                if self.source_head_type == "real_residual":
+                    head.bias.fill_(source_logit)
+                else:
+                    for chan_idx in range(self.n_chan):
+                        head.bias[2 * chan_idx].fill_(source_logit)
+                        head.bias[2 * chan_idx + 1].zero_()
+            if self.residual_gate_head is not None:
+                nn.init.zeros_(self.residual_gate_head.weight)
+                nn.init.zeros_(self.residual_gate_head.bias)
+
+    def _shared_tokens(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        query_side = None
+        compressed = self.compressor(self.in_proj(x))
+        if self.query_variant == "none":
+            z = compressed
+        else:
+            z, query_side = compressed
+
+        skips: list[torch.Tensor] = []
+        for stage in self.encoder:
+            z, skip = stage(z)
+            skips.append(skip)
+
+        for idx, stage in enumerate(self.decoder):
+            scale_idx = self.num_scales - 1 - idx
+            z = stage(z, skips[scale_idx])
+        return z, query_side
+
+    def _shared_tokens_stream(
+        self,
+        x: torch.Tensor,
+        state,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]]:
+        enc_states, dec_states = state
+        query_side = None
+        compressed = self.compressor.forward_stream(self.in_proj(x))
+        if self.query_variant == "none":
+            z = compressed
+        else:
+            z, query_side = compressed
+
+        skips: list[torch.Tensor] = []
+        new_enc_states: list[tuple[torch.Tensor, ...]] = []
+        for stage, stage_state in zip(self.encoder, enc_states):
+            z, skip, new_state = stage.forward_stream(z, stage_state)
+            skips.append(skip)
+            new_enc_states.append(new_state)
+
+        new_dec_states: list[tuple[torch.Tensor, ...]] = []
+        for idx, (stage, stage_state) in enumerate(zip(self.decoder, dec_states)):
+            scale_idx = self.num_scales - 1 - idx
+            z, new_state = stage.forward_stream(z, skips[scale_idx], stage_state)
+            new_dec_states.append(new_state)
+        return z, query_side, (tuple(new_enc_states), tuple(new_dec_states))
+
+    def _decode_tokens(self, tokens: torch.Tensor, query_side: torch.Tensor | None) -> torch.Tensor:
+        if self.query_variant == "none":
+            return self.decoder_to_freq(tokens)
+        _runtime_assert(query_side is not None, "Query side-path was not produced by the compressor.")
+        return self.decoder_to_freq(tokens, query_side)
+
+    def _explicit_estimates(
+        self,
+        x: torch.Tensor,
+        shared_tokens: torch.Tensor,
+        query_side: torch.Tensor | None,
+    ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        estimates: list[torch.Tensor] = []
+        mask_logits: list[torch.Tensor] = []
+        masks: list[torch.Tensor] = []
+        for refiner, head in zip(self.source_refiners, self.source_heads):
+            decoded = self._decode_tokens(refiner(shared_tokens), query_side)
+            logits = head(decoded)
+            mask_logits.append(logits)
+            if self.source_head_type == "real_residual":
+                gain = torch.sigmoid(logits) * self.real_mask_scale
+                masks.append(gain)
+                parts = []
+                for chan_idx in range(self.n_chan):
+                    chan_gain = gain[:, chan_idx : chan_idx + 1]
+                    real = x[:, 2 * chan_idx : 2 * chan_idx + 1] * chan_gain
+                    imag = x[:, 2 * chan_idx + 1 : 2 * chan_idx + 2] * chan_gain
+                    parts.extend([real, imag])
+                estimates.append(torch.cat(parts, dim=1))
+            else:
+                parts = []
+                mask_parts = []
+                for chan_idx in range(self.n_chan):
+                    real_logit = logits[:, 2 * chan_idx : 2 * chan_idx + 1]
+                    imag_logit = logits[:, 2 * chan_idx + 1 : 2 * chan_idx + 2]
+                    real_mask = torch.sigmoid(real_logit) * self.real_mask_scale
+                    imag_mask = torch.tanh(imag_logit) * self.imag_mask_scale
+                    mix_real = x[:, 2 * chan_idx : 2 * chan_idx + 1]
+                    mix_imag = x[:, 2 * chan_idx + 1 : 2 * chan_idx + 2]
+                    parts.extend(
+                        [
+                            mix_real * real_mask - mix_imag * imag_mask,
+                            mix_imag * real_mask + mix_real * imag_mask,
+                        ]
+                    )
+                    mask_parts.extend([real_mask, imag_mask])
+                estimates.append(torch.cat(parts, dim=1))
+                masks.append(torch.cat(mask_parts, dim=1))
+        return estimates, torch.cat(masks, dim=1), torch.cat(mask_logits, dim=1), shared_tokens
+
+    def _residual_estimate(
+        self,
+        x: torch.Tensor,
+        explicit_estimates: Sequence[torch.Tensor],
+        shared_tokens: torch.Tensor,
+        query_side: torch.Tensor | None,
+    ) -> torch.Tensor:
+        residual_parts = []
+        for chan_idx in range(self.n_chan):
+            real = x[:, 2 * chan_idx : 2 * chan_idx + 1]
+            imag = x[:, 2 * chan_idx + 1 : 2 * chan_idx + 2]
+            for estimate in explicit_estimates:
+                real = real - estimate[:, 2 * chan_idx : 2 * chan_idx + 1]
+                imag = imag - estimate[:, 2 * chan_idx + 1 : 2 * chan_idx + 2]
+            residual_parts.extend([real, imag])
+        residual = torch.cat(residual_parts, dim=1)
+        if self.residual_gate_head is None:
+            return residual
+        decoded = self._decode_tokens(shared_tokens, query_side)
+        gate = torch.sigmoid(self.residual_gate_head(decoded))
+        gated_parts = []
+        for chan_idx in range(self.n_chan):
+            chan_gate = gate[:, chan_idx : chan_idx + 1]
+            gated_parts.extend(
+                [
+                    residual[:, 2 * chan_idx : 2 * chan_idx + 1] * chan_gate,
+                    residual[:, 2 * chan_idx + 1 : 2 * chan_idx + 2] * chan_gate,
+                ]
+            )
+        return torch.cat(gated_parts, dim=1)
+
+    def _assemble_output(
+        self,
+        x: torch.Tensor,
+        shared_tokens: torch.Tensor,
+        query_side: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, object]]:
+        explicit_estimates, mask, mask_logits, shared_tokens = self._explicit_estimates(x, shared_tokens, query_side)
+        residual = self._residual_estimate(x, explicit_estimates, shared_tokens, query_side)
+        y = torch.cat([*explicit_estimates, residual], dim=1)
+        aux = {
+            "mask": mask,
+            "mask_domain": "packed_complex_mask" if self.source_head_type == "complex_residual" else "real_gain_mask",
+            "mask_logits": mask_logits,
+            "mask_logits_domain": (
+                "source_aware_dolphin_complex_mask_logits"
+                if self.source_head_type == "complex_residual"
+                else "source_aware_dolphin_real_gain_logits"
+            ),
+            "mask_logits_transform": (
+                "sigmoid_tanh_complex_mask"
+                if self.source_head_type == "complex_residual"
+                else "sigmoid_real_gain_mask"
+            ),
+            "mask_logits_real_scale": self.real_mask_scale,
+            "mask_logits_imag_scale": self.imag_mask_scale,
+            "explicit_source_count": self.explicit_source_count,
+            "residual_source_index": self.residual_source_index,
+            "sfx_residual_mode": self.sfx_residual_mode,
+        }
+        return y, aux
+
+    def forward(self, x: torch.Tensor, return_aux: bool = False):
+        shared_tokens, query_side = self._shared_tokens(x)
+        y, aux = self._assemble_output(x, shared_tokens, query_side)
+        if return_aux:
+            return y, aux
+        return y
+
+    def forward_stream(self, x: torch.Tensor, state=None, return_aux: bool = False):
+        _runtime_assert(x.ndim == 4, f"Expected (B,C,T,F), got {x.shape}")
+        _runtime_assert(x.shape[2] == 1, "forward_stream expects one frame at a time.")
+        if state is None:
+            state = self.init_stream_state(batch_size=x.shape[0], device=x.device, dtype=x.dtype)
+        shared_tokens, query_side, new_state = self._shared_tokens_stream(x, state)
+        y, aux = self._assemble_output(x, shared_tokens, query_side)
+        if return_aux:
+            return y, new_state, aux
+        return y, new_state
+
+    def state_numel(self, batch_size: int = 1) -> int:
+        parameter = next(self.parameters())
+        state = self.init_stream_state(batch_size=batch_size, device=parameter.device, dtype=parameter.dtype)
+        return _tree_numel(state)
+
+
 # ---------------------------------------------------------------------------
 # Packed-state ONNX export wrapper (unchanged contract, smaller leaf count)
 # ---------------------------------------------------------------------------
@@ -1254,6 +1609,27 @@ for _base_name in ("edge_small", "slim_4m", "slim_6m", "slim_8m", "large_6m", "l
     _PRESETS[f"{_base_name}_soft_band_query"] = dict(_PRESETS[_base_name], query_variant="soft_band_query")
     _PRESETS[f"{_base_name}_crossattn_query"] = dict(_PRESETS[_base_name], query_variant="crossattn_query")
 
+_PRESETS["source_aware_6m"] = dict(
+    _PRESETS["slim_6m"],
+    n_bands=56,
+    query_variant="soft_band_query",
+    source_aware=True,
+    explicit_source_count=2,
+    source_refine_layers=2,
+    source_refine_freq_kernel=5,
+    source_refine_expansion=2,
+    source_head_type="complex_residual",
+    sfx_residual_mode="residual",
+)
+_PRESETS["source_aware_6m_gated_sfx"] = dict(
+    _PRESETS["source_aware_6m"],
+    sfx_residual_mode="gated_residual",
+)
+_PRESETS["source_aware_6m_crossattn"] = dict(
+    _PRESETS["source_aware_6m"],
+    query_variant="crossattn_query",
+)
+
 
 def build_dolphin_sfc_npu_from_config(
     *,
@@ -1277,15 +1653,53 @@ def build_dolphin_sfc_npu_from_config(
     freq_kernels: tuple[int, ...] | list[int] | None = None,
     compressor_freq_kernel: int | None = None,
     ffn_expansion: int | None = None,
+    source_aware: bool | None = None,
+    explicit_source_count: int | None = None,
+    residual_source_index: int | None = None,
+    source_refine_layers: int | None = None,
+    source_refine_freq_kernel: int | None = None,
+    source_refine_expansion: int | None = None,
+    source_head_type: str | None = None,
+    sfx_residual_mode: str | None = None,
+    real_mask_scale: float | None = None,
+    imag_mask_scale: float | None = None,
 ) -> DolphinSFCNPUSeparator:
     if preset not in _PRESETS:
         names = ", ".join(sorted(_PRESETS))
         raise ValueError(f"Unknown DolphinSFCNPU preset {preset!r}. Available presets: {names}")
 
     cfg = deepcopy(_PRESETS[preset])
+    preset_source_aware = bool(cfg.pop("source_aware", False))
+    if source_aware is None:
+        source_aware = preset_source_aware
     preset_query_variant = cfg.pop("query_variant", "none")
     if query_variant is None:
         query_variant = str(preset_query_variant)
+    source_cfg = {
+        "explicit_source_count": cfg.pop("explicit_source_count", None),
+        "residual_source_index": cfg.pop("residual_source_index", None),
+        "source_refine_layers": cfg.pop("source_refine_layers", 2),
+        "source_refine_freq_kernel": cfg.pop("source_refine_freq_kernel", 5),
+        "source_refine_expansion": cfg.pop("source_refine_expansion", 2),
+        "source_head_type": cfg.pop("source_head_type", "complex_residual"),
+        "sfx_residual_mode": cfg.pop("sfx_residual_mode", "residual"),
+        "real_mask_scale": cfg.pop("real_mask_scale", 1.0),
+        "imag_mask_scale": cfg.pop("imag_mask_scale", 0.12),
+    }
+    source_overrides = {
+        "explicit_source_count": explicit_source_count,
+        "residual_source_index": residual_source_index,
+        "source_refine_layers": source_refine_layers,
+        "source_refine_freq_kernel": source_refine_freq_kernel,
+        "source_refine_expansion": source_refine_expansion,
+        "source_head_type": source_head_type,
+        "sfx_residual_mode": sfx_residual_mode,
+        "real_mask_scale": real_mask_scale,
+        "imag_mask_scale": imag_mask_scale,
+    }
+    for key, value in source_overrides.items():
+        if value is not None:
+            source_cfg[key] = value
     overrides = {
         "n_bands": n_bands,
         "d_model": d_model,
@@ -1300,7 +1714,10 @@ def build_dolphin_sfc_npu_from_config(
     for key, value in overrides.items():
         if value is not None:
             cfg[key] = value
-    return DolphinSFCNPUSeparator(
+    if source_aware and not masking:
+        raise ValueError("Source-aware Dolphin currently requires masking=True.")
+    separator_cls = SourceAwareDolphinSFCNPUSeparator if source_aware else DolphinSFCNPUSeparator
+    return separator_cls(
         n_freq=n_freq,
         n_fft=n_fft,
         sample_rate=sample_rate,
@@ -1311,6 +1728,7 @@ def build_dolphin_sfc_npu_from_config(
         mask_activation=mask_activation,
         query_variant=query_variant,
         query_type=query_type,
+        **(source_cfg if source_aware else {}),
         **cfg,  # type: ignore[arg-type]
     )
 
@@ -1328,6 +1746,7 @@ def build_dolphin_sfc_npu_preset(
     mask_activation: str = "sigmoid",
     query_variant: str | None = None,
     query_type: str = "adaptive",
+    source_aware: bool | None = None,
 ) -> DolphinSFCNPUSeparator:
     """
     Build a named DolphinSFCNPU configuration.
@@ -1353,4 +1772,5 @@ def build_dolphin_sfc_npu_preset(
         mask_activation=mask_activation,
         query_variant=query_variant,
         query_type=query_type,
+        source_aware=source_aware,
     )

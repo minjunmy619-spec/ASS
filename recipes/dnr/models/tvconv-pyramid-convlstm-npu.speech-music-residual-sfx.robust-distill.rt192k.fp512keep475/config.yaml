@@ -1,0 +1,12 @@
+_base_: ../tvconv-pyramid-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+
+tvconv_recurrent_layers: 1
+tvconv_recurrent_band_kernel: 3
+tvconv_recurrent_replace_blocks: 2
+
+task:
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_tvconv_pyramid_convlstm_npu_separator_system
+    recurrent_layers: ${tvconv_recurrent_layers}
+    recurrent_band_kernel: ${tvconv_recurrent_band_kernel}
+    recurrent_replace_blocks: ${tvconv_recurrent_replace_blocks}

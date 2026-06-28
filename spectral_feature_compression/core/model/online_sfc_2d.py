@@ -59,6 +59,29 @@ class RMSNorm2d(nn.Module):
         return x * self.weight.view(1, -1, 1, 1)
 
 
+class ChannelAffine2d(nn.Module):
+    """Per-channel affine transform for 4D tensors (B, C, T, F)."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
+
+
+def build_norm2d(channels: int, *, norm_type: str = "rms") -> nn.Module:
+    norm = str(norm_type).lower()
+    if norm == "rms":
+        return RMSNorm2d(channels)
+    if norm in {"affine", "channel_affine"}:
+        return ChannelAffine2d(channels)
+    if norm in {"identity", "none"}:
+        return nn.Identity()
+    raise ValueError(f"Unsupported norm_type={norm_type!r}; expected rms, affine, or identity.")
+
+
 class CausalConv2d(nn.Module):
     """
     Causal conv along time (T), regular centered conv along frequency (F).

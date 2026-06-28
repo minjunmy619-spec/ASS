@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 from BandSFCNetNPU.training_wrapper import build_band_sfc_net_npu_system
 from EdgeFusionNPU.training_wrapper import build_edge_fusion_npu_system
+from spectral_feature_compression.core.model import tvconv_pyramid_npu_separator_2d as _tvconv_pyramid_npu_separator_2d
 from spectral_feature_compression.core.model.adaptive_mel_locoformer_lite_sfc_2d import (
     build_adaptive_mel_locoformer_lite_sfc_system as _build_adaptive_mel_locoformer_lite_sfc_system,
 )
@@ -57,11 +58,26 @@ from spectral_feature_compression.core.model.sparse_unet_mel_sfc_2d import (
     build_sparse_unet_mel_sfc_system as _build_sparse_unet_mel_sfc_system,
 )
 from spectral_feature_compression.core.model.tvconv_pyramid_npu_separator_2d import (
+    build_tvconv_pyramid_convgru_npu_separator_system as _build_tvconv_pyramid_convgru_npu_separator_system,
+)
+from spectral_feature_compression.core.model.tvconv_pyramid_npu_separator_2d import (
+    build_tvconv_pyramid_convlstm_npu_separator_system as _build_tvconv_pyramid_convlstm_npu_separator_system,
+)
+from spectral_feature_compression.core.model.tvconv_pyramid_npu_separator_2d import (
     build_tvconv_pyramid_npu_separator_system as _build_tvconv_pyramid_npu_separator_system,
+)
+from spectral_feature_compression.core.model.tvconv_pyramid_npu_separator_2d import (
+    build_tvconv_pyramid_sfclite_query_npu_separator_system as _build_tvconv_pyramid_sfclite_query_npu_separator_system,
 )
 
 build_source_aware_sfc_locoformer_teacher_system = _build_source_aware_sfc_locoformer_teacher_system
 build_tvconv_pyramid_npu_separator_system = _build_tvconv_pyramid_npu_separator_system
+build_tvconv_pyramid_convgru_npu_separator_system = _build_tvconv_pyramid_convgru_npu_separator_system
+build_tvconv_pyramid_convlstm_npu_separator_system = _build_tvconv_pyramid_convlstm_npu_separator_system
+build_tvconv_pyramid_sfclite_query_npu_separator_system = _build_tvconv_pyramid_sfclite_query_npu_separator_system
+build_tvconv_pyramid_sourceaware_sfclite_convgru_npu_separator_system = (
+    _tvconv_pyramid_npu_separator_2d.build_tvconv_pyramid_sourceaware_sfclite_convgru_npu_separator_system
+)
 
 
 def build_sfc_locoformer_lite_plus_system(
@@ -789,6 +805,7 @@ def build_source_aware_melband_loco_cnb_student_npu_system(
     masking: bool = True,
     mixture_consistency: bool = True,
     routing_normalization: str = "softmax",
+    norm_type: str = "rms",
     freq_preprocess_enabled: bool = True,
     freq_preprocess_keep_bins: int | None = 475,
     freq_preprocess_target_bins: int | None = 512,
@@ -863,6 +880,7 @@ def build_source_aware_melband_loco_cnb_student_npu_system(
         masking=masking,
         mixture_consistency=mixture_consistency,
         routing_normalization=routing_normalization,
+        norm_type=norm_type,
         freq_preprocess_enabled=freq_preprocess_enabled,
         freq_preprocess_keep_bins=freq_preprocess_keep_bins,
         freq_preprocess_target_bins=freq_preprocess_target_bins,

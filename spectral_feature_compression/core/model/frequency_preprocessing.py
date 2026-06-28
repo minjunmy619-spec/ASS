@@ -73,6 +73,67 @@ def _build_triangular_high_basis(high_in: int, high_out: int) -> torch.Tensor:
     return basis
 
 
+def _build_triangular_high_basis_from_centers(high_in: int, centers: torch.Tensor) -> torch.Tensor:
+    high_out = int(centers.numel())
+    if high_out == 1:
+        return torch.ones(1, high_in, dtype=torch.float32)
+
+    centers = centers.to(dtype=torch.float32)
+    centers = centers.clone()
+    centers[0] = 0.0
+    centers[-1] = float(max(high_in - 1, 0))
+    if torch.any(centers[1:] <= centers[:-1]):
+        raise ValueError(f"Expected strictly increasing high-band centers, got {centers.tolist()}")
+
+    basis = torch.zeros(high_out, high_in, dtype=torch.float32)
+    positions = torch.arange(high_in, dtype=torch.float32)
+    for idx in range(high_out):
+        center = centers[idx]
+        left = centers[idx - 1] if idx > 0 else centers[idx]
+        right = centers[idx + 1] if idx < high_out - 1 else centers[idx]
+
+        values = torch.zeros_like(positions)
+        if center > left:
+            left_mask = (positions >= left) & (positions <= center)
+            values[left_mask] = (positions[left_mask] - left) / (center - left).clamp_min(1e-6)
+        if right > center:
+            right_mask = (positions >= center) & (positions <= right)
+            values[right_mask] = torch.maximum(
+                values[right_mask],
+                (right - positions[right_mask]) / (right - center).clamp_min(1e-6),
+            )
+        values[int(round(float(center.item())))] = 1.0
+        basis[idx] = values.clamp_min(0.0)
+    return basis
+
+
+def _build_log_high_basis(high_in: int, high_out: int) -> torch.Tensor:
+    if high_out == 1:
+        return torch.ones(1, high_in, dtype=torch.float32)
+    log_span = 3.0
+    u = torch.linspace(0.0, 1.0, steps=high_out, dtype=torch.float32)
+    centers = torch.expm1(u * log_span) / torch.expm1(torch.tensor(log_span, dtype=torch.float32))
+    centers = centers * float(max(high_in - 1, 0))
+    return _build_triangular_high_basis_from_centers(high_in, centers)
+
+
+def _build_piecewise_high_basis(high_in: int, high_out: int) -> torch.Tensor:
+    if high_out == 1:
+        return torch.ones(1, high_in, dtype=torch.float32)
+
+    lower_input_fraction = 0.55
+    lower_output_fraction = 0.70
+    lower_count = int(round(float(high_out) * lower_output_fraction))
+    lower_count = min(max(lower_count, 1), high_out - 1)
+    upper_count = high_out - lower_count
+
+    split = float(max(high_in - 1, 0)) * lower_input_fraction
+    lower = torch.linspace(0.0, split, steps=lower_count, dtype=torch.float32)
+    upper = torch.linspace(split, float(max(high_in - 1, 0)), steps=upper_count + 1, dtype=torch.float32)[1:]
+    centers = torch.cat([lower, upper], dim=0)
+    return _build_triangular_high_basis_from_centers(high_in, centers)
+
+
 def build_hybrid_frequency_matrices(
     n_freq_in: int,
     *,
@@ -91,10 +152,17 @@ def build_hybrid_frequency_matrices(
     if high_out <= 0:
         raise ValueError(f"Expected target_bins > keep_bins, got {target_bins} vs {keep_bins}")
 
+    if mode in {"learnable_query", "sfclite_query"}:
+        mode = "triangular"
+
     if mode == "avg":
         high_basis = _build_avg_high_basis(high_in, high_out)
     elif mode == "triangular":
         high_basis = _build_triangular_high_basis(high_in, high_out)
+    elif mode == "hybrid_log_high":
+        high_basis = _build_log_high_basis(high_in, high_out)
+    elif mode == "hybrid_piecewise_high":
+        high_basis = _build_piecewise_high_basis(high_in, high_out)
     else:
         raise ValueError(f"Unsupported frequency preprocessing mode: {mode}")
 
@@ -218,6 +286,77 @@ class HybridFrequencyProjector2d(nn.Module):
             "n_freq_out": self.n_freq_out,
             "keep_bins": self.keep_bins,
             "mode": self.mode,
+        }
+
+
+class LearnableQueryFrequencyProjector2d(nn.Module):
+    """
+    SFC-lite frequency encoder/decoder with a tied learnable query.
+
+    The encoder projects full-frequency packed STFT bins into ``target_bins``
+    using one learnable query matrix.  The decoder uses the same query matrix
+    directly, so there is no independent synthesis table to drift away from the
+    encoder transport learned during training.
+    """
+
+    def __init__(
+        self,
+        n_freq_in: int,
+        *,
+        keep_bins: int,
+        target_bins: int,
+        init_mode: str = "triangular",
+    ):
+        super().__init__()
+        analysis, _synthesis = build_hybrid_frequency_matrices(
+            n_freq_in=n_freq_in,
+            keep_bins=keep_bins,
+            target_bins=target_bins,
+            mode=init_mode,
+        )
+        self.n_freq_in = int(n_freq_in)
+        self.keep_bins = int(keep_bins)
+        self.target_bins = int(target_bins)
+        self.init_mode = init_mode
+        self.frequency_query = nn.Parameter(analysis)
+
+    @property
+    def n_freq_out(self) -> int:
+        return self.target_bins
+
+    def encoder_query(self) -> torch.Tensor:
+        return self.frequency_query
+
+    def analysis(self, x: torch.Tensor) -> torch.Tensor:
+        batch, channels, frames, n_freq = x.shape
+        if n_freq != self.n_freq_in:
+            raise ValueError(f"Expected {self.n_freq_in} input bins, got {n_freq}")
+        flat = x.reshape(batch * channels * frames, n_freq)
+        query = self.encoder_query().to(device=flat.device, dtype=flat.dtype)
+        y = flat @ query.transpose(0, 1)
+        return y.reshape(batch, channels, frames, self.n_freq_out)
+
+    def synthesis_with_query(self, x: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        batch, channels, frames, n_freq = x.shape
+        if n_freq != self.n_freq_out:
+            raise ValueError(f"Expected {self.n_freq_out} projected bins, got {n_freq}")
+        flat = x.reshape(batch * channels * frames, n_freq)
+        query = query.to(device=flat.device, dtype=flat.dtype)
+        y = flat @ query
+        return y.reshape(batch, channels, frames, self.n_freq_in)
+
+    def synthesis(self, x: torch.Tensor) -> torch.Tensor:
+        return self.synthesis_with_query(x, self.encoder_query())
+
+    def manifest(self) -> dict[str, object]:
+        return {
+            "enabled": True,
+            "type": "sfc_lite_learnable_query",
+            "n_freq_in": self.n_freq_in,
+            "n_freq_out": self.n_freq_out,
+            "keep_bins": self.keep_bins,
+            "init_mode": self.init_mode,
+            "tied_synthesis_query": True,
         }
 
 
@@ -359,12 +498,19 @@ def build_frequency_preprocessor(
     target_bins: int | None = None,
     mode: str = "triangular",
     dc_bypass_enabled: bool = False,
-) -> HybridFrequencyProjector2d | None:
+) -> HybridFrequencyProjector2d | LearnableQueryFrequencyProjector2d | None:
     if not enabled:
         return None
     n_freq_in = resolve_frequency_input_n_freq(n_freq_in, dc_bypass_enabled=dc_bypass_enabled)
     if keep_bins is None or target_bins is None:
         raise ValueError("keep_bins and target_bins must be provided when frequency preprocessing is enabled.")
+    if mode in {"learnable_query", "sfclite_query"}:
+        return LearnableQueryFrequencyProjector2d(
+            n_freq_in=n_freq_in,
+            keep_bins=int(keep_bins),
+            target_bins=int(target_bins),
+            init_mode="triangular",
+        )
     return HybridFrequencyProjector2d(
         n_freq_in=n_freq_in,
         keep_bins=int(keep_bins),
@@ -411,7 +557,7 @@ class FrequencyPreprocessedOnlineModel(nn.Module):
         core: nn.Module,
         n_src: int,
         n_chan: int,
-        freq_preprocessor: HybridFrequencyProjector2d | None = None,
+        freq_preprocessor: HybridFrequencyProjector2d | LearnableQueryFrequencyProjector2d | None = None,
         pcen_preprocessor: PCENGainNormalizer2d | None = None,
         dc_bypass_enabled: bool = False,
         dc_policy: str = "zero",
@@ -531,10 +677,7 @@ class FrequencyPreprocessedOnlineModel(nn.Module):
         x2d, dc2d = self.split_dc_2d(mixture2d)
         core_ref = self.preprocess_2d(x2d)
         core_in, gain, _pcen_state = self.preprocess_core_input_2d(core_ref)
-        if return_aux:
-            core_output = self.core(core_in, return_aux=True, **kwargs)
-        else:
-            core_output = self.core(core_in, **kwargs)
+        core_output = self.core(core_in, return_aux=True, **kwargs) if return_aux else self.core(core_in, **kwargs)
         if isinstance(core_output, tuple):
             y2d, aux = core_output
         else:

@@ -49,10 +49,19 @@ class DolphinSFCNPUOnlineModel(nn.Module):
         self.n_chan = n_chan
 
     def forward(self, x, **kwargs):
+        return_aux = bool(kwargs.pop("return_aux", False))
         # x: complex (B, M, F, T)
         x2d = pack_complex_stft_as_2d(x)  # (B, 2*M, T, F)
-        y2d = self.core(x2d)
-        return unpack_2d_to_complex_stft(y2d, n_src=self.n_src, n_chan=self.n_chan)
+        core_output = self.core(x2d, return_aux=True, **kwargs) if return_aux else self.core(x2d, **kwargs)
+        if isinstance(core_output, tuple):
+            y2d, aux = core_output
+        else:
+            y2d = core_output
+            aux = {}
+        estimate = unpack_2d_to_complex_stft(y2d, n_src=self.n_src, n_chan=self.n_chan)
+        if return_aux:
+            return estimate, aux
+        return estimate
 
 
 def build_dolphin_sfc_npu_system(
@@ -76,6 +85,16 @@ def build_dolphin_sfc_npu_system(
     freq_kernels: tuple[int, ...] | list[int] | None = None,
     compressor_freq_kernel: int | None = None,
     ffn_expansion: int | None = None,
+    source_aware: bool | None = None,
+    explicit_source_count: int | None = None,
+    residual_source_index: int | None = None,
+    source_refine_layers: int | None = None,
+    source_refine_freq_kernel: int | None = None,
+    source_refine_expansion: int | None = None,
+    source_head_type: str | None = None,
+    sfx_residual_mode: str | None = None,
+    real_mask_scale: float | None = None,
+    imag_mask_scale: float | None = None,
     scaling: bool = False,
     freq_preprocess_enabled: bool = False,
     freq_preprocess_keep_bins: int | None = None,
@@ -158,6 +177,16 @@ def build_dolphin_sfc_npu_system(
         freq_kernels=freq_kernels,
         compressor_freq_kernel=compressor_freq_kernel,
         ffn_expansion=ffn_expansion,
+        source_aware=source_aware,
+        explicit_source_count=explicit_source_count,
+        residual_source_index=residual_source_index,
+        source_refine_layers=source_refine_layers,
+        source_refine_freq_kernel=source_refine_freq_kernel,
+        source_refine_expansion=source_refine_expansion,
+        source_head_type=source_head_type,
+        sfx_residual_mode=sfx_residual_mode,
+        real_mask_scale=real_mask_scale,
+        imag_mask_scale=imag_mask_scale,
     )
     if freq_preprocessor is None and pcen_preprocessor is None and not dc_bypass_enabled:
         model = DolphinSFCNPUOnlineModel(core=core, n_src=n_src, n_chan=n_chan)

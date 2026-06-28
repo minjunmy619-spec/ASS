@@ -1,0 +1,22 @@
+_base_: ../tvconv-pyramid-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+
+# Deploy-first strong TVConv student.  Spend the extra 3-5M parameter budget in
+# fused Conv2D source-aware mask prediction rather than a RoFormer-style
+# source-decoder stack with many small memory ops.
+tvconv_recurrent_layers: 1
+tvconv_recurrent_band_kernel: 3
+tvconv_recurrent_replace_blocks: 2
+tvconv_source_head_type: folded_source_aware
+tvconv_source_mixer_layers: 1
+tvconv_mask_hidden: 384
+
+task:
+  model:
+    _target_: spectral_feature_compression.core.model.proposed_separation_models.build_tvconv_pyramid_sourceaware_sfclite_convgru_npu_separator_system
+    recurrent_layers: ${tvconv_recurrent_layers}
+    recurrent_band_kernel: ${tvconv_recurrent_band_kernel}
+    recurrent_replace_blocks: ${tvconv_recurrent_replace_blocks}
+    source_head_type: ${tvconv_source_head_type}
+    source_mixer_layers: ${tvconv_source_mixer_layers}
+    mask_hidden: ${tvconv_mask_hidden}
+    freq_preprocess_mode: learnable_query

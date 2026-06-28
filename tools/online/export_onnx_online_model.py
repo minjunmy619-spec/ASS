@@ -308,6 +308,48 @@ def load_dc_bypass_metadata(model_path: Path) -> dict[str, object] | None:
     }
 
 
+def load_pcen_preprocess_metadata(model_path: Path) -> dict[str, object] | None:
+    config_path = infer_recipe_config_path(model_path)
+    if config_path is None:
+        return None
+    top_level = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top_level, **model_cfg}
+    enabled = resolve_value(model_cfg.get("pcen_preprocess_enabled", False), context)
+    if not bool(enabled):
+        return None
+
+    n_chan_value = model_cfg.get("n_chan", top_level.get("n_chan", 1))
+    if n_chan_value == "${n_chan}" and "n_chan" in top_level:
+        n_chan_value = top_level["n_chan"]
+    n_chan = int(resolve_value(n_chan_value, context))
+    freq_meta = load_frequency_preprocess_metadata(config_path)
+    dc_meta = load_dc_bypass_metadata(config_path)
+    if freq_meta is not None and freq_meta.get("target_bins") is not None:
+        core_n_freq = int(freq_meta["target_bins"])  # type: ignore[arg-type]
+    elif "n_fft" in top_level:
+        full_n_freq = int(resolve_value(top_level["n_fft"], context)) // 2 + 1
+        core_n_freq = full_n_freq - 1 if dc_meta is not None else full_n_freq
+    else:
+        core_n_freq = None
+    state_shape = [1, n_chan, 1, core_n_freq] if core_n_freq is not None else None
+    return {
+        "enabled": True,
+        "type": "pcen_gain_normalizer_2d",
+        "placement": "after_frequency_preprocessing_before_core",
+        "invert_output_gain": True,
+        "n_chan": n_chan,
+        "smooth_coef": resolve_value(model_cfg.get("pcen_smooth_coef", 0.98), context),
+        "alpha": resolve_value(model_cfg.get("pcen_alpha", 0.5), context),
+        "delta": resolve_value(model_cfg.get("pcen_delta", 2.0), context),
+        "root": resolve_value(model_cfg.get("pcen_root", 0.5), context),
+        "eps": resolve_value(model_cfg.get("pcen_eps", 1.0e-6), context),
+        "gain_floor": resolve_value(model_cfg.get("pcen_gain_floor", 0.05), context),
+        "gain_ceiling": resolve_value(model_cfg.get("pcen_gain_ceiling", 20.0), context),
+        "state_shape": state_shape,
+    }
+
+
 def infer_export_freq_bins(config_path: Path) -> int:
     """Infer ONNX spectral bin count ``F`` for ``[B, 2*n_chan, T, F]`` exports."""
     top_level = merge_top_level_scalars(config_path)
@@ -544,6 +586,7 @@ def main():
     core, source_mode = load_export_core(args.model_path, args.device)
     frequency_preprocess_meta = load_frequency_preprocess_metadata(args.model_path)
     dc_bypass_meta = load_dc_bypass_metadata(args.model_path)
+    pcen_preprocess_meta = load_pcen_preprocess_metadata(args.model_path)
     core = core.to(args.device)
     if args.disable_masking and hasattr(core, "masking"):
         core = copy.deepcopy(core)
@@ -708,13 +751,17 @@ def main():
     allowed_ops = get_allowed_ops(args.op_preset).union(args.allow_op)
     audit = audit_onnx_graph(onnx_model, allowed_ops=allowed_ops)
 
-    if args.state_meta_out is not None and (state_meta is not None or constant_meta is not None):
+    if args.state_meta_out is not None and (
+        state_meta is not None or constant_meta is not None or pcen_preprocess_meta is not None
+    ):
         args.state_meta_out.parent.mkdir(parents=True, exist_ok=True)
         payload = {}
         if state_meta is not None:
             payload["streaming_state"] = state_meta
         if constant_meta is not None:
             payload["externalized_band_constants"] = constant_meta
+        if pcen_preprocess_meta is not None:
+            payload["pcen_preprocessing"] = pcen_preprocess_meta
         args.state_meta_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     if args.constants_out is not None:
@@ -757,6 +804,14 @@ def main():
             if args.externalize_band_constants and constant_meta is not None
             else 0
         )
+        pcen_state_shape = (
+            pcen_preprocess_meta.get("state_shape")
+            if isinstance(pcen_preprocess_meta, dict)
+            else None
+        )
+        pcen_state_shapes = [pcen_state_shape] if isinstance(pcen_state_shape, list) else []
+        pcen_state_bytes_fp16 = tensor_collection_bytes(pcen_state_shapes, element_size=2)
+        pcen_state_bytes_fp32 = tensor_collection_bytes(pcen_state_shapes, element_size=4)
         manifest = {
             "source": str(args.model_path),
             "source_mode": source_mode,
@@ -770,6 +825,7 @@ def main():
             "n_chan": args.n_chan,
             "frequency_preprocessing": frequency_preprocess_meta,
             "dc_bypass": dc_bypass_meta,
+            "pcen_preprocessing": pcen_preprocess_meta,
             "input_names": input_names,
             "output_names": output_names,
             "dynamic_inputs": (
@@ -795,6 +851,10 @@ def main():
                 "embedded_band_constants_bytes_fp32": embedded_constant_bytes_fp32,
                 "externalized_band_constants_bytes_fp16": externalized_constant_bytes_fp16,
                 "externalized_band_constants_bytes_fp32": externalized_constant_bytes_fp32,
+                "pcen_state_bytes_fp16": pcen_state_bytes_fp16,
+                "pcen_state_bytes_fp32": pcen_state_bytes_fp32,
+                "streaming_state_with_pcen_bytes_fp16": state_bytes_fp16 + pcen_state_bytes_fp16,
+                "streaming_state_with_pcen_bytes_fp32": state_bytes_fp32 + pcen_state_bytes_fp32,
                 "onnx_initializers_bytes": int(audit["initializer_bytes"]),
             },
             "onnx_audit": audit,

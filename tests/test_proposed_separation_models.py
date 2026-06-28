@@ -18,6 +18,7 @@ from spectral_feature_compression.core.model.adaptive_mel_sfc_2d import Adaptive
 from spectral_feature_compression.core.model.foa_event_query_prompted_sfc import (
     FOAEventQueryPromptedAsymmetricSFC2D,
 )
+from spectral_feature_compression.core.model.online_sfc_2d import ChannelAffine2d, RMSNorm2d
 from spectral_feature_compression.core.model.prompted_asymmetric_sfc_2d import OnlinePromptedAsymmetricSFC2D
 from spectral_feature_compression.core.model.proposed_separation_models import (
     build_adaptive_mel_loco_cnb_npu_system,
@@ -36,7 +37,11 @@ from spectral_feature_compression.core.model.proposed_separation_models import (
     build_source_aware_melband_roformer_teacher_system,
     build_source_aware_residual_sfc_system,
     build_sparse_unet_mel_sfc_music_system,
+    build_tvconv_pyramid_convgru_npu_separator_system,
+    build_tvconv_pyramid_convlstm_npu_separator_system,
     build_tvconv_pyramid_npu_separator_system,
+    build_tvconv_pyramid_sfclite_query_npu_separator_system,
+    build_tvconv_pyramid_sourceaware_sfclite_convgru_npu_separator_system,
 )
 from spectral_feature_compression.core.model.residual_refinement_sfc_2d import OnlineResidualRefinementSFC2D
 from spectral_feature_compression.core.model.source_aware_melband_loco_cnb_student_sfc_2d import (
@@ -59,6 +64,7 @@ from spectral_feature_compression.core.tasks.distillation_task import (
 )
 from tools.online.export_onnx_online_model import (
     build_model_system_from_recipe_config,
+    load_pcen_preprocess_metadata,
     merge_task_model_mapping,
     merge_top_level_scalars,
     resolve_value,
@@ -287,6 +293,273 @@ def test_tvconv_pyramid_waveform_wrapper_returns_aux_masks() -> None:
     assert aux["mask"].ndim == 4
     assert aux["mask"].shape[1] == 4
     assert aux["mask"].shape[-1] == 33
+
+
+@pytest.mark.parametrize(
+    ("config_path", "target_suffix", "expected_type"),
+    [
+        (
+            Path(
+                "recipes/dnr/models/"
+                "tvconv-pyramid-convgru-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/"
+                "config.yaml"
+            ),
+            "build_tvconv_pyramid_convgru_npu_separator_system",
+            "gru",
+        ),
+        (
+            Path(
+                "recipes/dnr/models/"
+                "tvconv-pyramid-convlstm-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/"
+                "config.yaml"
+            ),
+            "build_tvconv_pyramid_convlstm_npu_separator_system",
+            "lstm",
+        ),
+    ],
+)
+def test_tvconv_pyramid_recurrent_recipe_variants_parse_and_build(
+    config_path: Path,
+    target_suffix: str,
+    expected_type: str,
+) -> None:
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert str(resolve_value(model_cfg["_target_"], context)).endswith(target_suffix)
+    assert resolve_value(model_cfg["recurrent_layers"], context) == 1
+    assert resolve_value(model_cfg["recurrent_band_kernel"], context) == 3
+    assert resolve_value(model_cfg["recurrent_replace_blocks"], context) == 2
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    core = system.model.core
+    assert core.recurrent_type == expected_type
+    assert len(core.temporal_blocks) == 4
+    assert len(core.recurrent_blocks) == 1
+    assert core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+
+def test_tvconv_pyramid_recurrent_replace_blocks_requires_recurrent_type() -> None:
+    with pytest.raises(ValueError, match="recurrent_replace_blocks"):
+        TVConvPyramidNPUSeparator2D(n_freq=64, recurrent_replace_blocks=1)
+
+
+@pytest.mark.parametrize(
+    ("recurrent_type", "state_limit"),
+    [
+        ("gru", 16 * 1024),
+        ("lstm", 20 * 1024),
+    ],
+)
+def test_tvconv_pyramid_recurrent_bottleneck_streaming_matches_forward(
+    recurrent_type: str,
+    state_limit: int,
+) -> None:
+    torch.manual_seed(0)
+    core = TVConvPyramidNPUSeparator2D(
+        n_freq=64,
+        n_src=2,
+        n_chan=1,
+        base_channels=16,
+        bottleneck_channels=32,
+        n_down=3,
+        n_blocks=4,
+        expansion=2,
+        time_kernel=3,
+        time_dilation_cycle=(1, 2, 1, 2),
+        band_kernel=3,
+        recurrent_type=recurrent_type,
+        recurrent_layers=1,
+        recurrent_band_kernel=3,
+        recurrent_replace_blocks=2,
+        mask_hidden=8,
+    ).eval()
+    x = torch.randn(1, 2, 6, 64)
+
+    with torch.no_grad():
+        y = core(x)
+        state = core.init_stream_state(batch_size=1, dtype=x.dtype)
+        frames = []
+        for frame_idx in range(x.shape[2]):
+            frame, state = core.forward_stream(x[:, :, frame_idx : frame_idx + 1, :], state)
+            frames.append(frame)
+        y_stream = torch.cat(frames, dim=2)
+
+    assert tuple(y.shape) == (1, 4, 6, 64)
+    torch.testing.assert_close(y_stream, y, rtol=1e-5, atol=1e-5)
+    assert core.recurrent_type == recurrent_type
+    assert len(core.temporal_blocks) == 2
+    assert len(core.recurrent_blocks) == 1
+    assert core.state_size_bytes(dtype=torch.float16) < state_limit
+    with pytest.raises(RuntimeError, match="not exact for recurrent"):
+        core.forward_stream_recompute(x[:, :, :1])
+
+
+@pytest.mark.parametrize(
+    ("builder", "expected_type"),
+    [
+        (build_tvconv_pyramid_convgru_npu_separator_system, "gru"),
+        (build_tvconv_pyramid_convlstm_npu_separator_system, "lstm"),
+    ],
+)
+def test_tvconv_pyramid_recurrent_waveform_builders(builder, expected_type: str) -> None:
+    torch.manual_seed(0)
+    model = builder(
+        n_fft=64,
+        hop_length=16,
+        fs=8000,
+        n_src=3,
+        n_chan=1,
+        core_n_src=2,
+        base_channels=8,
+        bottleneck_channels=16,
+        n_down=2,
+        n_blocks=3,
+        expansion=2,
+        time_kernel=3,
+        time_dilation_cycle=(1, 2, 1),
+        band_kernel=3,
+        recurrent_layers=1,
+        recurrent_band_kernel=3,
+        recurrent_replace_blocks=1,
+        mask_hidden=8,
+        residual_source_enabled=True,
+        residual_source_index=2,
+        freq_preprocess_enabled=False,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 512)
+
+    with torch.no_grad():
+        est, aux = model(wav, return_aux=True)
+
+    assert tuple(est.shape) == (1, 3, 1, 512)
+    assert model.model.core.recurrent_type == expected_type
+    assert model.model.core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+    assert aux["mask_domain"] == "packed_complex_mask"
+    assert aux["mask_logits_domain"] == "tvconv_pyramid_complex_mask_logits"
+
+
+def test_tvconv_pyramid_sfclite_query_recipe_and_builder() -> None:
+    config_path = Path(
+        "recipes/dnr/models/"
+        "tvconv-pyramid-sfclite-query-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/"
+        "config.yaml"
+    )
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert str(resolve_value(model_cfg["_target_"], context)).endswith(
+        "build_tvconv_pyramid_sfclite_query_npu_separator_system"
+    )
+    assert resolve_value(model_cfg["freq_preprocess_mode"], context) == "learnable_query"
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    manifest = system.model.frequency_preprocess_manifest()
+    assert manifest is not None
+    assert manifest["type"] == "sfc_lite_learnable_query"
+    assert manifest["tied_synthesis_query"] is True
+    assert system.model.freq_preprocessor.frequency_query.requires_grad
+
+    torch.manual_seed(0)
+    tiny = build_tvconv_pyramid_sfclite_query_npu_separator_system(
+        n_fft=64,
+        hop_length=16,
+        fs=8000,
+        n_src=3,
+        n_chan=1,
+        core_n_src=2,
+        base_channels=8,
+        bottleneck_channels=16,
+        n_down=2,
+        n_blocks=2,
+        expansion=2,
+        time_kernel=3,
+        time_dilation_cycle=(1, 2),
+        band_kernel=3,
+        mask_hidden=8,
+        residual_source_enabled=True,
+        residual_source_index=2,
+        freq_preprocess_keep_bins=16,
+        freq_preprocess_target_bins=20,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 512)
+
+    with torch.no_grad():
+        est, aux = tiny(wav, return_aux=True)
+
+    assert tuple(est.shape) == (1, 3, 1, 512)
+    assert tiny.model.frequency_preprocess_manifest()["type"] == "sfc_lite_learnable_query"
+    assert aux["mask_domain"] == "packed_complex_mask"
+    assert aux["mask_logits_domain"] == "tvconv_pyramid_complex_mask_logits"
+
+
+def test_tvconv_pyramid_sourceaware_sfclite_convgru_recipe_and_builder() -> None:
+    config_path = Path(
+        "recipes/dnr/models/"
+        "tvconv-pyramid-sourceaware-sfclite-convgru-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/"
+        "config.yaml"
+    )
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert str(resolve_value(model_cfg["_target_"], context)).endswith(
+        "build_tvconv_pyramid_sourceaware_sfclite_convgru_npu_separator_system"
+    )
+    assert resolve_value(model_cfg["freq_preprocess_mode"], context) == "learnable_query"
+    assert resolve_value(model_cfg["source_head_type"], context) == "folded_source_aware"
+    assert resolve_value(model_cfg["source_mixer_layers"], context) == 1
+    assert resolve_value(model_cfg["mask_hidden"], context) == 384
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    core = system.model.core
+    total_params = sum(p.numel() for p in system.model.parameters())
+    assert core.recurrent_type == "gru"
+    assert core.source_head_type == "folded_source_aware"
+    assert len(core.recurrent_blocks) == 1
+    assert system.model.frequency_preprocess_manifest()["type"] == "sfc_lite_learnable_query"
+    assert 3_000_000 <= total_params <= 5_000_000
+    assert core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+    torch.manual_seed(0)
+    tiny = build_tvconv_pyramid_sourceaware_sfclite_convgru_npu_separator_system(
+        n_fft=64,
+        hop_length=16,
+        fs=8000,
+        n_src=3,
+        n_chan=1,
+        core_n_src=2,
+        base_channels=8,
+        bottleneck_channels=16,
+        n_down=2,
+        n_blocks=3,
+        expansion=2,
+        time_kernel=3,
+        time_dilation_cycle=(1, 2, 1),
+        band_kernel=3,
+        recurrent_layers=1,
+        recurrent_band_kernel=3,
+        recurrent_replace_blocks=1,
+        source_mixer_layers=1,
+        mask_hidden=16,
+        residual_source_enabled=True,
+        residual_source_index=2,
+        freq_preprocess_keep_bins=16,
+        freq_preprocess_target_bins=20,
+        css_segment_size=1,
+        css_shift_size=1,
+    ).eval()
+    wav = torch.randn(1, 1, 512)
+
+    with torch.no_grad():
+        est, aux = tiny(wav, return_aux=True)
+
+    assert tuple(est.shape) == (1, 3, 1, 512)
+    assert aux["mask_domain"] == "packed_complex_mask"
+    assert aux["mask_logits_domain"] == "tvconv_pyramid_folded_source_aware_complex_mask_logits"
 
 
 def test_source_aware_melband_roformer_teacher_forward_and_recipe() -> None:
@@ -770,6 +1043,79 @@ def test_source_aware_melband_roformer_strong_student_npu_forward_streaming_and_
     assert "distillation_band_mapping: mel_centers" in distill_text
     assert "build_source_aware_melband_roformer_teacher_system" in distill_text
 
+    relaxed_path = Path(
+        "recipes/dnr/models/"
+        "source-aware-melband-roformer.student-npu-strong-relaxed.distill.tv-fp512keep475/"
+        "config.yaml"
+    )
+    relaxed_system = build_model_system_from_recipe_config(relaxed_path).eval()
+    relaxed_core = relaxed_system.model.core
+    relaxed_params = sum(p.numel() for p in relaxed_core.parameters())
+    assert relaxed_core.n_freq == 512
+    assert relaxed_core.n_bands == 96
+    assert relaxed_core.d_model == 72
+    assert relaxed_core.n_encoder_layers == 3
+    assert relaxed_core.n_source_layers == 8
+    assert relaxed_core.correction_layers == 2
+    assert relaxed_core.mixture_consistency is False
+    assert 6_000_000 <= relaxed_params <= 7_000_000
+    assert relaxed_core.state_size_bytes(dtype=torch.float16) == 600 * 1024
+    assert relaxed_core.state_size_bytes(dtype=torch.float16) > 192 * 1024
+
+    from aiaccel.config import load_config, resolve_inherit
+
+    relaxed_config = resolve_inherit(
+        load_config(
+            relaxed_path,
+            {
+                "config_path": str(relaxed_path),
+                "working_directory": str(relaxed_path.parent.resolve()),
+                "base_config_path": str((Path.cwd() / "aiaccel" / "aiaccel" / "torch" / "apps" / "config").resolve()),
+            },
+        )
+    )
+    assert str(relaxed_config.datamodule._target_).endswith("OnTheFlyStemDataModule")
+    assert len(relaxed_config.datamodule.synthesis.synthesis_profiles) == 4
+    assert relaxed_config.task.request_model_aux is False
+    assert relaxed_config.task.require_model_aux is False
+    assert relaxed_config.task.source_loss_weights.speech == pytest.approx(1.6)
+    assert relaxed_config.task.residual_source_loss_weight == pytest.approx(0.0)
+    assert relaxed_config.task.distillation_band_mapping == "mel_centers"
+
+    nodelite_path = Path(
+        "recipes/dnr/models/"
+        "source-aware-melband-roformer.student-npu-strong-nodelite.distill.tv-fp512keep475/"
+        "config.yaml"
+    )
+    nodelite_system = build_model_system_from_recipe_config(nodelite_path).eval()
+    nodelite_core = nodelite_system.model.core
+    nodelite_params = sum(p.numel() for p in nodelite_core.parameters())
+    assert nodelite_core.n_freq == 512
+    assert nodelite_core.n_bands == 80
+    assert nodelite_core.d_model == 48
+    assert nodelite_core.n_encoder_layers == 2
+    assert nodelite_core.n_source_layers == 5
+    assert nodelite_core.correction_layers == 1
+    assert nodelite_core.mixture_consistency is False
+    assert 6_000_000 <= nodelite_params <= 6_500_000
+    assert nodelite_core.state_size_bytes(dtype=torch.float16) == 186 * 1024
+
+    nodelite_config = resolve_inherit(
+        load_config(
+            nodelite_path,
+            {
+                "config_path": str(nodelite_path),
+                "working_directory": str(nodelite_path.parent.resolve()),
+                "base_config_path": str((Path.cwd() / "aiaccel" / "aiaccel" / "torch" / "apps" / "config").resolve()),
+            },
+        )
+    )
+    assert str(nodelite_config.datamodule._target_).endswith("OnTheFlyStemDataModule")
+    assert len(nodelite_config.datamodule.synthesis.synthesis_profiles) == 4
+    assert nodelite_config.task.source_loss_weights.speech == pytest.approx(1.6)
+    assert nodelite_config.task.request_model_aux is False
+    assert nodelite_config.task.require_model_aux is False
+
 
 def test_source_aware_melband_loco_cnb_student_npu_forward_streaming_and_recipe() -> None:
     torch.manual_seed(0)
@@ -802,7 +1148,11 @@ def test_source_aware_melband_loco_cnb_student_npu_forward_streaming_and_recipe(
     wav = torch.randn(1, 1, 256)
     with torch.no_grad():
         est = model(wav)
+        est_aux, wav_aux = model(wav, return_aux=True)
     assert tuple(est.shape) == (1, 2, 1, 256)
+    torch.testing.assert_close(est_aux, est, rtol=1e-5, atol=1e-5)
+    assert wav_aux["mask_domain"] == "packed_complex_mask"
+    assert wav_aux["mask_logits_domain"] == "source_aware_melband_loco_cnb_complex_mask_logits"
 
     core = OnlineSourceAwareMelBandLocoCNBStudentSFC2D(
         n_freq=33,
@@ -829,6 +1179,7 @@ def test_source_aware_melband_loco_cnb_student_npu_forward_streaming_and_recipe(
     x = torch.randn(1, 2, 4, 33)
     with torch.no_grad():
         y = core(x)
+        y_aux, aux = core(x, return_aux=True)
         state = core.init_stream_state(batch_size=1, dtype=x.dtype)
         frames = []
         for frame_idx in range(x.shape[2]):
@@ -836,6 +1187,11 @@ def test_source_aware_melband_loco_cnb_student_npu_forward_streaming_and_recipe(
             frames.append(frame)
         y_stream = torch.cat(frames, dim=2)
     assert tuple(y.shape) == (1, 4, 4, 33)
+    torch.testing.assert_close(y_aux, y, rtol=1e-5, atol=1e-5)
+    assert aux["mask_domain"] == "packed_complex_mask"
+    assert aux["mask_logits_domain"] == "source_aware_melband_loco_cnb_complex_mask_logits"
+    assert tuple(aux["mask"].shape) == (1, 4, 4, 33)
+    torch.testing.assert_close(aux["mask_logits"], aux["mask"])
     assert tuple(y_stream.shape) == tuple(y.shape)
     torch.testing.assert_close(y_stream, y, rtol=1e-5, atol=1e-5)
     y_sources = y.reshape(1, 2, 2, 4, 33)
@@ -1038,6 +1394,93 @@ def test_source_aware_melband_loco_cnb_student_npu_forward_streaming_and_recipe(
     tv_system = build_model_system_from_recipe_config(tv_path).eval()
     assert tv_system.model.core.cnb_merge_dilations is True
     assert tv_system.model.residual_source_enabled is True
+
+    fixed_tv_path = Path(
+        "recipes/dnr/models/source-aware-melband-loco-cnb.tvfix-nopool.robust-lowlat.distill.rt192k.fp512keep475/config.yaml"
+    )
+    fixed_tv_cfg = OmegaConf.load(fixed_tv_path)
+    assert str(fixed_tv_cfg.datamodule._target_).endswith("OnTheFlyStemDataModule")
+    assert len(fixed_tv_cfg.datamodule.synthesis.synthesis_profiles) == 4
+    assert fixed_tv_cfg.task.request_model_aux is True
+    assert fixed_tv_cfg.task.require_model_aux is True
+    assert fixed_tv_cfg.task.mask_aux_alignment == "shared_prefix"
+    assert fixed_tv_cfg.task.distillation_band_mapping == "linear"
+    assert fixed_tv_cfg.task.teacher_logit_loss_weight == 0.0
+    fixed_tv_top = merge_top_level_scalars(fixed_tv_path)
+    fixed_tv_model_cfg = merge_task_model_mapping(fixed_tv_path)
+    fixed_tv_context = {**fixed_tv_top, **fixed_tv_model_cfg}
+    assert resolve_value(fixed_tv_model_cfg["pooled_mixer_hidden_schedule"], fixed_tv_context) == [0, 0, 0, 0]
+    fixed_tv_system = build_model_system_from_recipe_config(fixed_tv_path).eval()
+    assert all(block.pooled_mixer.__class__.__name__ == "Identity" for block in fixed_tv_system.model.core.backbone)
+
+    strong_tv_path = Path(
+        "recipes/dnr/models/source-aware-melband-loco-cnb.tvfix-strong-nopool.robust-lowlat.distill.rt192k.fp512keep475/config.yaml"
+    )
+    strong_tv_system = build_model_system_from_recipe_config(strong_tv_path).eval()
+    strong_core = strong_tv_system.model.core
+    assert strong_core.source_channels == 80
+    assert strong_core.n_source_layers == 5
+    assert all(block.pooled_mixer.__class__.__name__ == "Identity" for block in strong_core.backbone)
+    assert 3_000_000 <= sum(p.numel() for p in strong_core.parameters()) <= 4_000_000
+    assert strong_core.state_size_bytes(dtype=torch.float16) == fixed_tv_system.model.core.state_size_bytes(
+        dtype=torch.float16
+    )
+
+    capacity_sup_path = Path(
+        "recipes/dnr/models/source-aware-melband-loco-cnb.tvfix-capacity-nopool.sup.rt192k.fp512keep475/config.yaml"
+    )
+    from aiaccel.config import load_config, resolve_inherit
+
+    capacity_sup_cfg = resolve_inherit(
+        load_config(
+            capacity_sup_path,
+            {
+                "config_path": str(capacity_sup_path),
+                "working_directory": str(capacity_sup_path.parent.resolve()),
+                "base_config_path": str((Path.cwd() / "aiaccel" / "aiaccel" / "torch" / "apps" / "config").resolve()),
+            },
+        )
+    )
+    assert capacity_sup_cfg.task.teacher_model is None
+    assert capacity_sup_cfg.task.teacher_loss_weight == pytest.approx(0.0)
+    assert capacity_sup_cfg.task.teacher_mask_loss_weight == pytest.approx(0.0)
+    assert capacity_sup_cfg.task.teacher_logit_loss_weight == pytest.approx(0.0)
+    assert capacity_sup_cfg.task.request_model_aux is False
+    capacity_sup_system = build_model_system_from_recipe_config(capacity_sup_path).eval()
+    capacity_core = capacity_sup_system.model.core
+    assert capacity_core.source_channels == 112
+    assert capacity_core.n_source_layers == 5
+    assert all(block.pooled_mixer.__class__.__name__ == "Identity" for block in capacity_core.backbone)
+    assert 6_000_000 <= sum(p.numel() for p in capacity_core.parameters()) <= 7_000_000
+    assert capacity_core.state_size_bytes(dtype=torch.float16) == fixed_tv_system.model.core.state_size_bytes(
+        dtype=torch.float16
+    )
+
+    pcen_normlite_path = Path(
+        "recipes/dnr/models/source-aware-melband-loco-cnb.tvfix-capacity-pcen-normlite.sup.rt192k.fp512keep475/config.yaml"
+    )
+    pcen_normlite_top = merge_top_level_scalars(pcen_normlite_path)
+    pcen_normlite_model_cfg = merge_task_model_mapping(pcen_normlite_path)
+    pcen_normlite_context = {**pcen_normlite_top, **pcen_normlite_model_cfg}
+    assert resolve_value(pcen_normlite_model_cfg["norm_type"], pcen_normlite_context) == "affine"
+    assert resolve_value(pcen_normlite_model_cfg["include_magnitude_features"], pcen_normlite_context) is False
+    assert resolve_value(pcen_normlite_model_cfg["pcen_preprocess_enabled"], pcen_normlite_context) is True
+    pcen_normlite_meta = load_pcen_preprocess_metadata(pcen_normlite_path)
+    assert pcen_normlite_meta is not None
+    assert pcen_normlite_meta["type"] == "pcen_gain_normalizer_2d"
+    assert pcen_normlite_meta["placement"] == "after_frequency_preprocessing_before_core"
+    assert pcen_normlite_meta["state_shape"] == [1, 1, 1, 512]
+    pcen_normlite_system = build_model_system_from_recipe_config(pcen_normlite_path).eval()
+    pcen_normlite_core = pcen_normlite_system.model.core
+    assert pcen_normlite_system.model.pcen_preprocessor is not None
+    assert pcen_normlite_core.norm_type == "affine"
+    assert pcen_normlite_core.include_magnitude_features is False
+    assert not any(isinstance(module, RMSNorm2d) for module in pcen_normlite_core.modules())
+    assert any(isinstance(module, ChannelAffine2d) for module in pcen_normlite_core.modules())
+    assert 6_000_000 <= sum(p.numel() for p in pcen_normlite_core.parameters()) <= 7_000_000
+    assert pcen_normlite_core.state_size_bytes(dtype=torch.float16) == capacity_core.state_size_bytes(
+        dtype=torch.float16
+    )
 
 
 def test_source_aware_melband_loco_cnb_student_npu_onnx_audit_smoke() -> None:

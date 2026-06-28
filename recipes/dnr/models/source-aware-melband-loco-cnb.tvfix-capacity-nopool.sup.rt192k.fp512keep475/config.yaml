@@ -1,0 +1,25 @@
+_base_: ../source-aware-melband-loco-cnb.tvfix-nopool.robust-lowlat.distill.rt192k.fp512keep475/config.yaml
+
+# Supervised-only capacity probe for Loco-CNB TV.
+# This keeps the corrected TV data profile and no-pool architecture, disables
+# every teacher term, and reallocates capacity into source-aware decoding/mask
+# prediction so the run measures the student's standalone capacity.
+loco_cnb_source_channels: 112
+loco_cnb_source_layers: 5
+loco_cnb_source_fusion_hidden: 448
+loco_cnb_source_seed_hidden: 448
+loco_cnb_expander_hidden: 256
+loco_cnb_mask_hidden: 384
+loco_cnb_correction_channels: 32
+
+task:
+  teacher_model: null
+  require_teacher_checkpoint: false
+  teacher_checkpoint_path: null
+  teacher_css_validation: false
+  teacher_loss_weight: 0.0
+  teacher_mask_loss_weight: 0.0
+  teacher_logit_loss_weight: 0.0
+  latent_distillation_weight: 0.0
+  request_model_aux: false
+  require_model_aux: false

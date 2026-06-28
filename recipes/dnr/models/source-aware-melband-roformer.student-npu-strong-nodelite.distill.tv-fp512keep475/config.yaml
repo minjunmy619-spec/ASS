@@ -1,0 +1,53 @@
+_base_:
+  - ../../datamodules/on-the-fly-stem-tv-profiles.yaml
+  - ../source-aware-melband-roformer.student-npu-strong.distill.rt192k.fp512keep475/config.yaml
+
+# Node-lite strong student.  Keep the original strong student's layer counts and
+# cache shape, then buy capacity with wider stateless source/mask projections.
+# This is intended for NPUs where many small graph nodes are more expensive than
+# larger matrix/conv kernels.
+strong_student_n_bands: 80
+strong_student_d_model: 48
+strong_student_encoder_layers: 2
+strong_student_source_layers: 5
+strong_student_correction_layers: 1
+strong_student_encoder_expansion: 2
+strong_student_encoder_ffn_mult: 4
+strong_student_source_local_expansion: 2
+strong_student_source_local_ffn_mult: 4
+strong_student_source_fusion_hidden: 768
+strong_student_source_seed_hidden: 768
+strong_student_expander_hidden: 384
+strong_student_mask_hidden: 768
+strong_student_correction_channels: 24
+strong_student_kernel_size: [3, 5]
+strong_student_routing_kernel_size: [1, 3]
+strong_student_encoder_dilation_cycle: [1, 2]
+strong_student_include_magnitude_features: true
+strong_student_include_logmag_features: false
+strong_student_mixture_consistency: false
+
+task:
+  teacher_loss_weight: 0.65
+  mixture_consistency_weight: 0.05
+  source_order: [speech, music, effects]
+  source_loss_weights:
+    speech: 1.6
+    music: 1.25
+    effects: 0.85
+  source_loss_weight_normalization: full_mean
+  source_weighted_snr_loss_weight: 0.35
+  explicit_source_loss_weight: 0.05
+  residual_source_loss_weight: 0.0
+  residual_source_index: 2
+  robust_label_loss_weight: 0.20
+  robust_label_loss: charbonnier
+  robust_label_eps: 0.001
+  source_activity_loss_weight: 0.16
+  teacher_mask_loss_weight: 0.15
+  teacher_logit_loss_weight: 0.05
+  request_model_aux: false
+  require_model_aux: false
+  mask_aux_alignment: shared_prefix
+  mask_aux_max_frame_mismatch: 4
+  distillation_band_mapping: mel_centers

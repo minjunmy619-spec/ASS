@@ -40,6 +40,7 @@ from spectral_feature_compression.core.model.online_sfc_2d import (
     CausalConv2d,
     RMSNorm2d,
     _runtime_assert,
+    build_norm2d,
     pack_complex_stft_as_2d,
     unpack_2d_to_complex_stft,
 )
@@ -201,12 +202,19 @@ class StrongCausalOrFrameConv2d(nn.Module):
 class StrongTokenFFN2d(nn.Module):
     """Zero-state gated token/channel expansion applied at each time-frequency token."""
 
-    def __init__(self, channels: int, hidden_channels: int, *, residual_scale: float = 0.1):
+    def __init__(
+        self,
+        channels: int,
+        hidden_channels: int,
+        *,
+        residual_scale: float = 0.1,
+        norm_type: str = "rms",
+    ):
         super().__init__()
         if hidden_channels <= 0:
             raise ValueError(f"hidden_channels must be positive, got {hidden_channels}")
         self.hidden_channels = int(hidden_channels)
-        self.norm = RMSNorm2d(channels)
+        self.norm = build_norm2d(channels, norm_type=norm_type)
         self.expand = nn.Conv2d(channels, 2 * hidden_channels, kernel_size=1, bias=True)
         self.project = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=True)
         self.scale = nn.Parameter(torch.tensor(float(residual_scale)))
@@ -230,6 +238,7 @@ class StrongTemporalBandBlock2d(nn.Module):
         time_dilation: int = 1,
         causal: bool = True,
         residual_scale: float = 0.1,
+        norm_type: str = "rms",
     ):
         super().__init__()
         if band_kernel_size % 2 == 0:
@@ -239,7 +248,7 @@ class StrongTemporalBandBlock2d(nn.Module):
         self.channels = int(channels)
         self.hidden = int(hidden)
         self.causal = bool(causal)
-        self.norm = RMSNorm2d(channels)
+        self.norm = build_norm2d(channels, norm_type=norm_type)
         self.in_proj = nn.Conv2d(channels, 2 * hidden, kernel_size=1, bias=True)
         self.time_dw = StrongCausalOrFrameConv2d(
             hidden,
@@ -272,7 +281,7 @@ class StrongTemporalBandBlock2d(nn.Module):
         self.band_fuse = nn.Conv2d(2 * hidden, hidden, kernel_size=1, bias=True)
         self.out_proj = nn.Conv2d(hidden, channels, kernel_size=1, bias=True)
         self.mix_scale = nn.Parameter(torch.tensor(float(residual_scale)))
-        self.ffn = StrongTokenFFN2d(channels, ffn_hidden, residual_scale=residual_scale)
+        self.ffn = StrongTokenFFN2d(channels, ffn_hidden, residual_scale=residual_scale, norm_type=norm_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         value, gate = torch.split(self.in_proj(self.norm(x)), self.hidden, dim=1)
@@ -332,13 +341,14 @@ class StrongAdaptiveMelRouter2d(nn.Module):
         kernel_size: tuple[int, int] = (1, 3),
         causal: bool = True,
         normalization: str = "softmax",
+        norm_type: str = "rms",
     ):
         super().__init__()
         self.channels = int(channels)
         self.band_spec = band_spec
         self.n_bands = int(band_spec.n_bands)
         self.normalization = normalization
-        self.norm = RMSNorm2d(channels)
+        self.norm = build_norm2d(channels, norm_type=norm_type)
         self.pre = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
         self.local = StrongCausalOrFrameConv2d(
             channels,
@@ -416,14 +426,29 @@ class StrongAdaptiveMelRouter2d(nn.Module):
 class StrongMelBandExpander2d(nn.Module):
     """Custom query-conditioned K->F mel expander."""
 
-    def __init__(self, *, channels: int, band_spec: AdaptiveMelBandSpec2d, hidden_channels: int | None = None):
+    def __init__(
+        self,
+        *,
+        channels: int,
+        band_spec: AdaptiveMelBandSpec2d,
+        hidden_channels: int | None = None,
+        norm_type: str = "rms",
+    ):
         super().__init__()
         self.channels = int(channels)
         self.n_bands = int(band_spec.n_bands)
         self.n_freq = int(band_spec.n_freq)
         hidden_channels = channels if hidden_channels is None else int(hidden_channels)
-        self.latent_pre = nn.Sequential(RMSNorm2d(channels), nn.Conv2d(channels, channels, kernel_size=1), nn.SiLU())
-        self.query_pre = nn.Sequential(RMSNorm2d(channels), nn.Conv2d(channels, channels, kernel_size=1), nn.SiLU())
+        self.latent_pre = nn.Sequential(
+            build_norm2d(channels, norm_type=norm_type),
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.SiLU(),
+        )
+        self.query_pre = nn.Sequential(
+            build_norm2d(channels, norm_type=norm_type),
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.SiLU(),
+        )
         self.fuse = nn.Sequential(
             nn.Conv2d(2 * channels, 2 * hidden_channels, kernel_size=1, bias=True),
             nn.GLU(dim=1),
@@ -456,12 +481,12 @@ class StrongMelBandExpander2d(nn.Module):
 class StrongSourceSeed2d(nn.Module):
     """Learned source-specific seeding from shared mixture tokens."""
 
-    def __init__(self, *, channels: int, n_src: int, hidden_channels: int):
+    def __init__(self, *, channels: int, n_src: int, hidden_channels: int, norm_type: str = "rms"):
         super().__init__()
         self.channels = int(channels)
         self.n_src = int(n_src)
         self.seed = nn.Sequential(
-            RMSNorm2d(channels),
+            build_norm2d(channels, norm_type=norm_type),
             nn.Conv2d(channels, 2 * hidden_channels, kernel_size=1, bias=True),
             nn.GLU(dim=1),
             nn.Conv2d(hidden_channels, n_src * channels, kernel_size=1, bias=True),
@@ -489,6 +514,7 @@ class StrongSourceCompetitionBlock2d(nn.Module):
         local_ffn_mult: int = 4,
         fusion_hidden_channels: int = 192,
         band_kernel_size: int = 5,
+        norm_type: str = "rms",
     ):
         super().__init__()
         self.channels = int(channels)
@@ -502,10 +528,11 @@ class StrongSourceCompetitionBlock2d(nn.Module):
             time_dilation=1,
             causal=True,
             residual_scale=0.1,
+            norm_type=norm_type,
         )
         in_channels = 5 * channels
         self.fusion_hidden_channels = int(fusion_hidden_channels)
-        self.competition_norm = RMSNorm2d(in_channels)
+        self.competition_norm = build_norm2d(in_channels, norm_type=norm_type)
         self.competition_in = nn.Conv2d(in_channels, 2 * fusion_hidden_channels, kernel_size=1, bias=True)
         self.competition_mid = nn.Conv2d(fusion_hidden_channels, fusion_hidden_channels, kernel_size=1, bias=True)
         self.competition_out = nn.Conv2d(fusion_hidden_channels, channels, kernel_size=1, bias=True)
@@ -546,6 +573,7 @@ class StrongSourceDecoder2d(nn.Module):
         local_ffn_mult: int,
         fusion_hidden_channels: int,
         band_kernel_size: int,
+        norm_type: str = "rms",
     ):
         super().__init__()
         self.channels = int(channels)
@@ -559,6 +587,7 @@ class StrongSourceDecoder2d(nn.Module):
                     local_ffn_mult=local_ffn_mult,
                     fusion_hidden_channels=fusion_hidden_channels,
                     band_kernel_size=band_kernel_size,
+                    norm_type=norm_type,
                 )
                 for _ in range(n_layers)
             ]
@@ -596,6 +625,7 @@ class StrongSourceMaskHead2d(nn.Module):
         expander_hidden_channels: int,
         mask_hidden_channels: int,
         fullband_kernel_size: int = 5,
+        norm_type: str = "rms",
     ):
         super().__init__()
         self.channels = int(channels)
@@ -605,6 +635,7 @@ class StrongSourceMaskHead2d(nn.Module):
             channels=channels,
             band_spec=band_spec,
             hidden_channels=expander_hidden_channels,
+            norm_type=norm_type,
         )
         self.fullband_local = StrongTemporalBandBlock2d(
             channels,
@@ -614,9 +645,10 @@ class StrongSourceMaskHead2d(nn.Module):
             band_kernel_size=fullband_kernel_size,
             causal=True,
             residual_scale=0.1,
+            norm_type=norm_type,
         )
         self.mask = nn.Sequential(
-            RMSNorm2d(channels),
+            build_norm2d(channels, norm_type=norm_type),
             nn.Conv2d(channels, 2 * mask_hidden_channels, kernel_size=1, bias=True),
             nn.GLU(dim=1),
             nn.Conv2d(mask_hidden_channels, 2 * n_chan, kernel_size=1, bias=True),
@@ -647,6 +679,7 @@ class StrongMaskCorrectionHead2d(nn.Module):
         n_layers: int = 1,
         kernel_size: tuple[int, int] = (3, 5),
         causal: bool = True,
+        norm_type: str = "rms",
     ):
         super().__init__()
         self.context_channels = int(context_channels)
@@ -660,7 +693,7 @@ class StrongMaskCorrectionHead2d(nn.Module):
         self.mask_proj = nn.Conv2d(out_channels, correction_channels, kernel_size=1, bias=True)
         self.context_proj = nn.Conv2d(context_channels, correction_channels, kernel_size=1, bias=True)
         self.fuse = nn.Sequential(
-            RMSNorm2d(3 * correction_channels),
+            build_norm2d(3 * correction_channels, norm_type=norm_type),
             nn.Conv2d(3 * correction_channels, 2 * correction_channels, kernel_size=1, bias=True),
             nn.GLU(dim=1),
         )
@@ -675,6 +708,7 @@ class StrongMaskCorrectionHead2d(nn.Module):
                     time_dilation=1,
                     causal=causal,
                     residual_scale=0.1,
+                    norm_type=norm_type,
                 )
                 for _ in range(n_layers)
             ]

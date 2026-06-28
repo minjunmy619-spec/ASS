@@ -387,6 +387,7 @@ def main() -> None:
     budget_element_size = dtype_bytes(args.budget_dtype)
     initializer_budget_bytes = estimate_initializer_bytes(model, budget_element_size)
     streaming_state_budget_bytes = 0
+    pcen_state_budget_bytes = 0
     externalized_constant_budget_bytes = 0
 
     if args.state_meta is not None:
@@ -399,8 +400,13 @@ def main() -> None:
             externalized_constant_budget_bytes = (
                 numel_from_shapes(payload["externalized_band_constants"].get("shapes", [])) * budget_element_size
             )
+        if "pcen_preprocessing" in payload:
+            pcen_shape = payload["pcen_preprocessing"].get("state_shape")
+            if isinstance(pcen_shape, list):
+                pcen_state_budget_bytes = numel_from_shapes([pcen_shape]) * budget_element_size
 
-    state_plus_initializers = streaming_state_budget_bytes + initializer_budget_bytes
+    deployment_state_budget_bytes = streaming_state_budget_bytes + pcen_state_budget_bytes
+    state_plus_initializers = deployment_state_budget_bytes + initializer_budget_bytes
     state_plus_export_payload = state_plus_initializers + externalized_constant_budget_bytes
 
     print(f"Model: {args.onnx_path}")
@@ -416,8 +422,17 @@ def main() -> None:
     if args.state_meta is not None:
         print(f"State metadata: {args.state_meta}")
         print(
-            f"Streaming state ({args.budget_dtype} estimate): "
+            f"Core streaming state ({args.budget_dtype} estimate): "
             f"{format_bytes(streaming_state_budget_bytes)}"
+        )
+        if pcen_state_budget_bytes > 0:
+            print(
+                f"PCEN preprocessing state ({args.budget_dtype} estimate): "
+                f"{format_bytes(pcen_state_budget_bytes)}"
+            )
+        print(
+            f"Total deployment streaming state ({args.budget_dtype} estimate): "
+            f"{format_bytes(deployment_state_budget_bytes)}"
         )
         print(
             f"Externalized band constants ({args.budget_dtype} estimate): "
