@@ -22,6 +22,8 @@ _EXPORTS = {
     "BSLocoformer": f"{_MODEL}.bslocoformer",
     "CrossAttnDecoder": f"{_MODEL}.crossattn_enc_dec",
     "CrossAttnEncoder": f"{_MODEL}.crossattn_enc_dec",
+    "Conv2dGRU": f"{_MODEL}.conv2d_rnn_compat",
+    "Conv2dLSTM": f"{_MODEL}.conv2d_rnn_compat",
     "FrequencyPreprocessedOnlineModel": f"{_MODEL}.frequency_preprocessing",
     "FOAEventQueryPromptedAsymmetricSFC2D": f"{_MODEL}.foa_event_query_prompted_sfc",
     "FOAEventQueryPromptedAsymmetricSFCModel": f"{_MODEL}.foa_event_query_prompted_sfc",
