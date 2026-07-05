@@ -1,0 +1,38 @@
+_base_: ../sfc-locoformer-conv2d-32b-npu.2l.sourceaware-residual-sfx.distill.rt192k.fp512keep475/config.yaml
+
+# V2 model-only fix for the underpowered 32-band/2-layer student:
+# - less destructive SFC compression: 48 adaptive bands
+# - deeper compressed separator: 4 Conv2D Locoformer blocks
+# - cache-safe width: d_model=160, expansion=1, fp16 cache ~=180 KiB
+# - stronger full-band folded source head with a full-resolution skip
+sfc_loco_n_bands: 48
+sfc_loco_d_model: 160
+sfc_loco_layers: 4
+sfc_loco_kernel_size: [3, 3]
+sfc_loco_routing_kernel_size: [1, 3]
+sfc_loco_dilation_cycle: [1, 2, 1, 2]
+sfc_loco_expansion: 1
+sfc_loco_ffn_expansion: 5
+sfc_loco_source_head_type: folded_fullband
+sfc_loco_source_head_channels: 64
+sfc_loco_source_bottleneck_channels: 64
+sfc_loco_source_refine_layers: 1
+sfc_loco_source_kernel_size: 5
+sfc_loco_fullres_skip_enabled: true
+
+task:
+    model:
+        n_bands: ${sfc_loco_n_bands}
+        d_model: ${sfc_loco_d_model}
+        n_loco_layers: ${sfc_loco_layers}
+        kernel_size: ${sfc_loco_kernel_size}
+        routing_kernel_size: ${sfc_loco_routing_kernel_size}
+        dilation_cycle: ${sfc_loco_dilation_cycle}
+        expansion: ${sfc_loco_expansion}
+        ffn_expansion: ${sfc_loco_ffn_expansion}
+        source_head_type: ${sfc_loco_source_head_type}
+        source_head_channels: ${sfc_loco_source_head_channels}
+        source_bottleneck_channels: ${sfc_loco_source_bottleneck_channels}
+        source_refine_layers: ${sfc_loco_source_refine_layers}
+        source_kernel_size: ${sfc_loco_source_kernel_size}
+        fullres_skip_enabled: ${sfc_loco_fullres_skip_enabled}

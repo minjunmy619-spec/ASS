@@ -34,6 +34,7 @@ from spectral_feature_compression.core.model.frequency_preprocessing import (
 from spectral_feature_compression.core.model.online_model_wrapper import OnlineModelWrapper
 from spectral_feature_compression.core.model.online_sfc_2d import (
     CausalConv2d,
+    ChannelAffine2d,
     RMSNorm2d,
     _runtime_assert,
     _validate_npu_kernel_dilation_limit,
@@ -77,11 +78,12 @@ class SourceWiseSigmoidTanhComplexHead2d(nn.Module):
             raise ValueError(f"source_kernel_size must be a positive odd integer, got {source_kernel_size}")
         if real_mask_scale <= 0.0 or imag_mask_scale <= 0.0:
             raise ValueError("mask scales must be positive")
-        del source_kernel_size
+        _validate_npu_kernel_dilation_limit(source_kernel_size, 1, axis="source_head_frequency")
 
         self.n_src = int(n_src)
         self.n_chan = int(n_chan)
         self.hidden_channels = int(hidden_channels)
+        self.source_kernel_size = int(source_kernel_size)
         self.real_mask_scale = float(real_mask_scale)
         self.imag_mask_scale = float(imag_mask_scale)
 
@@ -91,7 +93,15 @@ class SourceWiseSigmoidTanhComplexHead2d(nn.Module):
         )
         self.refine = nn.ModuleList()
         for _ in range(int(refine_layers)):
-            self.refine.append(nn.Conv2d(self.hidden_channels, self.hidden_channels, kernel_size=1, bias=True))
+            self.refine.append(
+                nn.Conv2d(
+                    self.hidden_channels,
+                    self.hidden_channels,
+                    kernel_size=(1, self.source_kernel_size),
+                    padding=(0, self.source_kernel_size // 2),
+                    bias=True,
+                )
+            )
         self.out_norm = RMSNorm2d(self.hidden_channels)
         self.mask = nn.Conv2d(
             self.hidden_channels,
@@ -121,6 +131,128 @@ class SourceWiseSigmoidTanhComplexHead2d(nn.Module):
         for layer in self.refine:
             h = h + F.silu(layer(h))
         logits = self.mask(self.out_norm(h))
+        return self._mask_from_logits(logits), logits
+
+
+class FoldedFullBandSourceRefineBlock2d(nn.Module):
+    """Full-band source refinement with a cheap bottlenecked regular Conv2D."""
+
+    def __init__(
+        self,
+        *,
+        channels: int,
+        bottleneck_channels: int,
+        kernel_size: int,
+    ) -> None:
+        super().__init__()
+        if channels <= 0 or bottleneck_channels <= 0:
+            raise ValueError("channels and bottleneck_channels must be positive")
+        if kernel_size <= 0 or kernel_size % 2 != 1:
+            raise ValueError(f"kernel_size must be a positive odd integer, got {kernel_size}")
+        _validate_npu_kernel_dilation_limit(kernel_size, 1, axis="folded_source_head_frequency")
+
+        self.affine = ChannelAffine2d(channels)
+        self.reduce = nn.Conv2d(channels, bottleneck_channels, kernel_size=1, bias=True)
+        self.local = nn.Conv2d(
+            bottleneck_channels,
+            bottleneck_channels,
+            kernel_size=(1, kernel_size),
+            padding=(0, kernel_size // 2),
+            groups=1,
+            bias=True,
+        )
+        self.expand = nn.Conv2d(bottleneck_channels, channels, kernel_size=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.silu(self.reduce(self.affine(x)))
+        y = F.silu(self.local(y))
+        return x + self.expand(y)
+
+
+class FoldedFullBandSourceAwareComplexHead2d(nn.Module):
+    """
+    Source-folded full-band mask head.
+
+    The SFC trunk works on compressed bands. This head is intentionally placed
+    after expansion so it can refine speech/music masks at the original
+    frequency grid while keeping the expensive local Conv2D in a bottleneck.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        n_src: int,
+        n_chan: int,
+        hidden_channels: int = 96,
+        bottleneck_channels: int | None = None,
+        refine_layers: int = 1,
+        source_kernel_size: int = 5,
+        real_mask_scale: float = 1.5,
+        imag_mask_scale: float = 0.12,
+    ) -> None:
+        super().__init__()
+        if in_channels <= 0 or hidden_channels <= 0:
+            raise ValueError("in_channels and hidden_channels must be positive")
+        if n_src <= 0 or n_chan <= 0:
+            raise ValueError("n_src and n_chan must be positive")
+        if refine_layers < 0:
+            raise ValueError(f"refine_layers must be non-negative, got {refine_layers}")
+        if source_kernel_size <= 0 or source_kernel_size % 2 != 1:
+            raise ValueError(f"source_kernel_size must be a positive odd integer, got {source_kernel_size}")
+        if real_mask_scale <= 0.0 or imag_mask_scale <= 0.0:
+            raise ValueError("mask scales must be positive")
+        _validate_npu_kernel_dilation_limit(source_kernel_size, 1, axis="folded_source_head_frequency")
+
+        self.n_src = int(n_src)
+        self.n_chan = int(n_chan)
+        self.hidden_channels = int(hidden_channels)
+        self.folded_channels = self.n_src * self.n_chan * self.hidden_channels
+        self.bottleneck_channels = int(bottleneck_channels or min(self.hidden_channels, self.folded_channels))
+        self.real_mask_scale = float(real_mask_scale)
+        self.imag_mask_scale = float(imag_mask_scale)
+
+        self.seed = nn.Conv2d(in_channels, self.folded_channels, kernel_size=1, bias=True)
+        self.source_bias = nn.Parameter(torch.zeros(1, self.folded_channels, 1, 1))
+        self.refine = nn.ModuleList(
+            [
+                FoldedFullBandSourceRefineBlock2d(
+                    channels=self.folded_channels,
+                    bottleneck_channels=self.bottleneck_channels,
+                    kernel_size=source_kernel_size,
+                )
+                for _ in range(int(refine_layers))
+            ]
+        )
+        self.out_affine = ChannelAffine2d(self.folded_channels)
+        self.mask = nn.Conv2d(
+            self.folded_channels,
+            2 * self.n_src * self.n_chan,
+            kernel_size=1,
+            bias=True,
+        )
+        self._init_mask_bias()
+
+    def _init_mask_bias(self) -> None:
+        target_real = min(0.45 / max(self.real_mask_scale, 1.0e-6), 0.95)
+        with torch.no_grad():
+            self.mask.bias.zero_()
+            self.mask.bias[0::2].fill_(_logit(target_real))
+
+    def _mask_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        real = torch.sigmoid(logits[:, 0::2, :, :]) * self.real_mask_scale
+        imag = torch.tanh(logits[:, 1::2, :, :]) * self.imag_mask_scale
+        chunks: list[torch.Tensor] = []
+        for idx in range(self.n_src * self.n_chan):
+            chunks.append(real[:, idx : idx + 1, :, :])
+            chunks.append(imag[:, idx : idx + 1, :, :])
+        return torch.cat(chunks, dim=1)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = F.silu(self.seed(x) + self.source_bias)
+        for layer in self.refine:
+            h = layer(h)
+        logits = self.mask(self.out_affine(h))
         return self._mask_from_logits(logits), logits
 
 
@@ -188,7 +320,8 @@ class RegularConv2DLocoformerBlock2d(nn.Module):
 
     @staticmethod
     def _gated(x: torch.Tensor) -> torch.Tensor:
-        a, b = x.chunk(2, dim=1)
+        hidden = x.shape[1] // 2
+        a, b = torch.split(x, hidden, dim=1)
         return a * torch.sigmoid(b)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -242,9 +375,12 @@ class OnlineSFCLocoformerConv2D32BNPU2D(nn.Module):
         dilation_cycle: Sequence[int] | None = (1, 2),
         expansion: int = 2,
         ffn_expansion: int = 4,
+        source_head_type: str = "sourcewise_local",
         source_head_channels: int = 128,
+        source_bottleneck_channels: int | None = None,
         source_refine_layers: int = 1,
         source_kernel_size: int = 5,
+        fullres_skip_enabled: bool = False,
         real_mask_scale: float = 1.5,
         imag_mask_scale: float = 0.12,
         low_freq_hz: float = 1000.0,
@@ -270,6 +406,8 @@ class OnlineSFCLocoformerConv2D32BNPU2D(nn.Module):
         self.d_model = int(d_model)
         self.masking = bool(masking)
         self.causal = bool(causal)
+        self.source_head_type = str(source_head_type).lower().replace("-", "_")
+        self.fullres_skip_enabled = bool(fullres_skip_enabled)
         self.dilation_schedule = _normalize_dilation_schedule(int(n_loco_layers), dilation_cycle)
 
         self.band_spec = AdaptiveMelBandSpec2d(
@@ -308,23 +446,56 @@ class OnlineSFCLocoformerConv2D32BNPU2D(nn.Module):
             ]
         )
         self.expander = SoftBandQueryExpander2d(channels=self.d_model, band_spec=self.band_spec)
-        self.source_head = SourceWiseSigmoidTanhComplexHead2d(
-            in_channels=self.d_model,
-            n_src=self.n_src,
-            n_chan=self.n_chan,
-            hidden_channels=source_head_channels,
-            refine_layers=source_refine_layers,
-            source_kernel_size=source_kernel_size,
-            real_mask_scale=real_mask_scale,
-            imag_mask_scale=imag_mask_scale,
-        )
+        head_in_channels = self.d_model * (2 if self.fullres_skip_enabled else 1)
+        if self.source_head_type in {"sourcewise", "sourcewise_local", "local"}:
+            self.source_head = SourceWiseSigmoidTanhComplexHead2d(
+                in_channels=head_in_channels,
+                n_src=self.n_src,
+                n_chan=self.n_chan,
+                hidden_channels=source_head_channels,
+                refine_layers=source_refine_layers,
+                source_kernel_size=source_kernel_size,
+                real_mask_scale=real_mask_scale,
+                imag_mask_scale=imag_mask_scale,
+            )
+        elif self.source_head_type in {"sourcewise_pointwise", "pointwise", "legacy_pointwise"}:
+            self.source_head = SourceWiseSigmoidTanhComplexHead2d(
+                in_channels=head_in_channels,
+                n_src=self.n_src,
+                n_chan=self.n_chan,
+                hidden_channels=source_head_channels,
+                refine_layers=source_refine_layers,
+                source_kernel_size=1,
+                real_mask_scale=real_mask_scale,
+                imag_mask_scale=imag_mask_scale,
+            )
+        elif self.source_head_type in {"folded_fullband", "folded_source_aware", "folded"}:
+            self.source_head = FoldedFullBandSourceAwareComplexHead2d(
+                in_channels=head_in_channels,
+                n_src=self.n_src,
+                n_chan=self.n_chan,
+                hidden_channels=source_head_channels,
+                bottleneck_channels=source_bottleneck_channels,
+                refine_layers=source_refine_layers,
+                source_kernel_size=source_kernel_size,
+                real_mask_scale=real_mask_scale,
+                imag_mask_scale=imag_mask_scale,
+            )
+        else:
+            raise ValueError(
+                "Unsupported source_head_type="
+                f"{source_head_type!r}; expected sourcewise_local, sourcewise_pointwise, or folded_fullband."
+            )
 
     def _encode_decode(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.in_proj(x)
-        z, query_tokens = self.compressor(h)
+        h_full = self.in_proj(x)
+        z, query_tokens = self.compressor(h_full)
         for block in self.separator:
             z = block(z)
-        return self.expander(z, query_tokens)
+        h = self.expander(z, query_tokens)
+        if self.fullres_skip_enabled:
+            h = torch.cat([h, h_full], dim=1)
+        return h
 
     def _decode_masks(self, x: torch.Tensor, h: torch.Tensor, *, return_aux: bool = False):
         masks, logits = self.source_head(h)
@@ -342,6 +513,8 @@ class OnlineSFCLocoformerConv2D32BNPU2D(nn.Module):
             "mask_logits_transform": "sigmoid_tanh_complex_mask",
             "mask_logits_real_scale": self.source_head.real_mask_scale,
             "mask_logits_imag_scale": self.source_head.imag_mask_scale,
+            "mask_logits_source_head_type": self.source_head_type,
+            "mask_logits_fullres_skip_enabled": self.fullres_skip_enabled,
         }
 
     def forward(self, x: torch.Tensor, *, return_aux: bool = False):
@@ -374,13 +547,15 @@ class OnlineSFCLocoformerConv2D32BNPU2D(nn.Module):
             state = self.init_stream_state(batch_size=x.shape[0], device=x.device, dtype=x.dtype)
         _runtime_assert(len(state) == 1 + len(self.separator), f"Unexpected state tuple: {len(state)}")
 
-        h = self.in_proj(x)
-        (z, query_tokens), new_comp_state = self.compressor.forward_stream(h, state[0])
+        h_full = self.in_proj(x)
+        (z, query_tokens), new_comp_state = self.compressor.forward_stream(h_full, state[0])
         new_sep_states = []
         for block, block_state in zip(self.separator, state[1:]):
             z, block_state = block.forward_stream(z, block_state)
             new_sep_states.append(block_state)
         h = self.expander(z, query_tokens)
+        if self.fullres_skip_enabled:
+            h = torch.cat([h, h_full], dim=1)
         y = self._decode_masks(x, h, return_aux=False)
         return y, (new_comp_state, *new_sep_states)
 
@@ -512,9 +687,12 @@ def build_sfc_locoformer_conv2d_32b_npu_system(
     dilation_cycle: Sequence[int] | None = (1, 2),
     expansion: int = 2,
     ffn_expansion: int = 4,
+    source_head_type: str = "sourcewise_local",
     source_head_channels: int = 128,
+    source_bottleneck_channels: int | None = None,
     source_refine_layers: int = 1,
     source_kernel_size: int = 5,
+    fullres_skip_enabled: bool = False,
     real_mask_scale: float = 1.5,
     imag_mask_scale: float = 0.12,
     low_freq_hz: float = 1000.0,
@@ -605,9 +783,12 @@ def build_sfc_locoformer_conv2d_32b_npu_system(
         dilation_cycle=dilation_cycle,
         expansion=expansion,
         ffn_expansion=ffn_expansion,
+        source_head_type=source_head_type,
         source_head_channels=source_head_channels,
+        source_bottleneck_channels=source_bottleneck_channels,
         source_refine_layers=source_refine_layers,
         source_kernel_size=source_kernel_size,
+        fullres_skip_enabled=fullres_skip_enabled,
         real_mask_scale=real_mask_scale,
         imag_mask_scale=imag_mask_scale,
         low_freq_hz=low_freq_hz,

@@ -1,0 +1,10 @@
+_base_: ../tvconv-pyramid-sourceaware-sfclite-convgru-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+
+# Replace stride-2 ConvTranspose decoder steps with nearest frequency resize
+# followed by regular Conv2D.  This is meant to reduce checkerboard-like
+# frequency texture while keeping NPU-friendly Conv2D compute.
+tvconv_upsample_mode: resize_conv
+
+task:
+  model:
+    upsample_mode: ${tvconv_upsample_mode}

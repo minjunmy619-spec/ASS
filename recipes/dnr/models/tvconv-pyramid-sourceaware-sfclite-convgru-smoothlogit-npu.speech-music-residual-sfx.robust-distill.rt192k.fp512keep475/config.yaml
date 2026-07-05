@@ -1,0 +1,12 @@
+_base_: ../tvconv-pyramid-sourceaware-sfclite-convgru-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+
+# Perceptual-smoothness TVConv variant.
+# The model still predicts speech/music masks explicitly and keeps SFX residual,
+# but stabilizes the final mask logits with a tiny causal moving-average blend.
+tvconv_mask_logit_smoothing_kernel: 3
+tvconv_mask_logit_smoothing_blend: 0.25
+
+task:
+  model:
+    mask_logit_smoothing_kernel: ${tvconv_mask_logit_smoothing_kernel}
+    mask_logit_smoothing_blend: ${tvconv_mask_logit_smoothing_blend}

@@ -126,14 +126,46 @@ def _find_band_spec(root: nn.Module | None) -> nn.Module | None:
     if root is None:
         return None
     for module in root.modules():
-        centers = getattr(module, "centers_hz", None)
         n_bands = getattr(module, "n_bands", None)
-        if not isinstance(centers, torch.Tensor) or n_bands is None:
+        if n_bands is None:
             continue
-        centers_tensor = cast(torch.Tensor, centers)
-        if int(centers_tensor.numel()) == int(n_bands):
+        basis = _band_spec_basis(module)
+        if basis is not None and int(basis.shape[0]) == int(n_bands):
             return module
+        for center_name in ("centers_hz", "centers"):
+            centers = getattr(module, center_name, None)
+            if not isinstance(centers, torch.Tensor):
+                continue
+            centers_tensor = cast(torch.Tensor, centers)
+            if int(centers_tensor.numel()) == int(n_bands):
+                return module
     return None
+
+
+def _band_spec_basis(module: nn.Module | None) -> torch.Tensor | None:
+    if module is None:
+        return None
+    basis = getattr(module, "basis", None)
+    if not isinstance(basis, torch.Tensor):
+        return None
+    basis_tensor = cast(torch.Tensor, basis)
+    if basis_tensor.ndim == 4 and int(basis_tensor.shape[0]) == 1 and int(basis_tensor.shape[2]) == 1:
+        return basis_tensor[0, :, 0, :]
+    if basis_tensor.ndim == 2:
+        return basis_tensor
+    return None
+
+
+def _find_frequency_projectors(root: nn.Module | None) -> tuple[nn.Module, ...]:
+    if root is None:
+        return ()
+    projectors = []
+    for module in root.modules():
+        analysis = getattr(module, "analysis_matrix", None)
+        synthesis = getattr(module, "synthesis_matrix", None)
+        if isinstance(analysis, torch.Tensor) or isinstance(synthesis, torch.Tensor):
+            projectors.append(module)
+    return tuple(projectors)
 
 
 class TeacherStudentDistillationTask(SupTask):
@@ -279,10 +311,15 @@ class TeacherStudentDistillationTask(SupTask):
             "mel_center": "mel_centers",
             "center": "mel_centers",
             "centers": "mel_centers",
+            "overlap": "basis",
+            "overlap_basis": "basis",
+            "basis_overlap": "basis",
         }
         band_mapping = band_mapping_aliases.get(band_mapping, band_mapping)
-        if band_mapping not in {"none", "linear", "mel_centers", "auto"}:
-            raise ValueError("distillation_band_mapping must be one of 'none', 'linear', 'mel_centers', or 'auto'")
+        if band_mapping not in {"none", "linear", "basis", "mel_centers", "auto"}:
+            raise ValueError(
+                "distillation_band_mapping must be one of 'none', 'linear', 'basis', 'mel_centers', or 'auto'"
+            )
 
         self.fs = fs
         self.n_fft = n_fft
@@ -352,6 +389,8 @@ class TeacherStudentDistillationTask(SupTask):
         self._teacher_band_spec = (
             _find_band_spec(self.teacher_model) if self.distillation_band_mapping != "none" else None
         )
+        self._student_frequency_projectors = _find_frequency_projectors(self.model)
+        self._teacher_frequency_projectors = _find_frequency_projectors(self.teacher_model)
 
         self._register_latent_hooks()
 
@@ -674,6 +713,148 @@ class TeacherStudentDistillationTask(SupTask):
             mapped = F.interpolate(flat, size=target_size, mode="linear", align_corners=True)
         return mapped.reshape(*value.shape[:-1], target_size).to(dtype=value.dtype)
 
+    def _projector_matrix(
+        self,
+        projector: nn.Module,
+        attr_name: str,
+        *,
+        source_size: int,
+        target_size: int,
+        ref: torch.Tensor,
+    ) -> torch.Tensor | None:
+        matrix = getattr(projector, attr_name, None)
+        if not isinstance(matrix, torch.Tensor):
+            return None
+        matrix_tensor = cast(torch.Tensor, matrix)
+        if matrix_tensor.ndim != 2:
+            return None
+        if tuple(matrix_tensor.shape) != (target_size, source_size):
+            return None
+        return matrix_tensor.to(device=ref.device, dtype=torch.float32)
+
+    def _frequency_projector_mapping(
+        self,
+        source_size: int,
+        target_size: int,
+        ref: torch.Tensor,
+    ) -> torch.Tensor | None:
+        for projector in self._student_frequency_projectors:
+            mapping = self._projector_matrix(
+                projector,
+                "analysis_matrix",
+                source_size=source_size,
+                target_size=target_size,
+                ref=ref,
+            )
+            if mapping is not None:
+                return mapping
+
+        for projector in self._teacher_frequency_projectors:
+            mapping = self._projector_matrix(
+                projector,
+                "synthesis_matrix",
+                source_size=source_size,
+                target_size=target_size,
+                ref=ref,
+            )
+            if mapping is not None:
+                return mapping
+
+        for teacher_projector in self._teacher_frequency_projectors:
+            teacher_to_full = getattr(teacher_projector, "synthesis_matrix", None)
+            if not isinstance(teacher_to_full, torch.Tensor):
+                continue
+            teacher_to_full = cast(torch.Tensor, teacher_to_full)
+            if teacher_to_full.ndim != 2 or int(teacher_to_full.shape[1]) != source_size:
+                continue
+            teacher_to_full = teacher_to_full.to(device=ref.device, dtype=torch.float32)
+            for student_projector in self._student_frequency_projectors:
+                full_to_student = getattr(student_projector, "analysis_matrix", None)
+                if not isinstance(full_to_student, torch.Tensor):
+                    continue
+                full_to_student = cast(torch.Tensor, full_to_student)
+                if full_to_student.ndim != 2:
+                    continue
+                if int(full_to_student.shape[0]) != target_size:
+                    continue
+                if int(full_to_student.shape[1]) != int(teacher_to_full.shape[0]):
+                    continue
+                full_to_student = full_to_student.to(device=ref.device, dtype=torch.float32)
+                return torch.matmul(full_to_student, teacher_to_full)
+        return None
+
+    def _band_frequency_axis(self, band_spec: nn.Module | None, size: int, ref: torch.Tensor) -> torch.Tensor | None:
+        if band_spec is None:
+            return None
+        axis = getattr(band_spec, "bin_frequencies_hz", None)
+        if not isinstance(axis, torch.Tensor):
+            return None
+        axis_tensor = cast(torch.Tensor, axis).flatten()
+        if int(axis_tensor.numel()) != int(size):
+            return None
+        return axis_tensor.to(device=ref.device, dtype=torch.float32)
+
+    def _resample_band_rows(
+        self,
+        value: torch.Tensor,
+        *,
+        source_axis: torch.Tensor | None,
+        target_axis: torch.Tensor | None,
+        target_size: int,
+    ) -> torch.Tensor:
+        source_size = int(value.shape[-1])
+        target_size = int(target_size)
+        if source_size == target_size:
+            return value
+        if source_axis is None or target_axis is None:
+            return F.interpolate(value.unsqueeze(0), size=target_size, mode="linear", align_corners=True).squeeze(0)
+
+        right = torch.searchsorted(source_axis.contiguous(), target_axis.contiguous()).clamp(max=source_size - 1)
+        left = (right - 1).clamp(min=0)
+        left = torch.where(target_axis <= source_axis[0], torch.zeros_like(left), left)
+        right = torch.where(target_axis <= source_axis[0], torch.zeros_like(right), right)
+        left = torch.where(target_axis >= source_axis[-1], torch.full_like(left, source_size - 1), left)
+        right = torch.where(target_axis >= source_axis[-1], torch.full_like(right, source_size - 1), right)
+
+        left_hz = source_axis[left]
+        right_hz = source_axis[right]
+        denom = (right_hz - left_hz).clamp_min(1.0e-6)
+        right_weight = torch.where(left == right, torch.zeros_like(target_axis), (target_axis - left_hz) / denom)
+        right_weight = right_weight.clamp(0.0, 1.0)
+        left_weight = 1.0 - right_weight
+        return value[:, left] * left_weight.unsqueeze(0) + value[:, right] * right_weight.unsqueeze(0)
+
+    def _basis_band_mapping(self, source_size: int, target_size: int, ref: torch.Tensor) -> torch.Tensor | None:
+        teacher_basis = _band_spec_basis(self._teacher_band_spec)
+        student_basis = _band_spec_basis(self._student_band_spec)
+        if teacher_basis is None or student_basis is None:
+            if self.distillation_band_mapping == "basis":
+                raise ValueError("basis band mapping requires a basis buffer on both student and teacher band specs")
+            return None
+        if int(teacher_basis.shape[0]) != int(source_size) or int(student_basis.shape[0]) != int(target_size):
+            return None
+
+        teacher_basis = teacher_basis.to(device=ref.device, dtype=torch.float32)
+        student_basis = student_basis.to(device=ref.device, dtype=torch.float32)
+        teacher_f = int(teacher_basis.shape[-1])
+        student_f = int(student_basis.shape[-1])
+        if teacher_f <= 0 or student_f <= 0:
+            return None
+
+        teacher_expand = teacher_basis / teacher_basis.sum(dim=0, keepdim=True).clamp_min(1.0e-6)
+        teacher_axis = self._band_frequency_axis(self._teacher_band_spec, teacher_f, ref)
+        student_axis = self._band_frequency_axis(self._student_band_spec, student_f, ref)
+        teacher_expand = self._resample_band_rows(
+            teacher_expand,
+            source_axis=teacher_axis,
+            target_axis=student_axis,
+            target_size=student_f,
+        )
+        student_compress = student_basis / student_basis.sum(dim=1, keepdim=True).clamp_min(1.0e-6)
+        mapping = torch.matmul(student_compress, teacher_expand.transpose(0, 1))
+        mapping = mapping / mapping.sum(dim=1, keepdim=True).clamp_min(1.0e-6)
+        return mapping
+
     def _center_band_mapping(self, source_size: int, target_size: int, ref: torch.Tensor) -> torch.Tensor | None:
         if self._teacher_band_spec is None or self._student_band_spec is None:
             if self.distillation_band_mapping == "auto":
@@ -695,13 +876,11 @@ class TeacherStudentDistillationTask(SupTask):
         if int(teacher_centers_tensor.numel()) != int(source_size) or int(student_centers_tensor.numel()) != int(
             target_size
         ):
-            if self.distillation_band_mapping == "auto":
-                return None
-            raise ValueError(
-                "Band tensor sizes do not match discovered band specs: "
-                f"teacher tensor K={source_size}, teacher spec K={int(teacher_centers_tensor.numel())}; "
-                f"student tensor K={target_size}, student spec K={int(student_centers_tensor.numel())}"
-            )
+            # Mask/logit aux tensors are usually expanded back to the dense
+            # frequency grid before they are exposed.  In that case the model
+            # still has a band_spec, but the tensor width is no longer the
+            # band-token count, so mel-center mapping is the wrong domain.
+            return None
 
         source = teacher_centers_tensor.to(device=ref.device, dtype=torch.float32).flatten()
         target = student_centers_tensor.to(device=ref.device, dtype=torch.float32).flatten()
@@ -738,11 +917,20 @@ class TeacherStudentDistillationTask(SupTask):
                 "Band-domain distillation shape mismatch requires distillation_band_mapping; "
                 f"got teacher K={source_size}, student K={target_size}"
             )
+        if self.distillation_band_mapping in {"basis", "mel_centers", "auto"}:
+            mapping = self._basis_band_mapping(source_size, target_size, teacher_value)
+            if mapping is not None:
+                mapped = torch.matmul(teacher_value.float(), mapping.transpose(0, 1))
+                return mapped.to(dtype=teacher_value.dtype)
         if self.distillation_band_mapping in {"mel_centers", "auto"}:
             mapping = self._center_band_mapping(source_size, target_size, teacher_value)
             if mapping is not None:
                 mapped = torch.matmul(teacher_value.float(), mapping.transpose(0, 1))
                 return mapped.to(dtype=teacher_value.dtype)
+        mapping = self._frequency_projector_mapping(source_size, target_size, teacher_value)
+        if mapping is not None:
+            mapped = torch.matmul(teacher_value.float(), mapping.transpose(0, 1))
+            return mapped.to(dtype=teacher_value.dtype)
         return self._linear_map_last_dim(teacher_value, target_size)
 
     def _align_distillation_tensors(
@@ -965,12 +1153,20 @@ class TeacherStudentDistillationTask(SupTask):
             log_dict[f"{log_prefix}/loss_source_weighted_snr"] = source_weighted_snr_loss
 
         if self.explicit_source_loss_weight > 0.0:
-            explicit_source_loss = self._robust_source_subset_loss(est, ref, self._explicit_source_indices(ref.shape[1]))
+            explicit_source_loss = self._robust_source_subset_loss(
+                est,
+                ref,
+                self._explicit_source_indices(ref.shape[1]),
+            )
             loss = loss + self.explicit_source_loss_weight * explicit_source_loss
             log_dict[f"{log_prefix}/loss_explicit_sources"] = explicit_source_loss
 
         if self.residual_source_loss_weight > 0.0:
-            residual_source_loss = self._robust_source_subset_loss(est, ref, (self._residual_source_index(ref.shape[1]),))
+            residual_source_loss = self._robust_source_subset_loss(
+                est,
+                ref,
+                (self._residual_source_index(ref.shape[1]),),
+            )
             loss = loss + self.residual_source_loss_weight * residual_source_loss
             log_dict[f"{log_prefix}/loss_residual_source"] = residual_source_loss
 

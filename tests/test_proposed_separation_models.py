@@ -238,6 +238,136 @@ def test_tvconv_pyramid_npu_forward_streaming_and_recipe_budget() -> None:
     assert system.phase_consistency is None
 
 
+def test_tvconv_pyramid_mask_logit_smoothing_streaming_and_recipe_budget() -> None:
+    torch.manual_seed(0)
+    core = TVConvPyramidNPUSeparator2D(
+        n_freq=64,
+        n_src=2,
+        n_chan=1,
+        base_channels=16,
+        bottleneck_channels=32,
+        n_down=3,
+        n_blocks=2,
+        expansion=2,
+        time_kernel=3,
+        time_dilation_cycle=(1, 2),
+        band_kernel=3,
+        source_head_type="folded_source_aware",
+        source_mixer_layers=1,
+        mask_hidden=16,
+        mask_logit_smoothing_kernel=3,
+        mask_logit_smoothing_blend=0.25,
+    ).eval()
+    x = torch.randn(1, 2, 5, 64)
+
+    with torch.no_grad():
+        y, aux = core(x, return_aux=True)
+        state = core.init_stream_state(batch_size=1, dtype=x.dtype)
+        frames = []
+        for frame_idx in range(x.shape[2]):
+            frame, state = core.forward_stream(x[:, :, frame_idx : frame_idx + 1, :], state)
+            frames.append(frame)
+        y_stream = torch.cat(frames, dim=2)
+
+    assert tuple(y.shape) == (1, 4, 5, 64)
+    assert aux["mask_logits_smoothing_kernel"] == 3
+    assert aux["mask_logits_smoothing_blend"] == pytest.approx(0.25)
+    assert core.source_head.has_stream_state is True
+    assert len(state) == 3
+    assert tuple(state[-1].shape) == (1, 4, 2, 64)
+    assert core.stream_context_frames() == 8
+    torch.testing.assert_close(y_stream, y, rtol=1e-5, atol=1e-5)
+
+    config_path = Path(
+        "recipes/dnr/models/"
+        "tvconv-pyramid-sourceaware-sfclite-convgru-smoothlogit-npu."
+        "speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/"
+        "config.yaml"
+    )
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert str(resolve_value(model_cfg["_target_"], context)).endswith(
+        "build_tvconv_pyramid_sourceaware_sfclite_convgru_npu_separator_system"
+    )
+    assert resolve_value(model_cfg["mask_logit_smoothing_kernel"], context) == 3
+    assert resolve_value(model_cfg["mask_logit_smoothing_blend"], context) == pytest.approx(0.25)
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    recipe_core = system.model.core
+    assert recipe_core.source_head_type == "folded_source_aware"
+    assert recipe_core.source_head.logit_smoother.enabled is True
+    assert recipe_core.source_head.logit_smoother.kernel_size == 3
+    assert recipe_core.source_head.logit_smoother.blend == pytest.approx(0.25)
+    assert recipe_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+    params = sum(p.numel() for p in recipe_core.parameters())
+    assert 3_000_000 <= params <= 8_000_000
+
+
+def test_tvconv_pyramid_resize_conv_upsampling_streaming_and_recipe_budget() -> None:
+    torch.manual_seed(0)
+    core = TVConvPyramidNPUSeparator2D(
+        n_freq=65,
+        n_src=2,
+        n_chan=1,
+        base_channels=16,
+        bottleneck_channels=32,
+        n_down=3,
+        n_blocks=2,
+        expansion=2,
+        time_kernel=3,
+        time_dilation_cycle=(1, 2),
+        band_kernel=3,
+        upsample_mode="resize_conv",
+        source_head_type="folded_source_aware",
+        source_mixer_layers=1,
+        mask_hidden=16,
+        mask_logit_smoothing_kernel=3,
+        mask_logit_smoothing_blend=0.25,
+    ).eval()
+    x = torch.randn(1, 2, 5, 65)
+
+    with torch.no_grad():
+        y, aux = core(x, return_aux=True)
+        state = core.init_stream_state(batch_size=1, dtype=x.dtype)
+        frames = []
+        for frame_idx in range(x.shape[2]):
+            frame, state = core.forward_stream(x[:, :, frame_idx : frame_idx + 1, :], state)
+            frames.append(frame)
+        y_stream = torch.cat(frames, dim=2)
+
+    assert tuple(y.shape) == (1, 4, 5, 65)
+    assert core.upsample_mode == "resize_conv"
+    assert aux["mask_logits_smoothing_kernel"] == 3
+    assert not any(isinstance(module, torch.nn.ConvTranspose2d) for module in core.modules())
+    torch.testing.assert_close(y_stream, y, rtol=1e-5, atol=1e-5)
+
+    config_path = Path(
+        "recipes/dnr/models/"
+        "tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu."
+        "speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/"
+        "config.yaml"
+    )
+    top = merge_top_level_scalars(config_path)
+    model_cfg = merge_task_model_mapping(config_path)
+    context = {**top, **model_cfg}
+    assert str(resolve_value(model_cfg["_target_"], context)).endswith(
+        "build_tvconv_pyramid_sourceaware_sfclite_convgru_npu_separator_system"
+    )
+    assert resolve_value(model_cfg["upsample_mode"], context) == "resize_conv"
+    assert resolve_value(model_cfg["mask_logit_smoothing_kernel"], context) == 3
+    assert resolve_value(model_cfg["mask_logit_smoothing_blend"], context) == pytest.approx(0.25)
+
+    system = build_model_system_from_recipe_config(config_path).eval()
+    recipe_core = system.model.core
+    assert recipe_core.upsample_mode == "resize_conv"
+    assert recipe_core.source_head.logit_smoother.enabled is True
+    assert recipe_core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+    assert not any(isinstance(module, torch.nn.ConvTranspose2d) for module in recipe_core.modules())
+    params = sum(p.numel() for p in recipe_core.parameters())
+    assert 3_000_000 <= params <= 8_000_000
+
+
 def test_tvconv_pyramid_waveform_wrapper_returns_aux_masks() -> None:
     torch.manual_seed(0)
     model = build_tvconv_pyramid_npu_separator_system(
@@ -2556,6 +2686,41 @@ class _ToyBandSpecSeparator(torch.nn.Module):
         return torch.stack([wav * self.scale, wav * (1.0 - self.scale)], dim=1)
 
 
+class _ToyBasisSpec(torch.nn.Module):
+    def __init__(self, basis: torch.Tensor) -> None:
+        super().__init__()
+        self.n_bands = int(basis.shape[0])
+        self.n_freq = int(basis.shape[1])
+        self.register_buffer("basis", basis.view(1, self.n_bands, 1, self.n_freq))
+
+
+class _ToyBasisSpecSeparator(torch.nn.Module):
+    def __init__(self, basis: torch.Tensor, scale: float) -> None:
+        super().__init__()
+        self.band_spec = _ToyBasisSpec(basis)
+        self.scale = scale
+
+    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+        return torch.stack([wav * self.scale, wav * (1.0 - self.scale)], dim=1)
+
+
+class _ToyFrequencyProjector(torch.nn.Module):
+    def __init__(self, analysis_matrix: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("analysis_matrix", analysis_matrix)
+        self.register_buffer("synthesis_matrix", analysis_matrix.transpose(0, 1))
+
+
+class _ToyFrequencyProjectorSeparator(torch.nn.Module):
+    def __init__(self, analysis_matrix: torch.Tensor, scale: float) -> None:
+        super().__init__()
+        self.freq_preprocessor = _ToyFrequencyProjector(analysis_matrix)
+        self.scale = scale
+
+    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+        return torch.stack([wav * self.scale, wav * (1.0 - self.scale)], dim=1)
+
+
 class _ToyAuxSeparator(torch.nn.Module):
     def __init__(
         self,
@@ -2862,3 +3027,96 @@ def test_distillation_task_maps_teacher_band_tensors_to_student_grid() -> None:
 
     assert mapped_teacher.shape == student_band.shape
     assert all(loss.ndim == 0 and torch.isfinite(loss) for loss in losses)
+
+
+def test_distillation_task_uses_overlap_basis_for_band_mapping() -> None:
+    student_basis = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ]
+    )
+    teacher_basis = torch.tensor(
+        [
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ]
+    )
+    student = _ToyBasisSpecSeparator(student_basis, scale=0.4)
+    teacher = _ToyBasisSpecSeparator(teacher_basis, scale=0.6)
+    task = TeacherStudentDistillationTask(
+        model=student,
+        teacher_model=teacher,
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        distillation_band_mapping="mel_centers",
+    )
+    student_band = torch.zeros(1, 1, 1, 3)
+    teacher_band = torch.tensor([[[[2.0, 10.0]]]])
+
+    _, mapped_teacher = task._align_distillation_tensors(student_band, teacher_band, name="test")
+
+    expected = torch.tensor([[[[2.0, 6.0, 10.0]]]])
+    torch.testing.assert_close(mapped_teacher, expected)
+
+
+def test_distillation_task_uses_frequency_projector_for_dense_aux_mapping() -> None:
+    analysis_matrix = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.25, 0.75, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    student = _ToyFrequencyProjectorSeparator(analysis_matrix, scale=0.4)
+    teacher = torch.nn.Identity()
+    task = TeacherStudentDistillationTask(
+        model=student,
+        teacher_model=teacher,
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        distillation_band_mapping="linear",
+    )
+    student_dense = torch.zeros(1, 1, 1, 3)
+    teacher_dense = torch.tensor([[[[1.0, 2.0, 6.0, 20.0, 30.0]]]])
+
+    _, mapped_teacher = task._align_distillation_tensors(student_dense, teacher_dense, name="test")
+
+    expected = torch.tensor([[[[1.0, 5.0, 30.0]]]])
+    torch.testing.assert_close(mapped_teacher, expected)
+
+
+def test_distillation_task_mel_mapping_falls_back_for_dense_frequency_masks() -> None:
+    student = _ToyBandSpecSeparator(n_bands=4, scale=0.4)
+    teacher = _ToyBandSpecSeparator(n_bands=6, scale=0.6)
+    task = TeacherStudentDistillationTask(
+        model=student,
+        teacher_model=teacher,
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        mask_aux_alignment="shared_prefix",
+        mask_aux_max_frame_mismatch=1,
+        distillation_band_mapping="mel_centers",
+    )
+    wav = torch.randn(2, 1, 128)
+    est = student(wav)
+    teacher_est = teacher(wav)
+    student_aux = {
+        "mask": torch.zeros(2, 4, 3, 5),
+        "mask_domain": "packed_complex_mask",
+    }
+    teacher_aux = {
+        "mask": torch.ones(2, 6, 4, 7),
+        "mask_domain": "packed_complex_mask",
+    }
+
+    loss = task._mask_or_logit_loss(est, teacher_est, wav, student_aux, teacher_aux, logit=False)
+
+    assert loss.ndim == 0 and torch.isfinite(loss)

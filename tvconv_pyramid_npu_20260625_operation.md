@@ -123,6 +123,17 @@ intended training behavior. Fixed items:
     task does not compare raw RoFormer logits against raw TVConv logits; instead
     it converts the teacher `packed_complex_mask` into the student's TVConv
     logit coordinates when the student declares the matching transform.
+  - `distillation_band_mapping: mel_centers` now handles both compressed-band and
+    dense-frequency aux tensors. True band-token tensors first use an
+    overlap-aware basis bridge: teacher bands are expanded through the teacher
+    basis and re-compressed through the student basis, so different band splits
+    and overlap factors are respected. If no basis is available it falls back to
+    center interpolation. Expanded dense mask/logit tensors still fall back to
+    exact frequency-projector matrices when available, for example the TVConv
+    student's hybrid full-grid to 512-bin analysis matrix. Plain linear
+    frequency-axis mapping is now the final fallback, so RoFormer/TVConv aux
+    distillation does not fail just because both models still contain internal
+    band specs.
   - The recipe sets `require_model_aux: true` and explicit shared-prefix mask
     alignment with a bounded frame-mismatch tolerance.
 - Residual-mode `mixture_consistency_weight` is set to `0.0` in the recipe,
@@ -1180,3 +1191,300 @@ Next required experiments:
    - widening `base_channels` before increasing stateful bottleneck channels,
    - adding one non-stateful full-band refinement block,
    - training with teacher mask/logit distillation from the RoFormer teacher.
+
+---
+
+## Smooth-Logit TVConv Fix - 2026-07-03
+
+Listening feedback showed that TVConv can score well on validation SNR while
+still sounding rough or non-smooth. The likely model-side cause is mask-logit
+flicker: the pyramid can predict good average energy while the final mask gain
+changes too abruptly from frame to frame.
+
+Implemented fix:
+
+- Added `MaskLogitTemporalSmoother2d`.
+  - It is a causal regular Conv2D over final mask logits.
+  - It is initialized as a diagonal moving average.
+  - It blends raw logits with smoothed logits before sigmoid/tanh mask
+    conversion.
+  - It uses no attention, BMM, dynamic control flow, or tensors above 4D.
+- Added the smoother to both TVConv heads:
+  - `ConvPyramidSourceHead2d`
+  - `FoldedSourceAwareSourceHead2d`
+- Added stream-state support only when smoothing is enabled.
+  - Disabled recipes keep the old state tuple exactly.
+  - Enabled recipes append one small source-head logit-history state.
+- Updated `stream_context_frames()` so recompute streaming includes logit
+  smoothing history.
+
+New recipe:
+
+```text
+recipes/dnr/models/tvconv-pyramid-sourceaware-sfclite-convgru-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+```
+
+Recipe overrides:
+
+```yaml
+tvconv_mask_logit_smoothing_kernel: 3
+tvconv_mask_logit_smoothing_blend: 0.25
+
+task:
+  model:
+    mask_logit_smoothing_kernel: ${tvconv_mask_logit_smoothing_kernel}
+    mask_logit_smoothing_blend: ${tvconv_mask_logit_smoothing_blend}
+```
+
+Budget for the smooth source-aware SFC-lite ConvGRU TVConv recipe:
+
+```text
+params: 3,716,603
+fp16 stream state: 141,312 bytes
+stream context: 14 STFT frames
+state tensors:
+  [1, 160, 2, 32]
+  [1, 160, 2, 32]
+  [1, 160, 4, 32]
+  [1, 160, 4, 32]
+  [1, 160, 1, 32]
+  [1, 4, 2, 512]
+```
+
+The last state is the added causal logit history. It costs only `8 KiB` fp16
+for mono speech/music masks.
+
+Validation:
+
+```bash
+.venv/bin/python -m pytest tests/test_proposed_separation_models.py -q -k "tvconv_pyramid"
+.venv/bin/python -m ruff check \
+  spectral_feature_compression/core/model/tvconv_pyramid_npu_separator_2d.py \
+  tests/test_proposed_separation_models.py
+.venv/bin/python -m py_compile \
+  spectral_feature_compression/core/model/tvconv_pyramid_npu_separator_2d.py \
+  tests/test_proposed_separation_models.py
+```
+
+Result:
+
+```text
+pytest: 12 passed, 38 deselected
+ruff: All checks passed
+py_compile: pass
+```
+
+ONNX export:
+
+```bash
+.venv/bin/python tools/online/export_onnx_online_model.py \
+  recipes/dnr/models/tvconv-pyramid-sourceaware-sfclite-convgru-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml \
+  --out /tmp/tvconv_sourceaware_sfclite_convgru_smoothlogit.onnx \
+  --n-chan 1 \
+  --frames 1 \
+  --freqs 512 \
+  --streaming \
+  --state-meta-out /tmp/tvconv_sourceaware_sfclite_convgru_smoothlogit_state.json \
+  --deploy-manifest-out /tmp/tvconv_sourceaware_sfclite_convgru_smoothlogit_manifest.json \
+  --op-preset edge_npu_recommended \
+  --check
+```
+
+Result:
+
+```text
+ONNX checker: passed
+Disallowed ops: none
+ONNX nodes: 288
+Initializers: 67 tensors, 14,851,540 bytes
+ONNX ops: Add, Concat, Constant, Conv, ConvTranspose, Identity, Mul, Relu,
+          Sigmoid, Slice, Split, Sub, Tanh
+```
+
+ONE import/optimize:
+
+```bash
+export ONE_CMDS=/home/cmj/works/ONE/build/compiler/one-cmds
+export PATH="$ONE_CMDS:$PATH"
+export LD_LIBRARY_PATH="/home/cmj/works/ONE/build/compiler/luci/import:/home/cmj/works/ONE/build/compiler/luci/export:/home/cmj/works/ONE/build/compiler/luci/pass:/home/cmj/works/ONE/build/compiler/luci/service:/home/cmj/works/ONE/build/compiler/luci/lang:/home/cmj/works/ONE/build/compiler/luci/env:/home/cmj/works/ONE/build/compiler/luci/profile:/home/cmj/works/ONE/build/compiler/luci/plan:/home/cmj/works/ONE/build/compiler/luci/log:/home/cmj/works/ONE/build/compiler/luci/logex:/home/cmj/works/ONE/build/compiler/luci-compute:/home/cmj/works/ONE/build/compiler/luci-interpreter/src:/home/cmj/works/ONE/build/compiler/dio-hdf5:/home/cmj/works/ONE/build/compiler/loco:$LD_LIBRARY_PATH"
+
+one-import-onnx \
+  -i /tmp/tvconv_sourceaware_sfclite_convgru_smoothlogit.onnx \
+  -o /tmp/tvconv_sourceaware_sfclite_convgru_smoothlogit.circle \
+  --dynamic_batch_to_single_batch
+
+one-optimize \
+  -i /tmp/tvconv_sourceaware_sfclite_convgru_smoothlogit.circle \
+  -o /tmp/tvconv_sourceaware_sfclite_convgru_smoothlogit.opt.circle
+```
+
+Result: both artifacts exist.
+
+Circle operator counts after no-layout optimize:
+
+```text
+TRANSPOSE: 60
+MUL: 42
+ADD: 37
+CONV_2D: 23
+STRIDED_SLICE: 17
+RELU: 10
+PAD: 10
+CONCATENATION: 9
+LOGISTIC: 7
+SPLIT_V: 6
+DEPTHWISE_CONV_2D: 5
+TRANSPOSE_CONV: 4
+SLICE: 4
+SUB: 3
+TANH: 2
+SPLIT: 2
+```
+
+---
+
+## Smooth-Upsample TVConv Fix - 2026-07-03
+
+The smooth-logit variant addresses final mask flicker, but the original TVConv
+decoder still used stride-2 `ConvTranspose2d` upsampling. That can introduce
+alternating-bin or checkerboard-like spectral texture. This section records the
+opt-in replacement decoder path.
+
+Implemented fix:
+
+- Added `ResizeConvUpsample2d`.
+  - It upsamples the frequency axis with nearest `Resize`.
+  - It applies a regular `(1, 3)` Conv2D after resize.
+  - It then applies the same channel affine and skip-add as the original path.
+- Added `upsample_mode` to `TVConvPyramidNPUSeparator2D` and the system builder.
+  - `convtranspose` keeps the existing decoder and remains the default.
+  - `resize_conv` removes all `ConvTranspose2d` modules.
+- Added odd-width coverage in tests. The resize path crops `2x` nearest output
+  back to the exact skip width when the decoder target width is odd.
+
+New recipe:
+
+```text
+recipes/dnr/models/tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+```
+
+Recipe override:
+
+```yaml
+tvconv_upsample_mode: resize_conv
+
+task:
+  model:
+    upsample_mode: ${tvconv_upsample_mode}
+```
+
+This recipe inherits the smooth-logit source-aware SFC-lite ConvGRU TVConv
+recipe, so it includes both perceptual smoothness fixes:
+
+- resize-conv decoder upsampling,
+- causal final mask-logit smoothing.
+
+Budget:
+
+```text
+params: 3,716,603
+fp16 stream state: 141,312 bytes
+stream context: 14 STFT frames
+ConvTranspose2d modules: 0
+state tensors:
+  [1, 160, 2, 32]
+  [1, 160, 2, 32]
+  [1, 160, 4, 32]
+  [1, 160, 4, 32]
+  [1, 160, 1, 32]
+  [1, 4, 2, 512]
+```
+
+Validation:
+
+```bash
+.venv/bin/python -m pytest tests/test_proposed_separation_models.py -q -k "tvconv_pyramid"
+.venv/bin/python -m ruff check \
+  spectral_feature_compression/core/model/tvconv_pyramid_npu_separator_2d.py \
+  tests/test_proposed_separation_models.py
+.venv/bin/python -m py_compile \
+  spectral_feature_compression/core/model/tvconv_pyramid_npu_separator_2d.py \
+  tests/test_proposed_separation_models.py
+```
+
+Result:
+
+```text
+pytest: 13 passed, 38 deselected
+ruff: All checks passed
+py_compile: pass
+```
+
+ONNX export:
+
+```bash
+.venv/bin/python tools/online/export_onnx_online_model.py \
+  recipes/dnr/models/tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml \
+  --out /tmp/tvconv_sourceaware_sfclite_convgru_smoothup_smoothlogit.onnx \
+  --n-chan 1 \
+  --frames 1 \
+  --freqs 512 \
+  --streaming \
+  --state-meta-out /tmp/tvconv_sourceaware_sfclite_convgru_smoothup_smoothlogit_state.json \
+  --deploy-manifest-out /tmp/tvconv_sourceaware_sfclite_convgru_smoothup_smoothlogit_manifest.json \
+  --op-preset edge_npu_recommended \
+  --check
+```
+
+Result:
+
+```text
+ONNX checker: passed
+Disallowed ops: none
+ONNX nodes: 296
+Initializers: 67 tensors, 14,851,540 bytes
+ONNX ops: Add, Concat, Constant, Conv, Identity, Mul, Relu, Resize,
+          Sigmoid, Slice, Split, Sub, Tanh
+ConvTranspose ops: 0
+Resize ops: 4
+```
+
+ONE import/optimize:
+
+```bash
+export ONE_CMDS=/home/cmj/works/ONE/build/compiler/one-cmds
+export PATH="$ONE_CMDS:$PATH"
+export LD_LIBRARY_PATH="/home/cmj/works/ONE/build/compiler/luci/import:/home/cmj/works/ONE/build/compiler/luci/export:/home/cmj/works/ONE/build/compiler/luci/pass:/home/cmj/works/ONE/build/compiler/luci/service:/home/cmj/works/ONE/build/compiler/luci/lang:/home/cmj/works/ONE/build/compiler/luci/env:/home/cmj/works/ONE/build/compiler/luci/profile:/home/cmj/works/ONE/build/compiler/luci/plan:/home/cmj/works/ONE/build/compiler/luci/log:/home/cmj/works/ONE/build/compiler/luci/logex:/home/cmj/works/ONE/build/compiler/luci-compute:/home/cmj/works/ONE/build/compiler/luci-interpreter/src:/home/cmj/works/ONE/build/compiler/dio-hdf5:/home/cmj/works/ONE/build/compiler/loco:$LD_LIBRARY_PATH"
+
+one-import-onnx \
+  -i /tmp/tvconv_sourceaware_sfclite_convgru_smoothup_smoothlogit.onnx \
+  -o /tmp/tvconv_sourceaware_sfclite_convgru_smoothup_smoothlogit.circle \
+  --dynamic_batch_to_single_batch
+
+one-optimize \
+  -i /tmp/tvconv_sourceaware_sfclite_convgru_smoothup_smoothlogit.circle \
+  -o /tmp/tvconv_sourceaware_sfclite_convgru_smoothup_smoothlogit.opt.circle
+```
+
+Result: both artifacts exist.
+
+Circle operator counts after no-layout optimize:
+
+```text
+TRANSPOSE: 68
+MUL: 42
+ADD: 37
+CONV_2D: 27
+STRIDED_SLICE: 17
+PAD: 14
+RELU: 10
+CONCATENATION: 9
+LOGISTIC: 7
+SPLIT_V: 6
+DEPTHWISE_CONV_2D: 5
+RESIZE_NEAREST_NEIGHBOR: 4
+SUB: 3
+TANH: 2
+SPLIT: 2
+TRANSPOSE_CONV: 0
+```

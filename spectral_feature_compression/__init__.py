@@ -81,6 +81,7 @@ _EXPORTS = {
     "OnlineSourceAwareMelBandStudentSFCModel": f"{_MODEL}.source_aware_melband_student_sfc_2d",
     "OnlineSFCLocoformerConv2D32BNPU2D": f"{_MODEL}.sfc_locoformer_conv2d_32b_npu",
     "OnlineSFCLocoformerConv2D32BNPUModel": f"{_MODEL}.sfc_locoformer_conv2d_32b_npu",
+    "FoldedFullBandSourceAwareComplexHead2d": f"{_MODEL}.sfc_locoformer_conv2d_32b_npu",
     "SourceWiseSigmoidTanhComplexHead2d": f"{_MODEL}.sfc_locoformer_conv2d_32b_npu",
     "TVConvPyramidNPUSeparator2D": f"{_MODEL}.tvconv_pyramid_npu_separator_2d",
     "RotarySelfAttention": f"{_MODEL}.source_aware_melband_roformer",

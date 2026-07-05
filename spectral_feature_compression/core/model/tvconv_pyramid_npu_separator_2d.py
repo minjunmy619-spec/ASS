@@ -147,6 +147,33 @@ class ConvUpsample2d(nn.Module):
         return F.relu(x + skip)
 
 
+class ResizeConvUpsample2d(nn.Module):
+    """Frequency nearest-resize upsampler followed by regular Conv2D."""
+
+    def __init__(self, in_channels: int, out_channels: int, *, target_freq: int) -> None:
+        super().__init__()
+        if target_freq <= 0:
+            raise ValueError(f"target_freq must be positive, got {target_freq}")
+        self.target_freq = int(target_freq)
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=(1, 3),
+            padding=(0, 1),
+            bias=True,
+        )
+        self.affine = ChannelAffine2d(out_channels)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=(1.0, 2.0), mode="nearest")
+        if x.shape[-1] > self.target_freq:
+            x = x[:, :, :, : self.target_freq]
+        if x.shape[-1] != skip.shape[-1]:
+            raise ValueError(f"Upsample width mismatch: {x.shape[-1]} vs {skip.shape[-1]}")
+        x = self.affine(self.conv(x))
+        return F.relu(x + skip)
+
+
 class BottleneckCapacity2d(nn.Module):
     """Large 1x1 bottleneck MLP at compressed frequency width."""
 
@@ -373,6 +400,86 @@ def _state_numel(state) -> int:
     raise TypeError(f"Unsupported state leaf type: {type(state)!r}")
 
 
+class MaskLogitTemporalSmoother2d(nn.Module):
+    """Causal moving-average blend for mask logits."""
+
+    def __init__(self, channels: int, *, kernel_size: int = 1, blend: float = 0.0) -> None:
+        super().__init__()
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}")
+        if kernel_size <= 0:
+            raise ValueError(f"mask_logit_smoothing_kernel must be positive, got {kernel_size}")
+        if not 0.0 <= float(blend) <= 1.0:
+            raise ValueError(f"mask_logit_smoothing_blend must be in [0, 1], got {blend}")
+        _validate_kernel(kernel_size, 1, axis="mask logit smoothing time")
+
+        self.channels = int(channels)
+        self.kernel_size = int(kernel_size)
+        self.blend = float(blend)
+        self.pad_t = self.kernel_size - 1
+        self.enabled = self.kernel_size > 1 and self.blend > 0.0
+        if self.enabled:
+            self.conv = nn.Conv2d(
+                self.channels,
+                self.channels,
+                kernel_size=(self.kernel_size, 1),
+                groups=1,
+                bias=False,
+            )
+            self._init_moving_average()
+        else:
+            self.conv = None
+
+    def _init_moving_average(self) -> None:
+        if self.conv is None:
+            return
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            value = 1.0 / float(self.kernel_size)
+            for idx in range(self.channels):
+                self.conv.weight[idx, idx, :, 0].fill_(value)
+
+    def stream_context_frames(self) -> int:
+        return self.pad_t if self.enabled else 0
+
+    def init_stream_state(self, batch_size: int, *, freq_bins: int, device=None, dtype=None) -> torch.Tensor:
+        return torch.zeros(
+            batch_size,
+            self.channels,
+            self.stream_context_frames(),
+            freq_bins,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return logits
+        assert self.conv is not None
+        smooth = self.conv(F.pad(logits, (0, 0, self.pad_t, 0)))
+        return logits * (1.0 - self.blend) + smooth * self.blend
+
+    def forward_stream(
+        self,
+        logits: torch.Tensor,
+        state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.enabled:
+            return logits, logits[:, :, :0, :]
+        assert self.conv is not None
+        if state is None:
+            state = self.init_stream_state(
+                logits.shape[0],
+                freq_bins=logits.shape[-1],
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+        full = torch.cat([state, logits], dim=2)
+        new_state = full[:, :, -self.pad_t :, :]
+        smooth = self.conv(full)
+        return logits * (1.0 - self.blend) + smooth * self.blend, new_state
+
+
 class ConvPyramidSourceHead2d(nn.Module):
     """Complex-mask source head with source-folded channels."""
 
@@ -386,6 +493,8 @@ class ConvPyramidSourceHead2d(nn.Module):
         source_kernel: int,
         real_mask_scale: float,
         imag_mask_scale: float,
+        mask_logit_smoothing_kernel: int = 1,
+        mask_logit_smoothing_blend: float = 0.0,
     ) -> None:
         super().__init__()
         if source_kernel <= 0 or source_kernel % 2 != 1:
@@ -399,6 +508,7 @@ class ConvPyramidSourceHead2d(nn.Module):
         self.n_chan = int(n_chan)
         self.real_mask_scale = float(real_mask_scale)
         self.imag_mask_scale = float(imag_mask_scale)
+        out_channels = 2 * n_src * n_chan
         folded = int(n_src * hidden_channels)
         self.seed = nn.Conv2d(in_channels, folded, kernel_size=1, bias=True)
         self.refine = nn.Conv2d(
@@ -409,12 +519,33 @@ class ConvPyramidSourceHead2d(nn.Module):
             groups=n_src,
             bias=True,
         )
-        self.mask = nn.Conv2d(folded, 2 * n_src * n_chan, kernel_size=1, groups=n_src, bias=True)
+        self.mask = nn.Conv2d(folded, out_channels, kernel_size=1, groups=n_src, bias=True)
+        self.logit_smoother = MaskLogitTemporalSmoother2d(
+            out_channels,
+            kernel_size=mask_logit_smoothing_kernel,
+            blend=mask_logit_smoothing_blend,
+        )
 
-    def forward(self, x: torch.Tensor, mixture2d: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    @property
+    def has_stream_state(self) -> bool:
+        return self.logit_smoother.enabled
+
+    def stream_context_frames(self) -> int:
+        return self.logit_smoother.stream_context_frames()
+
+    def init_stream_state(self, batch_size: int, *, freq_bins: int, device=None, dtype=None) -> torch.Tensor:
+        return self.logit_smoother.init_stream_state(batch_size, freq_bins=freq_bins, device=device, dtype=dtype)
+
+    def _source_logits(self, x: torch.Tensor) -> torch.Tensor:
         source = F.relu(self.seed(x))
         source = source + F.relu(self.refine(source))
-        logits = self.mask(source)
+        return self.mask(source)
+
+    def _decode_logits(
+        self,
+        logits: torch.Tensor,
+        mixture2d: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         real = torch.sigmoid(logits[:, 0::2, :, :]) * self.real_mask_scale
         imag = torch.tanh(logits[:, 1::2, :, :]) * self.imag_mask_scale
         mask_chunks = []
@@ -423,7 +554,7 @@ class ConvPyramidSourceHead2d(nn.Module):
             mask_chunks.append(imag[:, idx : idx + 1, :, :])
         mask = torch.cat(mask_chunks, dim=1)
         y = _complex_mask_multiply(mixture2d, mask, n_src=self.n_src, n_chan=self.n_chan)
-        return y, {
+        aux = {
             "mask": mask,
             "mask_domain": "packed_complex_mask",
             "mask_logits": logits,
@@ -432,6 +563,24 @@ class ConvPyramidSourceHead2d(nn.Module):
             "mask_logits_real_scale": self.real_mask_scale,
             "mask_logits_imag_scale": self.imag_mask_scale,
         }
+        if self.logit_smoother.enabled:
+            aux["mask_logits_smoothing_kernel"] = self.logit_smoother.kernel_size
+            aux["mask_logits_smoothing_blend"] = self.logit_smoother.blend
+        return y, aux
+
+    def forward(self, x: torch.Tensor, mixture2d: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        logits = self.logit_smoother(self._source_logits(x))
+        return self._decode_logits(logits, mixture2d)
+
+    def forward_stream(
+        self,
+        x: torch.Tensor,
+        mixture2d: torch.Tensor,
+        state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+        logits, new_state = self.logit_smoother.forward_stream(self._source_logits(x), state)
+        y, aux = self._decode_logits(logits, mixture2d)
+        return y, aux, new_state
 
 
 class FoldedSourceAwareBlock2d(nn.Module):
@@ -470,6 +619,8 @@ class FoldedSourceAwareSourceHead2d(nn.Module):
         mixer_layers: int,
         real_mask_scale: float,
         imag_mask_scale: float,
+        mask_logit_smoothing_kernel: int = 1,
+        mask_logit_smoothing_blend: float = 0.0,
     ) -> None:
         super().__init__()
         if source_kernel <= 0 or source_kernel % 2 != 1:
@@ -485,6 +636,7 @@ class FoldedSourceAwareSourceHead2d(nn.Module):
         self.n_chan = int(n_chan)
         self.real_mask_scale = float(real_mask_scale)
         self.imag_mask_scale = float(imag_mask_scale)
+        out_channels = 2 * n_src * n_chan
         folded = int(n_src * hidden_channels)
         self.seed = nn.Conv2d(in_channels, folded, kernel_size=1, bias=True)
         self.source_bias = nn.Parameter(torch.zeros(1, folded, 1, 1))
@@ -494,13 +646,34 @@ class FoldedSourceAwareSourceHead2d(nn.Module):
                 for _ in range(int(mixer_layers))
             ]
         )
-        self.mask = nn.Conv2d(folded, 2 * n_src * n_chan, kernel_size=1, groups=n_src, bias=True)
+        self.mask = nn.Conv2d(folded, out_channels, kernel_size=1, groups=n_src, bias=True)
+        self.logit_smoother = MaskLogitTemporalSmoother2d(
+            out_channels,
+            kernel_size=mask_logit_smoothing_kernel,
+            blend=mask_logit_smoothing_blend,
+        )
 
-    def forward(self, x: torch.Tensor, mixture2d: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    @property
+    def has_stream_state(self) -> bool:
+        return self.logit_smoother.enabled
+
+    def stream_context_frames(self) -> int:
+        return self.logit_smoother.stream_context_frames()
+
+    def init_stream_state(self, batch_size: int, *, freq_bins: int, device=None, dtype=None) -> torch.Tensor:
+        return self.logit_smoother.init_stream_state(batch_size, freq_bins=freq_bins, device=device, dtype=dtype)
+
+    def _source_logits(self, x: torch.Tensor) -> torch.Tensor:
         source = F.relu(self.seed(x) + self.source_bias)
         for block in self.blocks:
             source = block(source)
-        logits = self.mask(source)
+        return self.mask(source)
+
+    def _decode_logits(
+        self,
+        logits: torch.Tensor,
+        mixture2d: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         real = torch.sigmoid(logits[:, 0::2, :, :]) * self.real_mask_scale
         imag = torch.tanh(logits[:, 1::2, :, :]) * self.imag_mask_scale
         mask_chunks = []
@@ -509,7 +682,7 @@ class FoldedSourceAwareSourceHead2d(nn.Module):
             mask_chunks.append(imag[:, idx : idx + 1, :, :])
         mask = torch.cat(mask_chunks, dim=1)
         y = _complex_mask_multiply(mixture2d, mask, n_src=self.n_src, n_chan=self.n_chan)
-        return y, {
+        aux = {
             "mask": mask,
             "mask_domain": "packed_complex_mask",
             "mask_logits": logits,
@@ -518,6 +691,24 @@ class FoldedSourceAwareSourceHead2d(nn.Module):
             "mask_logits_real_scale": self.real_mask_scale,
             "mask_logits_imag_scale": self.imag_mask_scale,
         }
+        if self.logit_smoother.enabled:
+            aux["mask_logits_smoothing_kernel"] = self.logit_smoother.kernel_size
+            aux["mask_logits_smoothing_blend"] = self.logit_smoother.blend
+        return y, aux
+
+    def forward(self, x: torch.Tensor, mixture2d: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        logits = self.logit_smoother(self._source_logits(x))
+        return self._decode_logits(logits, mixture2d)
+
+    def forward_stream(
+        self,
+        x: torch.Tensor,
+        mixture2d: torch.Tensor,
+        state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+        logits, new_state = self.logit_smoother.forward_stream(self._source_logits(x), state)
+        y, aux = self._decode_logits(logits, mixture2d)
+        return y, aux, new_state
 
 
 def _complex_mask_multiply(x: torch.Tensor, mask: torch.Tensor, *, n_src: int, n_chan: int) -> torch.Tensor:
@@ -564,12 +755,15 @@ class TVConvPyramidNPUSeparator2D(nn.Module):
         recurrent_layers: int = 0,
         recurrent_band_kernel: int = 3,
         recurrent_replace_blocks: int = 0,
+        upsample_mode: str = "convtranspose",
         source_head_type: str = "basic",
         source_mixer_layers: int = 1,
         mask_hidden: int = 96,
         source_kernel: int = 5,
         real_mask_scale: float = 1.0,
         imag_mask_scale: float = 0.12,
+        mask_logit_smoothing_kernel: int = 1,
+        mask_logit_smoothing_blend: float = 0.0,
     ) -> None:
         super().__init__()
         if n_freq <= 0:
@@ -606,6 +800,11 @@ class TVConvPyramidNPUSeparator2D(nn.Module):
             raise ValueError(f"recurrent_replace_blocks={recurrent_replace_blocks} exceeds n_blocks={n_blocks}.")
         self.recurrent_layers = int(recurrent_layers)
         self.recurrent_replace_blocks = int(recurrent_replace_blocks)
+        self.upsample_mode = str(upsample_mode).lower().replace("-", "_")
+        if self.upsample_mode not in {"convtranspose", "resize_conv"}:
+            raise ValueError(
+                f"upsample_mode must be one of ['convtranspose', 'resize_conv'], got {upsample_mode!r}"
+            )
 
         dilation_cycle = _as_int_tuple(time_dilation_cycle, default=(1, 1, 2, 2, 2, 1), name="time_dilation_cycle")
         conv_block_count = int(n_blocks) - int(recurrent_replace_blocks)
@@ -667,7 +866,10 @@ class TVConvPyramidNPUSeparator2D(nn.Module):
             in_size = sizes[rev_idx + 1]
             target_size = sizes[rev_idx]
             output_padding = target_size - (2 * in_size - 1)
-            up_blocks.append(ConvUpsample2d(in_ch, out_ch, output_padding=output_padding))
+            if self.upsample_mode == "resize_conv":
+                up_blocks.append(ResizeConvUpsample2d(in_ch, out_ch, target_freq=target_size))
+            else:
+                up_blocks.append(ConvUpsample2d(in_ch, out_ch, output_padding=output_padding))
         self.up_blocks = nn.ModuleList(up_blocks)
         self.output_affine = ChannelAffine2d(channels[0])
         source_head_cls = (
@@ -683,6 +885,8 @@ class TVConvPyramidNPUSeparator2D(nn.Module):
             "source_kernel": source_kernel,
             "real_mask_scale": real_mask_scale,
             "imag_mask_scale": imag_mask_scale,
+            "mask_logit_smoothing_kernel": mask_logit_smoothing_kernel,
+            "mask_logit_smoothing_blend": mask_logit_smoothing_blend,
         }
         if self.source_head_type == "folded_source_aware":
             source_head_kwargs["mixer_layers"] = int(source_mixer_layers)
@@ -717,7 +921,8 @@ class TVConvPyramidNPUSeparator2D(nn.Module):
         return y
 
     def stream_context_frames(self) -> int:
-        return sum(block.stream_context_frames() for block in self.temporal_blocks)
+        source_context = self.source_head.stream_context_frames()
+        return sum(block.stream_context_frames() for block in self.temporal_blocks) + source_context
 
     def init_stream_state(self, batch_size: int = 1, *, device=None, dtype=None):
         freq_bins = self.freq_sizes[-1]
@@ -729,12 +934,19 @@ class TVConvPyramidNPUSeparator2D(nn.Module):
             block.init_stream_state(batch_size, freq_bins=freq_bins, device=device, dtype=dtype)
             for block in self.recurrent_blocks
         )
-        return (*temporal_states, *recurrent_states)
+        source_state = (
+            (self.source_head.init_stream_state(batch_size, freq_bins=self.n_freq, device=device, dtype=dtype),)
+            if self.source_head.has_stream_state
+            else ()
+        )
+        return (*temporal_states, *recurrent_states, *source_state)
 
     def forward_stream(self, x: torch.Tensor, state=None):
         if state is None:
             state = self.init_stream_state(batch_size=x.shape[0], device=x.device, dtype=x.dtype)
         expected_states = len(self.temporal_blocks) + len(self.recurrent_blocks)
+        if self.source_head.has_stream_state:
+            expected_states += 1
         if len(state) != expected_states:
             raise ValueError(f"Expected {expected_states} streaming states, got {len(state)}")
         skips = []
@@ -745,7 +957,9 @@ class TVConvPyramidNPUSeparator2D(nn.Module):
             skips.append(h)
         new_states = []
         temporal_state = state[: len(self.temporal_blocks)]
-        recurrent_state = state[len(self.temporal_blocks) :]
+        recurrent_state_end = len(self.temporal_blocks) + len(self.recurrent_blocks)
+        recurrent_state = state[len(self.temporal_blocks) : recurrent_state_end]
+        source_state = state[-1] if self.source_head.has_stream_state else None
         for block, block_state in zip(self.temporal_blocks, temporal_state, strict=True):
             h, new_state = block.forward_stream(h, block_state)
             new_states.append(new_state)
@@ -755,7 +969,11 @@ class TVConvPyramidNPUSeparator2D(nn.Module):
         for up, skip in zip(self.up_blocks, reversed(skips[:-1]), strict=True):
             h = up(h, skip)
         h = self.output_affine(h)
-        y, aux = self.source_head(h, x)
+        if self.source_head.has_stream_state:
+            y, aux, new_source_state = self.source_head.forward_stream(h, x, source_state)
+            new_states.append(new_source_state)
+        else:
+            y, aux = self.source_head(h, x)
         self._last_aux = aux
         return y, tuple(new_states)
 
@@ -813,12 +1031,15 @@ def build_tvconv_pyramid_npu_separator_system(
     recurrent_layers: int = 0,
     recurrent_band_kernel: int = 3,
     recurrent_replace_blocks: int = 0,
+    upsample_mode: str = "convtranspose",
     source_head_type: str = "basic",
     source_mixer_layers: int = 1,
     mask_hidden: int = 96,
     source_kernel: int = 5,
     real_mask_scale: float = 1.0,
     imag_mask_scale: float = 0.12,
+    mask_logit_smoothing_kernel: int = 1,
+    mask_logit_smoothing_blend: float = 0.0,
     residual_source_enabled: bool = True,
     residual_source_index: int | None = None,
     scaling: bool = False,
@@ -907,12 +1128,15 @@ def build_tvconv_pyramid_npu_separator_system(
         recurrent_layers=recurrent_layers,
         recurrent_band_kernel=recurrent_band_kernel,
         recurrent_replace_blocks=recurrent_replace_blocks,
+        upsample_mode=upsample_mode,
         source_head_type=source_head_type,
         source_mixer_layers=source_mixer_layers,
         mask_hidden=mask_hidden,
         source_kernel=source_kernel,
         real_mask_scale=real_mask_scale,
         imag_mask_scale=imag_mask_scale,
+        mask_logit_smoothing_kernel=mask_logit_smoothing_kernel,
+        mask_logit_smoothing_blend=mask_logit_smoothing_blend,
     )
     model = FrequencyPreprocessedOnlineModel(
         core=core,

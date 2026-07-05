@@ -11,6 +11,7 @@ sfc_loco_routing_kernel_size: [1, 3]
 sfc_loco_dilation_cycle: [1, 2]
 sfc_loco_expansion: 2
 sfc_loco_ffn_expansion: 4
+sfc_loco_source_head_type: sourcewise_pointwise
 sfc_loco_source_head_channels: 128
 sfc_loco_source_refine_layers: 1
 sfc_loco_source_kernel_size: 5
@@ -60,6 +61,7 @@ task:
         dilation_cycle: ${sfc_loco_dilation_cycle}
         expansion: ${sfc_loco_expansion}
         ffn_expansion: ${sfc_loco_ffn_expansion}
+        source_head_type: ${sfc_loco_source_head_type}
         source_head_channels: ${sfc_loco_source_head_channels}
         source_refine_layers: ${sfc_loco_source_refine_layers}
         source_kernel_size: ${sfc_loco_source_kernel_size}
