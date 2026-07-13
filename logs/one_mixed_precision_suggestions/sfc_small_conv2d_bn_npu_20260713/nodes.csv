@@ -1,0 +1,183 @@
+rank,score,name,op,depth,rough_ops,latency_risk,boundary_risk,qerror,output_shape,producers,consumers,reasons
+1,90.371,/decoder/output/Conv,CONV_2D,105,110700,21.599,13.000,0,1x1x1025x6,129,131,"quality-sensitive CONV_2D; name hint: out,decoder; late-stage node; matched prefer-regex"
+2,74.635,/time_proj/conv_7/Conv,CONV_2D,91,1638400,24.754,13.000,0,1x1x64x160,115,117,quality-sensitive CONV_2D; late-stage node; matched prefer-regex
+3,74.635,/ffn/ffn.1/conv_7/Conv,CONV_2D,94,1638400,24.754,13.000,0,1x1x64x160,118,120,quality-sensitive CONV_2D; late-stage node; matched prefer-regex
+4,74.189,/conv_7/Conv;/act_7/Relu,CONV_2D,90,3276800,25.565,13.000,0,1x1x64x160,96,116,quality-sensitive CONV_2D; late-stage node; matched prefer-regex
+5,72.850,/ffn/ffn.0/conv_7/Conv;/ffn/ffn.0/act_7/Relu,CONV_2D,93,26214400,28.000,13.000,0,1x1x64x640,117,119,quality-sensitive CONV_2D; late-stage node; matched prefer-regex
+6,64.635,/freq_mix/freq_mix.1/conv/Conv,CONV_2D,10,1638400,24.754,13.000,0,1x1x64x160,9,11,quality-sensitive CONV_2D; matched prefer-regex
+7,64.635,/time_proj/conv/Conv,CONV_2D,14,1638400,24.754,13.000,0,1x1x64x160,14,16,quality-sensitive CONV_2D; matched prefer-regex
+8,64.635,/ffn/ffn.1/conv/Conv,CONV_2D,17,1638400,24.754,13.000,0,1x1x64x160,17,19,quality-sensitive CONV_2D; matched prefer-regex
+9,64.635,/freq_mix/freq_mix.1/conv_1/Conv,CONV_2D,21,1638400,24.754,13.000,0,1x1x64x160,21,23,quality-sensitive CONV_2D; matched prefer-regex
+10,64.635,/time_proj/conv_1/Conv,CONV_2D,25,1638400,24.754,13.000,0,1x1x64x160,26,28,quality-sensitive CONV_2D; matched prefer-regex
+11,64.635,/ffn/ffn.1/conv_1/Conv,CONV_2D,28,1638400,24.754,13.000,0,1x1x64x160,29,31,quality-sensitive CONV_2D; matched prefer-regex
+12,64.635,/freq_mix/freq_mix.1/conv_2/Conv,CONV_2D,32,1638400,24.754,13.000,0,1x1x64x160,33,35,quality-sensitive CONV_2D; matched prefer-regex
+13,64.635,/time_proj/conv_2/Conv,CONV_2D,36,1638400,24.754,13.000,0,1x1x64x160,38,40,quality-sensitive CONV_2D; matched prefer-regex
+14,64.635,/ffn/ffn.1/conv_2/Conv,CONV_2D,39,1638400,24.754,13.000,0,1x1x64x160,41,43,quality-sensitive CONV_2D; matched prefer-regex
+15,64.635,/freq_mix/freq_mix.1/conv_3/Conv,CONV_2D,43,1638400,24.754,13.000,0,1x1x64x160,45,47,quality-sensitive CONV_2D; matched prefer-regex
+16,64.635,/time_proj/conv_3/Conv,CONV_2D,47,1638400,24.754,13.000,0,1x1x64x160,50,52,quality-sensitive CONV_2D; matched prefer-regex
+17,64.635,/ffn/ffn.1/conv_3/Conv,CONV_2D,50,1638400,24.754,13.000,0,1x1x64x160,53,55,quality-sensitive CONV_2D; matched prefer-regex
+18,64.635,/freq_mix/freq_mix.1/conv_4/Conv,CONV_2D,54,1638400,24.754,13.000,0,1x1x64x160,57,59,quality-sensitive CONV_2D; matched prefer-regex
+19,64.635,/time_proj/conv_4/Conv,CONV_2D,58,1638400,24.754,13.000,0,1x1x64x160,62,64,quality-sensitive CONV_2D; matched prefer-regex
+20,64.635,/ffn/ffn.1/conv_4/Conv,CONV_2D,61,1638400,24.754,13.000,0,1x1x64x160,65,67,quality-sensitive CONV_2D; matched prefer-regex
+21,64.635,/freq_mix/freq_mix.1/conv_5/Conv,CONV_2D,65,1638400,24.754,13.000,0,1x1x64x160,69,71,quality-sensitive CONV_2D; matched prefer-regex
+22,64.635,/time_proj/conv_5/Conv,CONV_2D,69,1638400,24.754,13.000,0,1x1x64x160,74,76,quality-sensitive CONV_2D; matched prefer-regex
+23,64.635,/ffn/ffn.1/conv_5/Conv,CONV_2D,72,1638400,24.754,13.000,0,1x1x64x160,77,79,quality-sensitive CONV_2D; matched prefer-regex
+24,64.635,/freq_mix/freq_mix.1/conv_6/Conv,CONV_2D,76,1638400,24.754,13.000,0,1x1x64x160,81,83,quality-sensitive CONV_2D; matched prefer-regex
+25,64.635,/time_proj/conv_6/Conv,CONV_2D,80,1638400,24.754,13.000,0,1x1x64x160,86,88,quality-sensitive CONV_2D; matched prefer-regex
+26,64.635,/ffn/ffn.1/conv_6/Conv,CONV_2D,83,1638400,24.754,13.000,0,1x1x64x160,89,91,quality-sensitive CONV_2D; matched prefer-regex
+27,64.635,/freq_mix/freq_mix.1/conv_7/Conv,CONV_2D,87,1638400,24.754,13.000,0,1x1x64x160,93,95,quality-sensitive CONV_2D; matched prefer-regex
+28,64.189,/down/down.3/conv/Conv;/down/down.3/act/Relu,CONV_2D,7,3276800,25.565,13.000,0,1x1x64x160,6,8;11,quality-sensitive CONV_2D; matched prefer-regex
+29,64.189,/conv/Conv;/act/Relu,CONV_2D,13,3276800,25.565,13.000,0,1x1x64x160,13,15,quality-sensitive CONV_2D; matched prefer-regex
+30,64.189,/conv_1/Conv;/act_1/Relu,CONV_2D,24,3276800,25.565,13.000,0,1x1x64x160,25,27,quality-sensitive CONV_2D; matched prefer-regex
+31,64.189,/conv_2/Conv;/act_2/Relu,CONV_2D,35,3276800,25.565,13.000,0,1x1x64x160,37,39,quality-sensitive CONV_2D; matched prefer-regex
+32,64.189,/conv_3/Conv;/act_3/Relu,CONV_2D,46,3276800,25.565,13.000,0,1x1x64x160,49,51,quality-sensitive CONV_2D; matched prefer-regex
+33,64.189,/conv_4/Conv;/act_4/Relu,CONV_2D,57,3276800,25.565,13.000,0,1x1x64x160,61,63,quality-sensitive CONV_2D; matched prefer-regex
+34,64.189,/conv_5/Conv;/act_5/Relu,CONV_2D,68,3276800,25.565,13.000,0,1x1x64x160,73,75,quality-sensitive CONV_2D; matched prefer-regex
+35,64.189,/conv_6/Conv;/act_6/Relu,CONV_2D,79,3276800,25.565,13.000,0,1x1x64x160,85,87,quality-sensitive CONV_2D; matched prefer-regex
+36,63.952,/down/down.2/conv/Conv;/down/down.2/act/Relu,CONV_2D,6,4734976,25.996,13.000,0,1x1x128x136,5,7,quality-sensitive CONV_2D; matched prefer-regex
+37,63.928,/freq_mix/freq_mix.0/conv/Conv;/freq_mix/freq_mix.0/act/Relu,CONV_2D,9,4915200,26.040,13.000,0,1x1x64x160,8,10,quality-sensitive CONV_2D; matched prefer-regex
+38,63.928,/freq_mix/freq_mix.0/conv_1/Conv;/freq_mix/freq_mix.0/act_1/Relu,CONV_2D,20,4915200,26.040,13.000,0,1x1x64x160,20,22,quality-sensitive CONV_2D; matched prefer-regex
+39,63.928,/freq_mix/freq_mix.0/conv_2/Conv;/freq_mix/freq_mix.0/act_2/Relu,CONV_2D,31,4915200,26.040,13.000,0,1x1x64x160,32,34,quality-sensitive CONV_2D; matched prefer-regex
+40,63.928,/freq_mix/freq_mix.0/conv_3/Conv;/freq_mix/freq_mix.0/act_3/Relu,CONV_2D,42,4915200,26.040,13.000,0,1x1x64x160,44,46,quality-sensitive CONV_2D; matched prefer-regex
+41,63.928,/freq_mix/freq_mix.0/conv_4/Conv;/freq_mix/freq_mix.0/act_4/Relu,CONV_2D,53,4915200,26.040,13.000,0,1x1x64x160,56,58,quality-sensitive CONV_2D; matched prefer-regex
+42,63.928,/freq_mix/freq_mix.0/conv_5/Conv;/freq_mix/freq_mix.0/act_5/Relu,CONV_2D,64,4915200,26.040,13.000,0,1x1x64x160,68,70,quality-sensitive CONV_2D; matched prefer-regex
+43,63.928,/freq_mix/freq_mix.0/conv_6/Conv;/freq_mix/freq_mix.0/act_6/Relu,CONV_2D,75,4915200,26.040,13.000,0,1x1x64x160,80,82,quality-sensitive CONV_2D; matched prefer-regex
+44,63.928,/freq_mix/freq_mix.0/conv_7/Conv;/freq_mix/freq_mix.0/act_7/Relu,CONV_2D,86,4915200,26.040,13.000,0,1x1x64x160,92,94,quality-sensitive CONV_2D; matched prefer-regex
+45,63.756,/down/down.1/conv/Conv;/down/down.1/act/Relu,CONV_2D,5,6422528,26.353,13.000,0,1x1x256x112,4,6,quality-sensitive CONV_2D; matched prefer-regex
+46,63.359,/down/down.0/conv/Conv;/down/down.0/act/Relu,CONV_2D,4,11894784,27.075,13.000,0,1x1x512x88,3,5,quality-sensitive CONV_2D; matched prefer-regex
+47,63.322,/input/conv/Conv;/input/act/Relu,CONV_2D,3,12595200,27.142,13.000,0,1x1x1025x64,2,4,quality-sensitive CONV_2D; matched prefer-regex
+48,62.850,/ffn/ffn.0/conv/Conv;/ffn/ffn.0/act/Relu,CONV_2D,16,26214400,28.000,13.000,0,1x1x64x640,16,18,quality-sensitive CONV_2D; matched prefer-regex
+49,62.850,/ffn/ffn.0/conv_1/Conv;/ffn/ffn.0/act_1/Relu,CONV_2D,27,26214400,28.000,13.000,0,1x1x64x640,28,30,quality-sensitive CONV_2D; matched prefer-regex
+50,62.850,/ffn/ffn.0/conv_2/Conv;/ffn/ffn.0/act_2/Relu,CONV_2D,38,26214400,28.000,13.000,0,1x1x64x640,40,42,quality-sensitive CONV_2D; matched prefer-regex
+51,62.850,/ffn/ffn.0/conv_3/Conv;/ffn/ffn.0/act_3/Relu,CONV_2D,49,26214400,28.000,13.000,0,1x1x64x640,52,54,quality-sensitive CONV_2D; matched prefer-regex
+52,62.850,/ffn/ffn.0/conv_4/Conv;/ffn/ffn.0/act_4/Relu,CONV_2D,60,26214400,28.000,13.000,0,1x1x64x640,64,66,quality-sensitive CONV_2D; matched prefer-regex
+53,62.850,/ffn/ffn.0/conv_5/Conv;/ffn/ffn.0/act_5/Relu,CONV_2D,71,26214400,28.000,13.000,0,1x1x64x640,76,78,quality-sensitive CONV_2D; matched prefer-regex
+54,62.850,/ffn/ffn.0/conv_6/Conv;/ffn/ffn.0/act_6/Relu,CONV_2D,82,26214400,28.000,13.000,0,1x1x64x640,88,90,quality-sensitive CONV_2D; matched prefer-regex
+55,43.780,/Mul,MUL,109,1025,8.128,5.000,0,1x1x1025x1,114;133,140,late-stage node
+56,43.780,/Mul_1,MUL,109,1025,8.128,5.000,0,1x1x1025x1,136;138,140,late-stage node
+57,43.780,/Mul_2,MUL,109,1025,8.128,5.000,0,1x1x1025x1,141;142,147,late-stage node
+58,43.780,/Mul_3,MUL,109,1025,8.128,5.000,0,1x1x1025x1,144;145,147,late-stage node
+59,43.780,/Mul_4,MUL,109,1025,8.128,5.000,0,1x1x1025x1,148;150,156,late-stage node
+60,43.780,/Mul_5,MUL,109,1025,8.128,5.000,0,1x1x1025x1,152;154,156,late-stage node
+61,43.780,/Mul_6,MUL,109,1025,8.128,5.000,0,1x1x1025x1,157;158,163,late-stage node
+62,43.780,/Mul_7,MUL,109,1025,8.128,5.000,0,1x1x1025x1,160;161,163,late-stage node
+63,43.780,/Mul_8,MUL,109,1025,8.128,5.000,0,1x1x1025x1,164;166,172,late-stage node
+64,43.780,/Mul_9,MUL,109,1025,8.128,5.000,0,1x1x1025x1,168;170,172,late-stage node
+65,43.780,/Mul_10,MUL,109,1025,8.128,5.000,0,1x1x1025x1,173;174,179,late-stage node
+66,43.780,/Mul_11,MUL,109,1025,8.128,5.000,0,1x1x1025x1,176;177,179,late-stage node
+67,34.962,/decoder/up/up.0/bn/BatchNormalization;/decoder/up/up.0/act/Relu/Relu,RELU,97,17408,11.434,13.000,0,1x1x128x136,121,123,name hint: decoder; late-stage node; matched prefer-regex
+68,34.640,/decoder/up/up.1/bn/BatchNormalization;/decoder/up/up.1/act/Relu/Relu,RELU,99,28672,12.017,13.000,0,1x1x256x112,123,125,name hint: decoder; late-stage node; matched prefer-regex
+69,34.349,/decoder/up/up.2/bn/BatchNormalization;/decoder/up/up.2/act/Relu/Relu,RELU,101,45056,12.547,13.000,0,1x1x512x88,125,127,name hint: decoder; late-stage node; matched prefer-regex
+70,34.108,/decoder/up/up.3/bn/BatchNormalization;/decoder/up/up.3/act/Relu/Relu,RELU,103,65600,12.986,13.000,0,1x1x1025x64,127,129,name hint: decoder; late-stage node; matched prefer-regex
+71,33.780,/Sub,SUB,110,1025,8.128,13.000,0,1x1x1025x1,134;139,180,late-stage node
+72,33.780,/Add_25,ADD,110,1025,8.128,13.000,0,1x1x1025x1,143;146,180,late-stage node
+73,33.780,/Sub_1,SUB,110,1025,8.128,13.000,0,1x1x1025x1,151;155,180,late-stage node
+74,33.780,/Add_26,ADD,110,1025,8.128,13.000,0,1x1x1025x1,159;162,180,late-stage node
+75,33.780,/Sub_2,SUB,110,1025,8.128,13.000,0,1x1x1025x1,167;171,180,late-stage node
+76,33.780,/Add_27,ADD,110,1025,8.128,13.000,0,1x1x1025x1,175;178,180,late-stage node
+77,32.303,/Add_23,ADD,92,10240,10.813,13.000,0,1x1x64x160,95;116,118;120,late-stage node
+78,32.303,/Add_24,ADD,95,10240,10.813,13.000,0,1x1x64x160,117;119,121,late-stage node
+79,22.303,/Add_1,ADD,11,10240,10.813,13.000,0,1x1x64x160,7;10,13;16,low-priority fallback
+80,22.303,/Add_2,ADD,15,10240,10.813,13.000,0,1x1x64x160,11;15,17;19,low-priority fallback
+81,22.303,/Add_3,ADD,18,10240,10.813,13.000,0,1x1x64x160,16;18,20;23,low-priority fallback
+82,22.303,/Add_4,ADD,22,10240,10.813,13.000,0,1x1x64x160,19;22,25;28,low-priority fallback
+83,22.303,/Add_5,ADD,26,10240,10.813,13.000,0,1x1x64x160,23;27,29;31,low-priority fallback
+84,22.303,/Add_6,ADD,29,10240,10.813,13.000,0,1x1x64x160,28;30,32;35,low-priority fallback
+85,22.303,/Add_7,ADD,33,10240,10.813,13.000,0,1x1x64x160,31;34,37;40,low-priority fallback
+86,22.303,/Add_8,ADD,37,10240,10.813,13.000,0,1x1x64x160,35;39,41;43,low-priority fallback
+87,22.303,/Add_9,ADD,40,10240,10.813,13.000,0,1x1x64x160,40;42,44;47,low-priority fallback
+88,22.303,/Add_10,ADD,44,10240,10.813,13.000,0,1x1x64x160,43;46,49;52,low-priority fallback
+89,22.303,/Add_11,ADD,48,10240,10.813,13.000,0,1x1x64x160,47;51,53;55,low-priority fallback
+90,22.303,/Add_12,ADD,51,10240,10.813,13.000,0,1x1x64x160,52;54,56;59,low-priority fallback
+91,22.303,/Add_13,ADD,55,10240,10.813,13.000,0,1x1x64x160,55;58,61;64,low-priority fallback
+92,22.303,/Add_14,ADD,59,10240,10.813,13.000,0,1x1x64x160,59;63,65;67,low-priority fallback
+93,22.303,/Add_15,ADD,62,10240,10.813,13.000,0,1x1x64x160,64;66,68;71,low-priority fallback
+94,22.303,/Add_16,ADD,66,10240,10.813,13.000,0,1x1x64x160,67;70,73;76,low-priority fallback
+95,22.303,/Add_17,ADD,70,10240,10.813,13.000,0,1x1x64x160,71;75,77;79,low-priority fallback
+96,22.303,/Add_18,ADD,73,10240,10.813,13.000,0,1x1x64x160,76;78,80;83,low-priority fallback
+97,22.303,/Add_19,ADD,77,10240,10.813,13.000,0,1x1x64x160,79;82,85;88,low-priority fallback
+98,22.303,/Add_20,ADD,81,10240,10.813,13.000,0,1x1x64x160,83;87,89;91,low-priority fallback
+99,22.303,/Add_21,ADD,84,10240,10.813,13.000,0,1x1x64x160,88;90,92;95,low-priority fallback
+100,22.303,/Add_22,ADD,88,10240,10.813,13.000,0,1x1x64x160,91;94,96;117,low-priority fallback
+101,10.631,/decoder/output/Conv/post_tr,TRANSPOSE,106,6150,10.217,17.000,0,1x6x1x1025,130,132;137;149;153;165;169,"name hint: out,decoder; late-stage node; matched prefer-regex; memory/shape op: avoid isolated int16"
+102,3.106,/decoder/output/Conv/pads,PAD,104,65728,12.989,25.000,0,1x1x1027x64,128,130,"name hint: out,decoder; late-stage node; matched prefer-regex; memory/shape op: avoid isolated int16"
+103,-5.048,/decoder/up/up.0/bn/BatchNormalization;/decoder/up/up.0/act/Relu/TransposeConv,TRANSPOSE_CONV,96,4734976,25.996,13.000,0,1x1x128x136,120,122,quality-sensitive TRANSPOSE_CONV; name hint: decoder; late-stage node; matched prefer-regex; matched skip-regex
+104,-5.244,/decoder/up/up.1/bn/BatchNormalization;/decoder/up/up.1/act/Relu/TransposeConv,TRANSPOSE_CONV,98,6422528,26.353,13.000,0,1x1x256x112,122,124,quality-sensitive TRANSPOSE_CONV; name hint: decoder; late-stage node; matched prefer-regex; matched skip-regex
+105,-5.380,/decoder/up/up.2/bn/BatchNormalization;/decoder/up/up.2/act/Relu/TransposeConv,TRANSPOSE_CONV,100,7929856,26.600,13.000,0,1x1x512x88,124,126,quality-sensitive TRANSPOSE_CONV; name hint: decoder; late-stage node; matched prefer-regex; matched skip-regex
+106,-5.678,/decoder/up/up.3/bn/BatchNormalization;/decoder/up/up.3/act/Relu/TransposeConv,TRANSPOSE_CONV,102,12595200,27.142,13.000,0,1x1x1025x64,126,128,quality-sensitive TRANSPOSE_CONV; name hint: decoder; late-stage node; matched prefer-regex; matched skip-regex
+107,-18.665,/input/conv/Conv/pads,PAD,2,2054,8.936,25.000,0,1x1x1027x2,1,3,matched prefer-regex; memory/shape op: avoid isolated int16
+108,-19.717,/freq_mix/freq_mix.0/conv/Conv/pads,PAD,8,10560,10.849,25.000,0,1x1x66x160,7,9,matched prefer-regex; memory/shape op: avoid isolated int16
+109,-19.717,/freq_mix/freq_mix.0/conv_1/Conv/pads,PAD,19,10560,10.849,25.000,0,1x1x66x160,19,21,matched prefer-regex; memory/shape op: avoid isolated int16
+110,-19.717,/freq_mix/freq_mix.0/conv_2/Conv/pads,PAD,30,10560,10.849,25.000,0,1x1x66x160,31,33,matched prefer-regex; memory/shape op: avoid isolated int16
+111,-19.717,/freq_mix/freq_mix.0/conv_3/Conv/pads,PAD,41,10560,10.849,25.000,0,1x1x66x160,43,45,matched prefer-regex; memory/shape op: avoid isolated int16
+112,-19.717,/freq_mix/freq_mix.0/conv_4/Conv/pads,PAD,52,10560,10.849,25.000,0,1x1x66x160,55,57,matched prefer-regex; memory/shape op: avoid isolated int16
+113,-19.717,/freq_mix/freq_mix.0/conv_5/Conv/pads,PAD,63,10560,10.849,25.000,0,1x1x66x160,67,69,matched prefer-regex; memory/shape op: avoid isolated int16
+114,-19.717,/freq_mix/freq_mix.0/conv_6/Conv/pads,PAD,74,10560,10.849,25.000,0,1x1x66x160,79,81,matched prefer-regex; memory/shape op: avoid isolated int16
+115,-19.717,/freq_mix/freq_mix.0/conv_7/Conv/pads,PAD,85,10560,10.849,25.000,0,1x1x66x160,91,93,matched prefer-regex; memory/shape op: avoid isolated int16
+116,-29.369,/Concat_8,CONCATENATION,111,6150,10.217,25.000,0,1x1x1025x6,140;147;156;163;172;179,181,late-stage node; memory/shape op: avoid isolated int16
+117,-40.143,/Concat,CONCATENATION,12,20480,11.624,25.000,0,1x2x64x160,11;12,14;111,memory/shape op: avoid isolated int16
+118,-40.143,/Concat_1,CONCATENATION,23,20480,11.624,25.000,0,1x2x64x160,23;24,26;109,memory/shape op: avoid isolated int16
+119,-40.143,/Concat_2,CONCATENATION,34,20480,11.624,25.000,0,1x2x64x160,35;36,38;107,memory/shape op: avoid isolated int16
+120,-40.143,/Concat_3,CONCATENATION,45,20480,11.624,25.000,0,1x2x64x160,47;48,50;105,memory/shape op: avoid isolated int16
+121,-40.143,/Concat_4,CONCATENATION,56,20480,11.624,25.000,0,1x2x64x160,59;60,62;103,memory/shape op: avoid isolated int16
+122,-40.143,/Concat_5,CONCATENATION,67,20480,11.624,25.000,0,1x2x64x160,71;72,74;101,memory/shape op: avoid isolated int16
+123,-40.143,/Concat_6,CONCATENATION,78,20480,11.624,25.000,0,1x2x64x160,83;84,86;99,memory/shape op: avoid isolated int16
+124,-40.143,/Concat_7,CONCATENATION,89,20480,11.624,25.000,0,1x2x64x160,0;95,97;115,memory/shape op: avoid isolated int16
+125,-96.494,/Concat_8/Transpose_0.3.1.2,TRANSPOSE,112,6150,10.217,14.500,0,1x6x1x1025,180,,graph output path; late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+126,-102.822,/Slice_7,STRIDED_SLICE,91,10240,10.813,22.500,0,1x160x1x64,97,,graph output path; late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+127,-110.789,/input/conv/Conv/pads/Transpose_0.2.3.1,TRANSPOSE,1,2050,8.934,14.500,0,1x1x1025x2,,2,matched prefer-regex; memory/shape op: avoid isolated int16; matched skip-regex
+128,-112.822,/Slice_6,STRIDED_SLICE,80,10240,10.813,22.500,0,1x160x1x64,99,,graph output path; memory/shape op: avoid isolated int16; matched skip-regex
+129,-112.822,/Slice_5,STRIDED_SLICE,69,10240,10.813,22.500,0,1x160x1x64,101,,graph output path; memory/shape op: avoid isolated int16; matched skip-regex
+130,-112.822,/Slice_4,STRIDED_SLICE,58,10240,10.813,22.500,0,1x160x1x64,103,,graph output path; memory/shape op: avoid isolated int16; matched skip-regex
+131,-112.822,/Slice_3,STRIDED_SLICE,47,10240,10.813,22.500,0,1x160x1x64,105,,graph output path; memory/shape op: avoid isolated int16; matched skip-regex
+132,-112.822,/Slice_2,STRIDED_SLICE,36,10240,10.813,22.500,0,1x160x1x64,107,,graph output path; memory/shape op: avoid isolated int16; matched skip-regex
+133,-112.822,/Slice_1,STRIDED_SLICE,25,10240,10.813,22.500,0,1x160x1x64,109,,graph output path; memory/shape op: avoid isolated int16; matched skip-regex
+134,-112.822,/Slice,STRIDED_SLICE,14,10240,10.813,22.500,0,1x160x1x64,111,,graph output path; memory/shape op: avoid isolated int16; matched skip-regex
+135,-122.220,/Mul/Transpose_0.2.3.1_270,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,132,134,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+136,-122.220,/Mul_1/Transpose_0.2.3.1_277,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,137,139,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+137,-122.220,/Mul_2/Transpose_0.2.3.1_281,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,137,143,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+138,-122.220,/Mul_3/Transpose_0.2.3.1_284,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,132,146,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+139,-122.220,/Mul_4/Transpose_0.2.3.1_291,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,149,151,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+140,-122.220,/Mul_5/Transpose_0.2.3.1_297,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,153,155,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+141,-122.220,/Mul_6/Transpose_0.2.3.1_301,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,153,159,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+142,-122.220,/Mul_7/Transpose_0.2.3.1_304,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,149,162,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+143,-122.220,/Mul_8/Transpose_0.2.3.1_311,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,165,167,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+144,-122.220,/Mul_9/Transpose_0.2.3.1_317,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,169,171,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+145,-122.220,/Mul_10/Transpose_0.2.3.1_321,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,169,175,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+146,-122.220,/Mul_11/Transpose_0.2.3.1_324,TRANSPOSE,108,1025,8.128,17.000,0,1x1x1025x1,165,178,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+147,-124.143,/Concat_7/Transpose_0.3.1.2,TRANSPOSE,90,20480,11.624,17.000,0,1x160x2x64,96,98,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+148,-128.220,/Slice_10,STRIDED_SLICE,107,1025,8.128,25.000,0,1x1x1x1025,131,133;145,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+149,-128.220,/Slice_11,STRIDED_SLICE,107,1025,8.128,25.000,0,1x1x1x1025,131,138;142,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+150,-128.220,/Slice_12,STRIDED_SLICE,107,1025,8.128,25.000,0,1x1x1x1025,131,150;161,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+151,-128.220,/Slice_13,STRIDED_SLICE,107,1025,8.128,25.000,0,1x1x1x1025,131,154;158,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+152,-128.220,/Slice_14,STRIDED_SLICE,107,1025,8.128,25.000,0,1x1x1x1025,131,166;177,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+153,-128.220,/Slice_15,STRIDED_SLICE,107,1025,8.128,25.000,0,1x1x1x1025,131,170;174,late-stage node; memory/shape op: avoid isolated int16; matched skip-regex
+154,-131.822,/Concat_7/Transpose_0.2.3.1,TRANSPOSE,1,10240,10.813,14.500,0,1x1x64x160,,96,memory/shape op: avoid isolated int16; matched skip-regex
+155,-131.822,/Concat/Transpose_0.2.3.1,TRANSPOSE,1,10240,10.813,14.500,0,1x1x64x160,,13,memory/shape op: avoid isolated int16; matched skip-regex
+156,-131.822,/Concat_1/Transpose_0.2.3.1,TRANSPOSE,1,10240,10.813,14.500,0,1x1x64x160,,25,memory/shape op: avoid isolated int16; matched skip-regex
+157,-131.822,/Concat_2/Transpose_0.2.3.1,TRANSPOSE,1,10240,10.813,14.500,0,1x1x64x160,,37,memory/shape op: avoid isolated int16; matched skip-regex
+158,-131.822,/Concat_3/Transpose_0.2.3.1,TRANSPOSE,1,10240,10.813,14.500,0,1x1x64x160,,49,memory/shape op: avoid isolated int16; matched skip-regex
+159,-131.822,/Concat_4/Transpose_0.2.3.1,TRANSPOSE,1,10240,10.813,14.500,0,1x1x64x160,,61,memory/shape op: avoid isolated int16; matched skip-regex
+160,-131.822,/Concat_5/Transpose_0.2.3.1,TRANSPOSE,1,10240,10.813,14.500,0,1x1x64x160,,73,memory/shape op: avoid isolated int16; matched skip-regex
+161,-131.822,/Concat_6/Transpose_0.2.3.1,TRANSPOSE,1,10240,10.813,14.500,0,1x1x64x160,,85,memory/shape op: avoid isolated int16; matched skip-regex
+162,-132.220,/Mul/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,113,134,memory/shape op: avoid isolated int16; matched skip-regex
+163,-132.220,/Mul_1/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,135,139,memory/shape op: avoid isolated int16; matched skip-regex
+164,-132.220,/Mul_2/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,113,143,memory/shape op: avoid isolated int16; matched skip-regex
+165,-132.220,/Mul_3/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,135,146,memory/shape op: avoid isolated int16; matched skip-regex
+166,-132.220,/Mul_4/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,113,151,memory/shape op: avoid isolated int16; matched skip-regex
+167,-132.220,/Mul_5/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,135,155,memory/shape op: avoid isolated int16; matched skip-regex
+168,-132.220,/Mul_6/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,113,159,memory/shape op: avoid isolated int16; matched skip-regex
+169,-132.220,/Mul_7/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,135,162,memory/shape op: avoid isolated int16; matched skip-regex
+170,-132.220,/Mul_8/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,113,167,memory/shape op: avoid isolated int16; matched skip-regex
+171,-132.220,/Mul_9/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,135,171,memory/shape op: avoid isolated int16; matched skip-regex
+172,-132.220,/Mul_10/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,113,175,memory/shape op: avoid isolated int16; matched skip-regex
+173,-132.220,/Mul_11/Transpose_0.2.3.1,TRANSPOSE,2,1025,8.128,17.000,0,1x1x1025x1,135,178,memory/shape op: avoid isolated int16; matched skip-regex
+174,-134.143,/Concat_6/Transpose_0.3.1.2,TRANSPOSE,79,20480,11.624,17.000,0,1x160x2x64,85,100,memory/shape op: avoid isolated int16; matched skip-regex
+175,-134.143,/Concat_5/Transpose_0.3.1.2,TRANSPOSE,68,20480,11.624,17.000,0,1x160x2x64,73,102,memory/shape op: avoid isolated int16; matched skip-regex
+176,-134.143,/Concat_4/Transpose_0.3.1.2,TRANSPOSE,57,20480,11.624,17.000,0,1x160x2x64,61,104,memory/shape op: avoid isolated int16; matched skip-regex
+177,-134.143,/Concat_3/Transpose_0.3.1.2,TRANSPOSE,46,20480,11.624,17.000,0,1x160x2x64,49,106,memory/shape op: avoid isolated int16; matched skip-regex
+178,-134.143,/Concat_2/Transpose_0.3.1.2,TRANSPOSE,35,20480,11.624,17.000,0,1x160x2x64,37,108,memory/shape op: avoid isolated int16; matched skip-regex
+179,-134.143,/Concat_1/Transpose_0.3.1.2,TRANSPOSE,24,20480,11.624,17.000,0,1x160x2x64,25,110,memory/shape op: avoid isolated int16; matched skip-regex
+180,-134.143,/Concat/Transpose_0.3.1.2,TRANSPOSE,13,20480,11.624,17.000,0,1x160x2x64,13,112,memory/shape op: avoid isolated int16; matched skip-regex
+181,-136.345,/Slice_8,STRIDED_SLICE,1,1025,8.128,22.500,0,1x1x1x1025,,114;141;148;157;164;173,memory/shape op: avoid isolated int16; matched skip-regex
+182,-136.345,/Slice_9,STRIDED_SLICE,1,1025,8.128,22.500,0,1x1x1x1025,,136;144;152;160;168;176,memory/shape op: avoid isolated int16; matched skip-regex

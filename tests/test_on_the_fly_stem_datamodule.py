@@ -106,6 +106,45 @@ def test_on_the_fly_stem_dataset_returns_fixed_duration_and_consistent_mix(tmp_p
     assert torch.count_nonzero(ref[:, 0].abs().sum(dim=-1)).item() == 3
 
 
+def test_on_the_fly_stem_dataset_samples_source_clip_duration_range(tmp_path: Path) -> None:
+    long_pools = {}
+    short_pools = {}
+    for stem in _STEMS:
+        long_path = tmp_path / "long" / stem / f"{stem}.wav"
+        short_path = tmp_path / "short" / stem / f"{stem}.wav"
+        _write_wav(long_path, 0.1, sr=8000, n_samples=8000)
+        _write_wav(short_path, 0.1, sr=8000, n_samples=1000)
+        long_pools[stem] = str(long_path)
+        short_pools[stem] = str(short_path)
+
+    long_dataset = OnTheFlyStemDataset(
+        source_pools=long_pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        source_clip_duration_range=[0.25, 0.25],
+        dataset_length=1,
+        seed=123,
+        **_base_synthesis(),
+    )
+    short_dataset = OnTheFlyStemDataset(
+        source_pools=short_pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        source_clip_duration_range=[0.25, 0.25],
+        dataset_length=1,
+        seed=123,
+        **_base_synthesis(),
+    )
+
+    long_clip, _ = long_dataset._sample_audio("speech", long_dataset._rng_for_index(0))
+    short_clip, _ = short_dataset._sample_audio("speech", short_dataset._rng_for_index(0))
+
+    assert long_clip.numel() == 2000
+    assert short_clip.numel() == 1000
+
+
 def test_on_the_fly_stem_dataset_normalizes_active_sources_before_gain(tmp_path: Path) -> None:
     pools = _make_source_pools(tmp_path)
     synthesis = _base_synthesis()

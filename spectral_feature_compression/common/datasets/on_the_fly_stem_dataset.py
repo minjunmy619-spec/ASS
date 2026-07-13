@@ -144,6 +144,7 @@ class OnTheFlyStemDataset(Dataset):
         active_stem_count: Mapping[str, Any] | Sequence[int] | None = None,
         stem_sampling_weights: Mapping[str, float] | None = None,
         clips_per_active_stem: Mapping[str, Any] | int | Sequence[int] | None = None,
+        source_clip_duration_range: Sequence[float] | float | None = None,
         short_clip_policy: str = "concatenate",
         short_clip_pad_probability: float | Mapping[str, float] = 0.5,
         same_stem_placement: Mapping[str, Any] | None = None,
@@ -178,6 +179,15 @@ class OnTheFlyStemDataset(Dataset):
         self.sr = int(sr)
         self.duration = float(duration)
         self.n_samples = int(round(self.sr * self.duration))
+        self.source_clip_duration_range = (
+            None
+            if source_clip_duration_range is None
+            else _as_float_range(source_clip_duration_range, default=(self.duration, self.duration))
+        )
+        if self.source_clip_duration_range is not None and self.source_clip_duration_range[0] <= 0.0:
+            raise ValueError(
+                f"source_clip_duration_range values must be positive, got {self.source_clip_duration_range}"
+            )
         self.dataset_length = int(dataset_length)
         self.seed = seed
         self.return_metadata = bool(return_metadata)
@@ -275,7 +285,11 @@ class OnTheFlyStemDataset(Dataset):
             for field in ("stem_sampling_weights", "stem_gain_db", "clips_per_active_stem"):
                 value = profile.get(field)
                 if isinstance(value, Mapping):
-                    _validate_mapping_keys(value, self.source_order, name=f"synthesis_profiles.{profile['name']}.{field}")
+                    _validate_mapping_keys(
+                        value,
+                        self.source_order,
+                        name=f"synthesis_profiles.{profile['name']}.{field}",
+                    )
 
             snr_cfg = profile.get("stem_snr_db")
             if isinstance(snr_cfg, Mapping) and isinstance(snr_cfg.get("range"), Mapping):
@@ -483,7 +497,11 @@ class OnTheFlyStemDataset(Dataset):
 
     def _sample_audio(self, stem: str, rng: random.Random) -> tuple[torch.Tensor, Path]:
         path = rng.choice(self.source_files[stem])
-        audio = self._load_audio(path, rng, max_samples=self.n_samples)
+        max_samples = self.n_samples
+        if self.source_clip_duration_range is not None:
+            clip_duration = _sample_uniform(rng, self.source_clip_duration_range)
+            max_samples = max(1, int(round(self.sr * clip_duration)))
+        audio = self._load_audio(path, rng, max_samples=max_samples)
         return audio, path
 
     def _try_add_clip(
@@ -793,7 +811,11 @@ class OnTheFlyStemDataset(Dataset):
         )
         active_stems = _weighted_sample_without_replacement(
             self.source_order,
-            self.stem_sampling_weights if profile is None else profile.get("stem_sampling_weights", self.stem_sampling_weights),
+            (
+                self.stem_sampling_weights
+                if profile is None
+                else profile.get("stem_sampling_weights", self.stem_sampling_weights)
+            ),
             active_count,
             rng,
         )
