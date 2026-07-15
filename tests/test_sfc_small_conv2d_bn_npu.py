@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 import tempfile
 
@@ -57,6 +58,22 @@ def test_sfc_small_conv2d_bn_uses_batchnorm_without_rmsnorm() -> None:
     assert any(isinstance(module, torch.nn.BatchNorm2d) for module in modules)
     assert not any(module.__class__.__name__.lower().startswith("rms") for module in modules)
     assert not any(isinstance(module, torch.nn.MultiheadAttention) for module in modules)
+
+
+def test_sfc_small_conv2d_bn_uses_sfc_query_transport() -> None:
+    model = SFCSmallConv2DBNNPUCore(
+        n_freq=129,
+        n_bands=16,
+        d_inner=32,
+        d_model=48,
+        n_separator_layers=2,
+        n_sfc_heads=4,
+    )
+    assert tuple(model.encoder.query.shape) == (4, 16, 8)
+    assert tuple(model.encoder.pos_bias.shape) == (4, 16, 129)
+    assert tuple(model.decoder.query.shape) == (4, 129, 8)
+    assert tuple(model.decoder.pos_bias.shape) == (4, 129, 16)
+    assert not any(isinstance(module, torch.nn.ConvTranspose2d) for module in model.modules())
 
 
 def test_sfc_small_conv2d_bn_default_budget() -> None:
@@ -134,8 +151,11 @@ def test_sfc_small_conv2d_bn_streaming_onnx_export_uses_npu_friendly_ops() -> No
         onnx.checker.check_model(graph)
 
     ops = {node.op_type for node in graph.graph.node}
+    op_counts = Counter(node.op_type for node in graph.graph.node)
     assert "Conv" in ops
-    assert "ConvTranspose" in ops
-    assert "BatchNormalization" in ops
-    assert not {"MatMul", "Gemm", "LayerNormalization", "RMSNormalization"} & ops
-    assert not {"Pad", "ConstantOfShape", "Reshape", "Transpose"} & ops
+    assert "MatMul" in ops
+    assert "Softmax" in ops
+    assert op_counts["MatMul"] == 4
+    assert op_counts["Softmax"] == 2
+    assert not {"Gemm", "LayerNormalization", "RMSNormalization"} & ops
+    assert not {"Pad", "ConstantOfShape", "Expand", "Tile"} & ops

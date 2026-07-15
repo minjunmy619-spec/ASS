@@ -1,24 +1,24 @@
-"""NPU-friendly SFC-small rewrite with Conv2D and BatchNorm2D.
+"""NPU-friendly SFC-small rewrite with faithful SFC frequency transport.
 
 This module keeps the original SFC-small topology:
 
     complex STFT -> SFC encoder -> TF separator -> SFC decoder -> complex mask
 
-The NPU rewrite removes cross-attention and Locoformer attention from the hot
-path. Frequency compression/expansion uses Conv2D / stride-2 TransposedConv2D
-pyramids, and temporal modeling uses causal Conv2D blocks on the compressed
-band axis.
+The NPU rewrite keeps the SFC encoder/decoder idea: learned band/full-frequency
+queries cross-attend over full-bin or compressed-band embeddings with musical
+band position bias. Projections and FFNs are Conv2D + BatchNorm2D, and temporal
+modeling remains causal Conv2D on the compressed band axis.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectral_feature_compression.core.model.bandit_split import get_band_specs
 from spectral_feature_compression.core.model.model_wrapper import ModelWrapper
 
 
@@ -37,47 +37,6 @@ def _validate_odd_kernel(kernel_size: int, *, name: str) -> None:
         raise ValueError(f"{name} must be odd for same-frequency padding, got {kernel_size}")
 
 
-def _round_to_multiple(value: float, multiple: int = 8) -> int:
-    return max(multiple, int(round(value / multiple)) * multiple)
-
-
-def _interpolate_channels(start: int, end: int, n_stages: int) -> list[int]:
-    if n_stages <= 0:
-        raise ValueError(f"n_stages must be positive, got {n_stages}")
-    channels = []
-    for stage_idx in range(1, n_stages + 1):
-        frac = stage_idx / n_stages
-        channels.append(_round_to_multiple(start + (end - start) * frac))
-    channels[-1] = int(end)
-    return channels
-
-
-def _compute_frequency_pyramid(n_freq: int, n_bands: int) -> tuple[list[int], list[int], list[int], list[int]]:
-    """Return encoder and decoder frequency widths for stride-2 SFC transport."""
-
-    if n_freq <= 1:
-        raise ValueError(f"n_freq must be larger than one, got {n_freq}")
-    if n_bands <= 0:
-        raise ValueError(f"n_bands must be positive, got {n_bands}")
-    if (n_freq - 1) % n_bands != 0:
-        raise ValueError(f"Expected n_freq = n_bands * 2**N + 1, got n_freq={n_freq}, n_bands={n_bands}")
-    scale = (n_freq - 1) // n_bands
-    if scale <= 0 or scale & (scale - 1):
-        raise ValueError(f"Expected power-of-two frequency scale, got {(n_freq - 1)} / {n_bands} = {scale}")
-    n_stages = int(math.log2(scale))
-    widths = [int(n_freq)]
-    down_kernels: list[int] = []
-    width = int(n_freq)
-    for _ in range(n_stages):
-        kernel_f = 3 if width % 2 == 1 else 2
-        down_kernels.append(kernel_f)
-        width = (width - kernel_f) // 2 + 1
-        widths.append(width)
-    if widths[-1] != n_bands:
-        raise ValueError(f"Frequency pyramid ended at {widths[-1]} bands, expected {n_bands}")
-    return widths, list(reversed(widths)), down_kernels, list(reversed(down_kernels))
-
-
 def _normalize_dilation_cycle(n_layers: int, dilation_cycle: Sequence[int] | None) -> tuple[int, ...]:
     if dilation_cycle is None:
         dilation_cycle = (1,)
@@ -87,6 +46,58 @@ def _normalize_dilation_cycle(n_layers: int, dilation_cycle: Sequence[int] | Non
     if any(value <= 0 for value in cycle):
         raise ValueError(f"dilation_cycle values must be positive, got {cycle}")
     return tuple(cycle[idx % len(cycle)] for idx in range(n_layers))
+
+
+def _resolve_n_fft(n_freq: int, n_fft: int | None) -> int:
+    inferred = 2 * (int(n_freq) - 1)
+    if n_fft is None:
+        return inferred
+    if int(n_fft) // 2 + 1 != int(n_freq):
+        raise ValueError(f"n_fft={n_fft} is inconsistent with n_freq={n_freq}")
+    return int(n_fft)
+
+
+def _resolve_band_indices(
+    *,
+    n_freq: int,
+    n_bands: int,
+    n_fft: int | None,
+    sample_rate: int,
+    band_config: str,
+) -> list[tuple[int, int]]:
+    resolved_n_fft = _resolve_n_fft(n_freq, n_fft)
+    band_indices, _freq_weights, _overlap = get_band_specs(
+        band_config,
+        resolved_n_fft,
+        sample_rate,
+        n_bands=n_bands,
+    )
+    if len(band_indices) != n_bands:
+        raise ValueError(f"Expected {n_bands} bands from {band_config}, got {len(band_indices)}")
+    clipped = [(max(0, int(start)), min(int(n_freq), int(end))) for start, end in band_indices]
+    if any(end <= start for start, end in clipped):
+        raise ValueError(f"{band_config}{n_bands} produced zero-width bands for n_freq={n_freq}")
+    covered = torch.zeros(n_freq)
+    for start, end in clipped:
+        covered[start:end] += 1
+    if torch.any(covered == 0):
+        raise ValueError(f"{band_config}{n_bands} does not cover all {n_freq} frequency bins")
+    return clipped
+
+
+def _build_encoder_position_bias(band_indices: list[tuple[int, int]], n_freq: int) -> torch.Tensor:
+    bias = torch.zeros(len(band_indices), n_freq)
+    for band_idx, (start, end) in enumerate(band_indices):
+        center = (start + end - 1) / 2.0
+        denom = max((end - start) / 2.0, 1.0)
+        for freq_idx in range(n_freq):
+            if freq_idx < start:
+                bias[band_idx, freq_idx] = float(freq_idx - start)
+            elif freq_idx >= end:
+                bias[band_idx, freq_idx] = float(end - 1 - freq_idx)
+            else:
+                bias[band_idx, freq_idx] = -abs(float(freq_idx) - center) / denom
+    return bias
 
 
 class CausalConv2dBNAct(nn.Module):
@@ -144,7 +155,11 @@ class CausalConv2dBNAct(nn.Module):
         joined = torch.cat((state, x), dim=2)
         padded = F.pad(joined, (self.freq_pad, self.freq_pad, 0, 0)) if self.freq_pad > 0 else joined
         y = self.act(self.bn(self.conv(padded)))
-        return y, joined[:, :, -self.context_frames :, :]
+        if self.context_frames == 1 and (torch.jit.is_tracing() or x.shape[2] == 1):
+            next_state = x
+        else:
+            next_state = joined[:, :, -self.context_frames :, :]
+        return y, next_state
 
 
 class Conv2dBNAct(nn.Module):
@@ -179,38 +194,8 @@ class Conv2dBNAct(nn.Module):
         return self.act(self.bn(self.conv(x)))
 
 
-class ConvTranspose2dBNAct(nn.Module):
-    """TransposedConv2D followed by BatchNorm2D and optional ReLU."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        *,
-        kernel_f: int,
-        activation: bool = True,
-    ) -> None:
-        super().__init__()
-        if kernel_f not in (2, 3):
-            raise ValueError(f"Only valid stride-2 frequency kernels 2/3 are supported, got {kernel_f}")
-        self.tconv = nn.ConvTranspose2d(
-            in_channels,
-            out_channels,
-            kernel_size=(1, int(kernel_f)),
-            stride=(1, 2),
-            padding=(0, 0),
-            output_padding=(0, 0),
-            bias=True,
-        )
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.act = nn.ReLU(inplace=False) if activation else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.tconv(x)))
-
-
 class SFCSmallConv2DBNEncoder(nn.Module):
-    """SFC encoder replacement: local input conv then stride-2 frequency transport."""
+    """SFC encoder: full-frequency embeddings queried by musical band tokens."""
 
     def __init__(
         self,
@@ -220,38 +205,116 @@ class SFCSmallConv2DBNEncoder(nn.Module):
         d_model: int,
         n_freq: int,
         n_bands: int,
+        n_fft: int | None,
+        sample_rate: int,
+        band_config: str,
+        n_heads: int,
+        learnable_pos_bias: bool,
         use_learnable_query: bool,
     ) -> None:
         super().__init__()
-        enc_widths, _, down_kernels, _ = _compute_frequency_pyramid(n_freq, n_bands)
-        out_channels = _interpolate_channels(d_inner, d_model, len(enc_widths) - 1)
+        if d_inner % n_heads != 0:
+            raise ValueError(f"d_inner={d_inner} must be divisible by n_heads={n_heads}")
         self.n_freq = int(n_freq)
         self.n_bands = int(n_bands)
+        self.n_heads = int(n_heads)
+        self.head_dim = int(d_inner) // int(n_heads)
+        self.scale = self.head_dim**-0.5
+        self.query_type = "learnable" if use_learnable_query else "adaptive"
         self.input_channels = int(in_channels)
         self.input = Conv2dBNAct(in_channels, d_inner, kernel_size=(1, 3), padding=(0, 1))
-        stages: list[nn.Module] = []
-        channels_in = d_inner
-        for channels_out, kernel_f in zip(out_channels, down_kernels):
-            stages.append(
-                Conv2dBNAct(
-                    channels_in,
-                    channels_out,
-                    kernel_size=(1, kernel_f),
-                    stride=(1, 2),
-                    padding=(0, 0),
-                )
-            )
-            channels_in = channels_out
-        self.down = nn.Sequential(*stages)
-        self.band_query = (
-            nn.Parameter(torch.zeros(1, d_model, 1, n_bands)) if use_learnable_query else None
+        self.kv_proj = nn.Conv2d(d_inner, 2 * d_inner, kernel_size=1, bias=False)
+        self.aggregate = Conv2dBNAct(d_inner, d_inner, activation=False)
+        self.ffn = nn.Sequential(
+            Conv2dBNAct(d_inner, 2 * d_inner, activation=True),
+            Conv2dBNAct(2 * d_inner, d_inner, activation=False),
         )
+        self.output = Conv2dBNAct(d_inner, d_model, kernel_size=(1, 3), padding=(0, 1))
+
+        band_indices = _resolve_band_indices(
+            n_freq=n_freq,
+            n_bands=n_bands,
+            n_fft=n_fft,
+            sample_rate=sample_rate,
+            band_config=band_config,
+        )
+        pos_bias = _build_encoder_position_bias(band_indices, n_freq).unsqueeze(0).repeat(n_heads, 1, 1)
+        if learnable_pos_bias:
+            self.pos_bias = nn.Parameter(pos_bias)
+        else:
+            self.register_buffer("pos_bias", pos_bias)
+
+        query = torch.randn(n_heads, n_bands, self.head_dim) * 0.02
+        if self.query_type == "learnable":
+            self.query = nn.Parameter(query)
+        else:
+            self.register_buffer("query", query)
+        weights = torch.softmax(_build_encoder_position_bias(band_indices, n_freq), dim=-1)
+        self.register_buffer("adaptive_pool", weights)
+
+    def _prepare_query(self, emb_flat: torch.Tensor) -> list[torch.Tensor]:
+        if self.query_type == "learnable":
+            return [self.query[head_idx].unsqueeze(0).to(dtype=emb_flat.dtype) for head_idx in range(self.n_heads)]
+
+        # Adaptive mode mirrors the official weighted band-mean query path with a
+        # static musical-band pooling prior to avoid gather/index_add in export.
+        pooled = torch.matmul(self.adaptive_pool.to(dtype=emb_flat.dtype).unsqueeze(0), emb_flat.transpose(1, 2))
+        return [
+            pooled[:, :, head_idx * self.head_dim : (head_idx + 1) * self.head_dim]
+            for head_idx in range(self.n_heads)
+        ]
+
+    def _attend(self, h: torch.Tensor) -> torch.Tensor:
+        bsz, _channels, n_frames, n_freq = h.shape
+        kv = self.kv_proj(h)
+        key, value = kv.chunk(2, dim=1)
+        batch_frames = bsz * n_frames
+        key_flat = key.permute(0, 2, 1, 3).reshape(batch_frames, -1, n_freq)
+        value_flat = value.permute(0, 2, 3, 1).reshape(batch_frames, n_freq, -1)
+        emb_flat = h.permute(0, 2, 1, 3).reshape(batch_frames, -1, n_freq)
+        queries = self._prepare_query(emb_flat)
+
+        head_outputs: list[torch.Tensor] = []
+        pos_bias = self.pos_bias.to(dtype=h.dtype)
+        for head_idx in range(self.n_heads):
+            start = head_idx * self.head_dim
+            end = start + self.head_dim
+            key_h = key_flat[:, start:end, :]
+            value_h = value_flat[:, :, start:end]
+            score = torch.matmul(queries[head_idx], key_h) * self.scale
+            score = score + pos_bias[head_idx : head_idx + 1]
+            weight = torch.softmax(score, dim=-1)
+            head_outputs.append(torch.matmul(weight, value_h))
+
+        attended = torch.cat(head_outputs, dim=-1)
+        attended = attended.transpose(1, 2).reshape(bsz, n_frames, -1, self.n_bands).permute(0, 2, 1, 3)
+        attended = self.aggregate(attended)
+        return attended + self.ffn(attended)
+
+    def _attend_stream_frame(self, h: torch.Tensor) -> torch.Tensor:
+        bsz, _channels, _n_frames, n_freq = h.shape
+        kv = self.kv_proj(h)
+        key, value = kv.chunk(2, dim=1)
+        key = key.reshape(bsz, self.n_heads, self.head_dim, n_freq)
+        value = value.reshape(bsz, self.n_heads, self.head_dim, n_freq).transpose(2, 3)
+
+        if self.query_type == "learnable":
+            query = self.query.unsqueeze(0).to(dtype=h.dtype)
+        else:
+            emb = h.reshape(bsz, self.n_heads, self.head_dim, n_freq).transpose(2, 3)
+            pool = self.adaptive_pool.reshape(1, 1, self.n_bands, n_freq).to(dtype=h.dtype)
+            query = torch.matmul(pool, emb)
+
+        score = torch.matmul(query, key) * self.scale
+        score = score + self.pos_bias.unsqueeze(0).to(dtype=h.dtype)
+        weight = torch.softmax(score, dim=-1)
+        attended = torch.matmul(weight, value)
+        attended = attended.transpose(2, 3).reshape(bsz, -1, 1, self.n_bands)
+        attended = self.aggregate(attended)
+        return attended + self.ffn(attended)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.down(self.input(x))
-        if self.band_query is not None:
-            h = h + self.band_query.to(dtype=h.dtype)
-        return h
+        return self.output(self._attend(self.input(x)))
 
     def init_stream_state(
         self,
@@ -266,10 +329,8 @@ class SFCSmallConv2DBNEncoder(nn.Module):
         h = self.input(x)
         if state is None:
             state = self.init_stream_state(x.shape[0], device=x.device, dtype=x.dtype)
-        h = self.down(h)
-        if self.band_query is not None:
-            h = h + self.band_query.to(dtype=h.dtype)
-        return h, state
+        h = self._attend(h) if not torch.jit.is_tracing() and h.shape[2] != 1 else self._attend_stream_frame(h)
+        return self.output(h), state
 
 
 class Conv2DLocoBNBlock(nn.Module):
@@ -332,7 +393,7 @@ class Conv2DLocoBNBlock(nn.Module):
 
 
 class SFCSmallConv2DBNDecoder(nn.Module):
-    """SFC decoder replacement: stride-2 frequency expansion then mask head."""
+    """SFC decoder: full-frequency queries read compressed band tokens."""
 
     def __init__(
         self,
@@ -342,35 +403,98 @@ class SFCSmallConv2DBNDecoder(nn.Module):
         out_channels: int,
         n_freq: int,
         n_bands: int,
+        n_fft: int | None,
+        sample_rate: int,
+        band_config: str,
+        n_heads: int,
+        learnable_pos_bias: bool,
         use_learnable_query: bool,
     ) -> None:
         super().__init__()
-        _, dec_widths, _, up_kernels = _compute_frequency_pyramid(n_freq, n_bands)
-        stage_count = len(dec_widths) - 1
-        stage_channels = list(reversed(_interpolate_channels(d_inner, d_model, stage_count)))
-        target_channels = stage_channels[1:] + [d_inner]
-        stages: list[nn.Module] = []
-        in_channels = d_model
-        for out_ch, kernel_f in zip(target_channels, up_kernels):
-            stages.append(
-                ConvTranspose2dBNAct(
-                    in_channels,
-                    out_ch,
-                    kernel_f=kernel_f,
-                )
-            )
-            in_channels = out_ch
-        self.up = nn.Sequential(*stages)
-        self.freq_query = (
-            nn.Parameter(torch.zeros(1, d_inner, 1, n_freq)) if use_learnable_query else None
+        if d_inner % n_heads != 0:
+            raise ValueError(f"d_inner={d_inner} must be divisible by n_heads={n_heads}")
+        self.n_freq = int(n_freq)
+        self.n_bands = int(n_bands)
+        self.n_heads = int(n_heads)
+        self.head_dim = int(d_inner) // int(n_heads)
+        self.scale = self.head_dim**-0.5
+        self.query_type = "learnable" if use_learnable_query else "adaptive"
+        self.input = Conv2dBNAct(d_model, d_inner, kernel_size=(1, 3), padding=(0, 1))
+        self.kv_proj = nn.Conv2d(d_inner, 2 * d_inner, kernel_size=1, bias=False)
+        self.aggregate = Conv2dBNAct(d_inner, d_inner, activation=False)
+        self.ffn = nn.Sequential(
+            Conv2dBNAct(d_inner, 2 * d_inner, activation=True),
+            Conv2dBNAct(2 * d_inner, d_inner, activation=False),
         )
         self.output = nn.Conv2d(d_inner, out_channels, kernel_size=(1, 3), padding=(0, 1), bias=True)
 
+        band_indices = _resolve_band_indices(
+            n_freq=n_freq,
+            n_bands=n_bands,
+            n_fft=n_fft,
+            sample_rate=sample_rate,
+            band_config=band_config,
+        )
+        enc_bias = _build_encoder_position_bias(band_indices, n_freq)
+        pos_bias = enc_bias.transpose(0, 1).unsqueeze(0).repeat(n_heads, 1, 1)
+        if learnable_pos_bias:
+            self.pos_bias = nn.Parameter(pos_bias)
+        else:
+            self.register_buffer("pos_bias", pos_bias)
+
+        query = torch.randn(n_heads, n_freq, self.head_dim) * 0.02
+        if self.query_type == "learnable":
+            self.query = nn.Parameter(query)
+        else:
+            self.register_buffer("query", query)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.up(x)
-        if self.freq_query is not None:
-            h = h + self.freq_query.to(dtype=h.dtype)
-        return self.output(h)
+        h = self.input(x)
+        bsz, _channels, n_frames, n_bands = h.shape
+        kv = self.kv_proj(h)
+        key, value = kv.chunk(2, dim=1)
+        batch_frames = bsz * n_frames
+        key_flat = key.permute(0, 2, 1, 3).reshape(batch_frames, -1, n_bands)
+        value_flat = value.permute(0, 2, 3, 1).reshape(batch_frames, n_bands, -1)
+
+        head_outputs: list[torch.Tensor] = []
+        pos_bias = self.pos_bias.to(dtype=h.dtype)
+        for head_idx in range(self.n_heads):
+            start = head_idx * self.head_dim
+            end = start + self.head_dim
+            key_h = key_flat[:, start:end, :]
+            value_h = value_flat[:, :, start:end]
+            query_h = self.query[head_idx].unsqueeze(0).to(dtype=h.dtype)
+            score = torch.matmul(query_h, key_h) * self.scale
+            score = score + pos_bias[head_idx : head_idx + 1]
+            weight = torch.softmax(score, dim=-1)
+            head_outputs.append(torch.matmul(weight, value_h))
+
+        expanded = torch.cat(head_outputs, dim=-1)
+        expanded = expanded.transpose(1, 2).reshape(bsz, n_frames, -1, self.n_freq).permute(0, 2, 1, 3)
+        expanded = self.aggregate(expanded)
+        expanded = expanded + self.ffn(expanded)
+        return self.output(expanded)
+
+    def forward_stream(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.input(x)
+        if not torch.jit.is_tracing() and h.shape[2] != 1:
+            return self.forward(x)
+        bsz, _channels, _n_frames, n_bands = h.shape
+        kv = self.kv_proj(h)
+        key, value = kv.chunk(2, dim=1)
+        key = key.reshape(bsz, self.n_heads, self.head_dim, n_bands)
+        value = value.reshape(bsz, self.n_heads, self.head_dim, n_bands).transpose(2, 3)
+
+        query = self.query.unsqueeze(0).to(dtype=h.dtype)
+        score = torch.matmul(query, key) * self.scale
+        score = score + self.pos_bias.unsqueeze(0).to(dtype=h.dtype)
+        weight = torch.softmax(score, dim=-1)
+        expanded = torch.matmul(weight, value)
+        expanded = expanded.transpose(2, 3).reshape(bsz, -1, 1, self.n_freq)
+        expanded = self.aggregate(expanded)
+        expanded = expanded + self.ffn(expanded)
+        return self.output(expanded)
 
 
 def _apply_packed_complex_mask(x: torch.Tensor, mask: torch.Tensor, *, n_src: int, n_chan: int) -> torch.Tensor:
@@ -395,12 +519,17 @@ class SFCSmallConv2DBNNPUCore(nn.Module):
         self,
         *,
         n_freq: int,
+        n_fft: int | None = None,
+        sample_rate: int = 44100,
         n_bands: int = 64,
+        band_config: str = "musical",
         n_src: int = 3,
         n_chan: int = 1,
         d_inner: int = 64,
         d_model: int = 160,
         n_separator_layers: int = 8,
+        n_sfc_heads: int = 4,
+        learnable_pos_bias: bool = True,
         time_kernel_size: int = 2,
         freq_kernel_size: int = 3,
         ffn_expansion: int = 4,
@@ -416,11 +545,15 @@ class SFCSmallConv2DBNNPUCore(nn.Module):
         if d_inner <= 0 or d_model <= 0:
             raise ValueError(f"d_inner and d_model must be positive, got {d_inner}, {d_model}")
         self.n_freq = int(n_freq)
+        self.n_fft = _resolve_n_fft(n_freq, n_fft)
+        self.sample_rate = int(sample_rate)
         self.n_bands = int(n_bands)
+        self.band_config = str(band_config)
         self.n_src = int(n_src)
         self.n_chan = int(n_chan)
         self.d_inner = int(d_inner)
         self.d_model = int(d_model)
+        self.n_sfc_heads = int(n_sfc_heads)
         self.n_separator_layers = int(n_separator_layers)
         self.masking = bool(masking)
         self.dilation_schedule = _normalize_dilation_cycle(self.n_separator_layers, dilation_cycle)
@@ -433,6 +566,11 @@ class SFCSmallConv2DBNNPUCore(nn.Module):
             d_model=d_model,
             n_freq=n_freq,
             n_bands=n_bands,
+            n_fft=self.n_fft,
+            sample_rate=sample_rate,
+            band_config=band_config,
+            n_heads=n_sfc_heads,
+            learnable_pos_bias=learnable_pos_bias,
             use_learnable_query=use_learnable_query,
         )
         self.separator = nn.ModuleList(
@@ -453,6 +591,11 @@ class SFCSmallConv2DBNNPUCore(nn.Module):
             out_channels=out_channels,
             n_freq=n_freq,
             n_bands=n_bands,
+            n_fft=self.n_fft,
+            sample_rate=sample_rate,
+            band_config=band_config,
+            n_heads=n_sfc_heads,
+            learnable_pos_bias=learnable_pos_bias,
             use_learnable_query=use_learnable_query,
         )
         self._init_mask_bias()
@@ -510,7 +653,7 @@ class SFCSmallConv2DBNNPUCore(nn.Module):
         for block, block_state in zip(self.separator, state):
             h, new_block_state = block.forward_stream(h, block_state)
             next_state.append(new_block_state)
-        mask = self.decoder(h)
+        mask = self.decoder.forward_stream(h)
         y = _apply_packed_complex_mask(x, mask, n_src=self.n_src, n_chan=self.n_chan) if self.masking else mask
         return y, tuple(next_state)
 
@@ -558,9 +701,12 @@ def build_sfc_small_conv2d_bn_npu_system(
     n_src: int = 3,
     n_chan: int = 1,
     n_bands: int = 64,
+    band_config: str = "musical",
     d_inner: int = 64,
     d_model: int = 160,
     n_separator_layers: int = 8,
+    n_sfc_heads: int = 4,
+    learnable_pos_bias: bool = True,
     time_kernel_size: int = 2,
     freq_kernel_size: int = 3,
     ffn_expansion: int = 4,
@@ -574,12 +720,17 @@ def build_sfc_small_conv2d_bn_npu_system(
 ) -> ModelWrapper:
     core_model = SFCSmallConv2DBNNPUModel(
         n_freq=n_fft // 2 + 1,
+        n_fft=n_fft,
+        sample_rate=fs,
         n_bands=n_bands,
+        band_config=band_config,
         n_src=n_src,
         n_chan=n_chan,
         d_inner=d_inner,
         d_model=d_model,
         n_separator_layers=n_separator_layers,
+        n_sfc_heads=n_sfc_heads,
+        learnable_pos_bias=learnable_pos_bias,
         time_kernel_size=time_kernel_size,
         freq_kernel_size=freq_kernel_size,
         ffn_expansion=ffn_expansion,

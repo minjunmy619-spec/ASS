@@ -12,8 +12,11 @@ n_src: 3
 n_chan: 1
 
 sfc_npu_n_bands: 64
+sfc_npu_band_config: musical
 sfc_npu_d_inner: 64
 sfc_npu_d_model: 160
+sfc_npu_n_sfc_heads: 4
+sfc_npu_learnable_pos_bias: true
 sfc_npu_n_separator_layers: 8
 sfc_npu_time_kernel_size: 2
 sfc_npu_freq_kernel_size: 3
@@ -63,8 +66,11 @@ task:
     n_src: ${n_src}
     n_chan: ${n_chan}
     n_bands: ${sfc_npu_n_bands}
+    band_config: ${sfc_npu_band_config}
     d_inner: ${sfc_npu_d_inner}
     d_model: ${sfc_npu_d_model}
+    n_sfc_heads: ${sfc_npu_n_sfc_heads}
+    learnable_pos_bias: ${sfc_npu_learnable_pos_bias}
     n_separator_layers: ${sfc_npu_n_separator_layers}
     time_kernel_size: ${sfc_npu_time_kernel_size}
     freq_kernel_size: ${sfc_npu_freq_kernel_size}

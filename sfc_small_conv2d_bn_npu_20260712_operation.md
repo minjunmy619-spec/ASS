@@ -57,7 +57,7 @@ complex STFT -> SFC encoder -> TF separator -> SFC decoder -> complex mask
 
 NPU changes:
 
-- Cross-attention encoder/decoder are replaced with Conv2D frequency transport.
+- Cross-attention encoder/decoder are replaced with NPU-friendly SFC query transport using Conv2D projections plus per-head MatMul/Softmax.
 - Locoformer attention blocks are replaced with Conv2D TF blocks.
 - RMSNorm/RMSGroupNorm are replaced with `BatchNorm2d`.
 - The deployable core uses packed-real `[B, C, T, F]` tensors.
@@ -66,10 +66,11 @@ NPU changes:
 
 Frequency transport:
 
-- Encoder uses valid stride-2 Conv2D kernels for exact `1025 -> 512 -> 256 -> 128 -> 64`.
-- Kernel schedule is `3, 2, 2, 2`, avoiding padding in the transport path.
-- Decoder mirrors this with valid stride-2 TransposedConv2D kernels `2, 2, 2, 3` for `64 -> 1025`.
-- This follows the NPU rule that transposed Conv2D stride should be `2`.
+- Encoder first embeds full STFT bins with Conv2D, then 64 learned musical-band queries cross-attend over all 1025 frequency bins.
+- The encoder attention uses official `musical64` band indices and a learnable per-head band-distance position bias with shape `[4, 64, 1025]`.
+- Decoder mirrors this contract: 1025 learned full-frequency queries cross-attend over the 64 compressed separator tokens with position bias `[4, 1025, 64]`.
+- Projections and FFNs are implemented as Conv2D + BatchNorm2D.  Attention routing uses static per-head `MatMul` + `Softmax` instead of PyTorch `MultiheadAttention`.
+- The previous fixed stride-2 pyramid (`1025 -> 512 -> 256 -> 128 -> 64`) has been removed because it did not preserve the core SFC query/routing mechanism.
 
 Separator:
 
@@ -78,15 +79,17 @@ Separator:
 - Default temporal kernel is `2`, dilation cycle is `[1]`.
 - This keeps fp16 streaming state under the 192 KiB quota while putting most parameters into compressed-band Conv2D capacity.
 
-Learnable query replacement:
+SFC query transport:
 
-- The original learnable-query idea is kept as low-cost learned band/frequency biases.
-- This avoids attention/bmm and avoids irregular gather/scatter routing.
+- Encoder query shape is `[4, 64, 16]` for the default `d_inner=64`, `n_sfc_heads=4`.
+- Decoder query shape is `[4, 1025, 16]`.
+- `band_config=musical`, `n_sfc_heads=4`, and `learnable_pos_bias=true` are explicit recipe knobs.
+- This is closer to official SFC-CA than the first Conv2D pyramid version while still avoiding `LayerNorm`, `RMSNorm`, `Gemm`, `MultiheadAttention`, `Tile`, and `Expand` in the streaming ONNX smoke test.
 
 Default budget:
 
 ```text
-parameters: 3,408,006
+parameters: 3,823,782
 fp16 streaming state: 163,840 bytes = 160.00 KiB
 ```
 
@@ -134,7 +137,7 @@ Focused tests:
 Result:
 
 ```text
-7 passed
+8 passed
 ```
 
 Budget check:
@@ -152,7 +155,7 @@ PY
 Result:
 
 ```text
-3408006
+3823782
 163840
 ```
 
@@ -250,6 +253,42 @@ Optimized Circle operator counts:
 1. Export a deployment mode with `masking=false` if the DSP can apply complex masks outside the NPU; this should remove much of the mask slice/mul/sub/concat tail.
 2. Train the recipe against the on-the-fly TV profiles and compare against the cross-attention SFC-small teacher.
 3. Replace synthetic calibration with real representative TV audio clips once manifests are available.
+
+## 2026-07-15 Faithful SFC Transport Update
+
+The first Conv2D BN NPU version used a fixed stride-2 frequency pyramid.  That version compiled, but it did not preserve the official SFC encoder/decoder mechanism.  The model file was updated to use NPU-friendly SFC query transport:
+
+```text
+full-frequency embeddings + musical band queries -> MatMul/Softmax compression to 64 tokens
+64 separator tokens + full-frequency queries -> MatMul/Softmax expansion to 1025 bins
+```
+
+Validation:
+
+```bash
+.venv/bin/python -m py_compile \
+  spectral_feature_compression/core/model/sfc_small_conv2d_bn_npu.py \
+  tests/test_sfc_small_conv2d_bn_npu.py
+
+.venv/bin/python -m pytest tests/test_sfc_small_conv2d_bn_npu.py -q
+```
+
+Result:
+
+```text
+8 passed
+parameters: 3,823,782
+fp16 streaming state: 163,840 bytes
+```
+
+Streaming ONNX smoke-test operator intent:
+
+```text
+Required: Conv, MatMul, Softmax
+Forbidden: Gemm, LayerNormalization, RMSNormalization, Pad, ConstantOfShape, Expand, Tile
+```
+
+Important: the 2026-07-13 Circle/quantization artifacts below were produced from the previous fixed-pyramid model revision.  They are now stale for the current faithful SFC-query implementation and must be regenerated before deployment or quantization comparison.
 
 ## 2026-07-13 Calibration And Quantization Update
 
@@ -536,3 +575,171 @@ Tensor dtype sanity check:
 mixed depth_back_10: INT16 50, INT32 78, INT64 2, UINT8 233
 pure uint8:          INT32 80, UINT8 249
 ```
+
+## 2026-07-15 ONE-Guided Streaming Latency Rewrite
+
+The July 15 faithful SFC encoder/decoder topology was rewritten for lower final
+NPU latency while keeping the SFC semantic contract:
+
+- Encoder still uses learned musical-band queries to cross-attend over full
+  frequency-bin keys/values with musical position bias.
+- Decoder still uses learned full-frequency queries to cross-attend over
+  compressed band keys/values with the transposed musical position bias.
+- The Conv2D separator and BatchNorm2D normalization remain unchanged in
+  meaning.
+
+The change is in the streaming/export implementation.  The previous streaming
+attention path iterated over heads in Python, slicing the key/value channel
+dimension and concatenating head outputs.  ONE does not generally erase that
+kind of real head-layout plumbing:
+
+- `RemoveRedundantTransposePass` only handles consecutive transposes with
+  constant permutations.
+- `SubstituteTransposeToReshapePass` only converts a transpose when the
+  non-unit dimension order is unchanged.
+- `RemoveRedundantReshapePass` only bypasses consecutive reshapes.
+- `ConvertNCHWToNHWC` runs early and resolves custom `BatchMatMul`/`MatMul`
+  before layout conversion, so the PyTorch/ONNX attention layout strongly
+  affects the final Circle graph.
+- `FuseBatchNormWithConvPass` folds inference BatchNorm exported as
+  Conv/Mul/Add into Conv2D weights/bias, which confirms BatchNorm2D is the right
+  latency replacement for RMSNorm here.
+
+Implementation changes:
+
+- `SFCSmallConv2DBNEncoder.forward_stream()` now uses one 4D batched
+  multi-head MatMul path for the streaming frame:
+  `[B,H,K,Dh] x [B,H,Dh,F] -> [B,H,K,F]`.
+- `SFCSmallConv2DBNDecoder.forward_stream()` uses the symmetric batched path:
+  `[B,H,F,Dh] x [B,H,Dh,K] -> [B,H,F,K]`.
+- The full training forward path keeps the multi-frame implementation, so
+  existing training semantics and on-the-fly synthesis remain compatible.
+- `CausalConv2dBNAct.forward_stream()` returns the one-frame input directly as
+  next state for the default one-frame causal context, avoiding a traced Slice
+  per separator block.
+- `tests/test_sfc_small_conv2d_bn_npu.py` now asserts the streaming export has
+  exactly 4 `MatMul` and 2 `Softmax` ONNX ops, preventing regression back to a
+  per-head graph.
+
+Validation:
+
+```bash
+.venv/bin/python -m pytest tests/test_sfc_small_conv2d_bn_npu.py -q
+```
+
+Result:
+
+```text
+8 passed
+```
+
+Exported artifacts:
+
+```text
+logs/npu_efficiency_audit/sfc_small_conv2d_bn_npu_20260715/
+  sfc_small_stream_masked.onnx
+  sfc_small_stream_masked.circle
+  sfc_small_stream_masked.opt.circle
+  sfc_small_stream_rawmask.onnx
+  sfc_small_stream_rawmask.circle
+  sfc_small_stream_rawmask.opt.circle
+  sfc_small_stream_perhead_reference.onnx
+```
+
+Commands:
+
+```bash
+.venv/bin/python tools/online/export_onnx_online_model.py \
+  recipes/dnr/models/sfc-small-conv2d-bn-npu.musical64.onfly.rt192k/config.yaml \
+  --out logs/npu_efficiency_audit/sfc_small_conv2d_bn_npu_20260715/sfc_small_stream_masked.onnx \
+  --n-chan 1 --frames 1 --opset 11 --streaming --check \
+  --state-meta-out logs/npu_efficiency_audit/sfc_small_conv2d_bn_npu_20260715/sfc_small_stream_masked_state.json
+
+/home/cmj/works/ONE/build/compiler/one-cmds/one-import-onnx \
+  -i logs/npu_efficiency_audit/sfc_small_conv2d_bn_npu_20260715/sfc_small_stream_masked.onnx \
+  -o logs/npu_efficiency_audit/sfc_small_conv2d_bn_npu_20260715/sfc_small_stream_masked.circle \
+  --dynamic_batch_to_single_batch
+
+/home/cmj/works/ONE/build/compiler/one-cmds/one-optimize \
+  -i logs/npu_efficiency_audit/sfc_small_conv2d_bn_npu_20260715/sfc_small_stream_masked.circle \
+  -o logs/npu_efficiency_audit/sfc_small_conv2d_bn_npu_20260715/sfc_small_stream_masked.opt.circle \
+  --convert_nchw_to_nhwc \
+  --fuse_batchnorm_with_conv \
+  --fuse_activation_function \
+  --remove_duplicate_const \
+  --remove_unnecessary_add \
+  --remove_unnecessary_slice \
+  --remove_unnecessary_strided_slice \
+  --remove_unnecessary_reshape \
+  --remove_unnecessary_transpose \
+  --remove_redundant_reshape \
+  --remove_redundant_transpose \
+  --forward_transpose_op \
+  --resolve_customop_matmul \
+  --resolve_customop_batchmatmul
+```
+
+Measured ONNX operator counts:
+
+```text
+per-head reference ONNX:
+  nodes=366 Constant=122 Conv=60 Add=39 Slice=28 Mul=24
+  MatMul=16 Softmax=8 Transpose=8 Concat=11 Reshape=6
+
+rewritten masked streaming ONNX:
+  nodes=238 Conv=60 Constant=52 Add=33 Slice=12 Mul=18
+  MatMul=4 Softmax=2 Transpose=4 Concat=9 Reshape=6
+
+rewritten raw-mask streaming ONNX:
+  nodes=179 Conv=60 Add=30 Constant=20 Concat=8 Mul=6
+  MatMul=4 Softmax=2 Slice=4 Transpose=4 Reshape=6
+```
+
+The temporary per-head reference ONNX failed `one-import-onnx`:
+
+```text
+loc("/MatMul/reshape"): error: 'Circle.reshape' op requires 'output' number
+of elements to match 'input' number of elements, but got 1025 and 16400
+```
+
+This reinforces the rewrite: the batched-head path is smaller and avoids an
+importer failure mode.
+
+Measured Circle operator counts:
+
+```text
+masked import Circle:
+  nodes=277 TRANSPOSE=124 CONV_2D=60 ADD=31 MUL=14 PAD=12
+  STRIDED_SLICE=12 CONCATENATION=9 RESHAPE=6 BATCH_MATMUL=4 SOFTMAX=2
+
+masked optimized Circle:
+  nodes=189 CONV_2D=60 TRANSPOSE=36 ADD=31 MUL=14 PAD=12
+  STRIDED_SLICE=12 CONCATENATION=9 BATCH_MATMUL=4 SOFTMAX=2
+
+raw-mask import Circle:
+  nodes=250 TRANSPOSE=124 CONV_2D=60 ADD=28 PAD=12 CONCATENATION=8
+  RESHAPE=6 BATCH_MATMUL=4 STRIDED_SLICE=4 MUL=2 SOFTMAX=2
+
+raw-mask optimized Circle:
+  nodes=152 CONV_2D=60 ADD=28 TRANSPOSE=26 PAD=12 CONCATENATION=8
+  RESHAPE=6 BATCH_MATMUL=4 STRIDED_SLICE=4 MUL=2 SOFTMAX=2
+```
+
+Deployment guidance from this pass:
+
+- Use the rewritten streaming path as the default SFC-small NPU export path.
+- Prefer `--disable-masking` for the lowest NPU latency if the DSP/CPU side can
+  apply the packed complex mask; this keeps the learned model identical but
+  removes the memory-heavy mask application tail from the NPU graph.
+- Keep `--convert_nchw_to_nhwc` for Circle optimization, but preserve external
+  NCHW input/output shapes unless calibration H5 and runtime integration are
+  regenerated for NHWC.
+- Do not use `--decompose_softmax`; the SFC transport should stay as
+  `BATCH_MATMUL -> SOFTMAX -> BATCH_MATMUL`.
+- For this graph, do not enable the `substitute_*_to_reshape` family in the
+  final latency recipe by default.  A small flag sweep showed the masked graph
+  improves from 204 to 189 optimized Circle nodes when those substitutions are
+  omitted and `--forward_transpose_op` is kept.  The raw-mask graph is unchanged
+  at 152 nodes either way.
+- The remaining `STRIDED_SLICE` ops in the raw-mask optimized graph are from
+  key/value splitting and are much smaller than the original per-head split.
