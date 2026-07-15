@@ -12,6 +12,11 @@ from spectral_feature_compression.core.model.sfc_small_conv2d_bn_npu import (
     SFCSmallConv2DBNNPUCore,
     SFCSmallConv2DBNNPUModel,
 )
+from spectral_feature_compression.core.model.sfc_small_conv2d_bn_npu_kvsplit import (
+    SFCSmallConv2DBNNPUKvSplitCore,
+    SFCSmallConv2DBNNPUKvSplitModel,
+    convert_sfc_small_conv2d_bn_npu_state_dict_to_kvsplit,
+)
 from spectral_feature_compression.utils.onnx_streaming import StreamingStateIOWrapper, flatten_tensor_tree
 from tools.online.export_onnx_online_model import build_model_system_from_recipe_config
 
@@ -21,6 +26,8 @@ def test_sfc_small_conv2d_bn_public_lazy_exports() -> None:
 
     assert sfc.SFCSmallConv2DBNNPUCore is SFCSmallConv2DBNNPUCore
     assert sfc.SFCSmallConv2DBNNPUModel is SFCSmallConv2DBNNPUModel
+    assert sfc.SFCSmallConv2DBNNPUKvSplitCore is SFCSmallConv2DBNNPUKvSplitCore
+    assert sfc.SFCSmallConv2DBNNPUKvSplitModel is SFCSmallConv2DBNNPUKvSplitModel
 
 
 def test_sfc_small_conv2d_bn_core_streaming_matches_full() -> None:
@@ -117,6 +124,64 @@ def test_sfc_small_conv2d_bn_recipe_builds_onfly_system() -> None:
     assert core.state_size_bytes(dtype=torch.float16) < 192 * 1024
 
 
+def test_sfc_small_conv2d_bn_kvsplit_state_dict_is_equivalent() -> None:
+    torch.manual_seed(0)
+    base = SFCSmallConv2DBNNPUCore(
+        n_freq=65,
+        n_bands=8,
+        n_src=2,
+        n_chan=1,
+        d_inner=16,
+        d_model=32,
+        n_separator_layers=2,
+    ).eval()
+    kvsplit = SFCSmallConv2DBNNPUKvSplitCore(
+        n_freq=65,
+        n_bands=8,
+        n_src=2,
+        n_chan=1,
+        d_inner=16,
+        d_model=32,
+        n_separator_layers=2,
+    ).eval()
+    kvsplit.load_state_dict(convert_sfc_small_conv2d_bn_npu_state_dict_to_kvsplit(base.state_dict()))
+    x = torch.randn(1, 2, 4, 65)
+
+    with torch.no_grad():
+        base_y, base_mask = base(x, return_mask=True)
+        kv_y, kv_mask = kvsplit(x, return_mask=True)
+        base_state = base.init_stream_state(batch_size=1, dtype=x.dtype)
+        kv_state = kvsplit.init_stream_state(batch_size=1, dtype=x.dtype)
+        base_frames = []
+        kv_frames = []
+        for frame_idx in range(x.shape[2]):
+            frame = x[:, :, frame_idx : frame_idx + 1, :]
+            base_frame, base_state = base.forward_stream(frame, base_state)
+            kv_frame, kv_state = kvsplit.forward_stream(frame, kv_state)
+            base_frames.append(base_frame)
+            kv_frames.append(kv_frame)
+        base_stream = torch.cat(base_frames, dim=2)
+        kv_stream = torch.cat(kv_frames, dim=2)
+
+    torch.testing.assert_close(kv_mask, base_mask, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(kv_y, base_y, rtol=3e-5, atol=3e-5)
+    torch.testing.assert_close(kv_stream, base_stream, rtol=3e-5, atol=3e-5)
+
+
+def test_sfc_small_conv2d_bn_kvsplit_recipe_builds_onfly_system() -> None:
+    config_path = Path("recipes/dnr/models/sfc-small-conv2d-bn-npu-kvsplit.musical64.onfly.rt192k/config.yaml")
+    system = build_model_system_from_recipe_config(config_path).eval()
+    core = system.model.core
+    assert isinstance(core, SFCSmallConv2DBNNPUKvSplitCore)
+    assert core.n_freq == 1025
+    assert core.n_bands == 64
+    assert not hasattr(core.encoder, "kv_proj")
+    assert not hasattr(core.decoder, "kv_proj")
+    assert hasattr(core.encoder, "key_proj")
+    assert hasattr(core.encoder, "value_proj")
+    assert core.state_size_bytes(dtype=torch.float16) < 192 * 1024
+
+
 def test_sfc_small_conv2d_bn_streaming_onnx_export_uses_npu_friendly_ops() -> None:
     onnx = pytest.importorskip("onnx")
 
@@ -159,3 +224,45 @@ def test_sfc_small_conv2d_bn_streaming_onnx_export_uses_npu_friendly_ops() -> No
     assert op_counts["Softmax"] == 2
     assert not {"Gemm", "LayerNormalization", "RMSNormalization"} & ops
     assert not {"Pad", "ConstantOfShape", "Expand", "Tile"} & ops
+
+
+def test_sfc_small_conv2d_bn_kvsplit_rawmask_streaming_onnx_removes_kv_slices_and_scale_mul() -> None:
+    onnx = pytest.importorskip("onnx")
+
+    model = SFCSmallConv2DBNNPUKvSplitCore(
+        n_freq=65,
+        n_bands=8,
+        n_src=2,
+        n_chan=1,
+        d_inner=16,
+        d_model=32,
+        n_separator_layers=2,
+        masking=False,
+    ).eval()
+    wrapper = StreamingStateIOWrapper(model, batch_size=1, dtype=torch.float32)
+    state = model.init_stream_state(batch_size=1, dtype=torch.float32)
+    flat_state, _ = flatten_tensor_tree(state)
+    x = torch.randn(1, 2, 1, 65)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir) / "sfc_small_conv2d_bn_npu_kvsplit.onnx"
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                (x, *flat_state),
+                str(out),
+                opset_version=11,
+                input_names=["x", *[f"state_{idx}" for idx in range(len(flat_state))]],
+                output_names=["y", *[f"next_state_{idx}" for idx in range(len(flat_state))]],
+                do_constant_folding=True,
+                dynamo=False,
+            )
+        graph = onnx.load(str(out))
+        onnx.checker.check_model(graph)
+
+    op_counts = Counter(node.op_type for node in graph.graph.node)
+    assert op_counts["MatMul"] == 4
+    assert op_counts["Softmax"] == 2
+    assert op_counts["Slice"] == 0
+    assert op_counts["Mul"] == 0
+    assert not {"Gemm", "LayerNormalization", "RMSNormalization", "Pad", "Expand", "Tile"} & set(op_counts)

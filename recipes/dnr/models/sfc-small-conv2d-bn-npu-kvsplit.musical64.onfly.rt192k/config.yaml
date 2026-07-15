@@ -1,0 +1,5 @@
+_base_: ../sfc-small-conv2d-bn-npu.musical64.onfly.rt192k/config.yaml
+
+task:
+  model:
+    _target_: spectral_feature_compression.core.model.sfc_small_conv2d_bn_npu_kvsplit.build_sfc_small_conv2d_bn_npu_kvsplit_system

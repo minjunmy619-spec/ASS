@@ -82,6 +82,8 @@ _EXPORTS = {
     "OnlineSFCLocoformerConv2D32BNPU2D": f"{_MODEL}.sfc_locoformer_conv2d_32b_npu",
     "OnlineSFCLocoformerConv2D32BNPUModel": f"{_MODEL}.sfc_locoformer_conv2d_32b_npu",
     "SFCSmallConv2DBNNPUCore": f"{_MODEL}.sfc_small_conv2d_bn_npu",
+    "SFCSmallConv2DBNNPUKvSplitCore": f"{_MODEL}.sfc_small_conv2d_bn_npu_kvsplit",
+    "SFCSmallConv2DBNNPUKvSplitModel": f"{_MODEL}.sfc_small_conv2d_bn_npu_kvsplit",
     "SFCSmallConv2DBNNPUModel": f"{_MODEL}.sfc_small_conv2d_bn_npu",
     "FoldedFullBandSourceAwareComplexHead2d": f"{_MODEL}.sfc_locoformer_conv2d_32b_npu",
     "SourceWiseSigmoidTanhComplexHead2d": f"{_MODEL}.sfc_locoformer_conv2d_32b_npu",

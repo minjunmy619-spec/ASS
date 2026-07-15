@@ -743,3 +743,130 @@ Deployment guidance from this pass:
   at 152 nodes either way.
 - The remaining `STRIDED_SLICE` ops in the raw-mask optimized graph are from
   key/value splitting and are much smaller than the original per-head split.
+
+Optional ABI-changing flag result:
+
+```text
+with --nchw_to_nhwc_input_shape --nchw_to_nhwc_output_shape:
+  masked optimized Circle:   nodes=172 memory_ops=58 TRANSPOSE=19
+  raw-mask optimized Circle: nodes=134 memory_ops=38 TRANSPOSE=8
+```
+
+This is the best measured flag-level latency improvement after the batched-head
+rewrite, but it changes external tensor shapes.  For example, the raw-mask input
+becomes `[1, 1, 1025, 2]` and each separator state becomes `[1, 1, 64, 160]`.
+Use it only if the calibration H5 writer and runtime integration are switched
+to NHWC tensors.
+
+Implemented NHWC raw-mask ABI artifacts under:
+
+```text
+logs/npu_efficiency_audit/sfc_small_conv2d_bn_npu_20260715/nhwc_abi_rawmask/
+  build_nhwc_abi_rawmask.py
+  stream_rawmask.onnx
+  stream_rawmask.circle
+  stream_rawmask.nhwc.opt.circle
+  stream_rawmask.nhwc.opt.q.circle
+  calib_nhwc.h5
+  calib_nhwc_list.txt
+  calib_npy/
+  manifest.json
+  stream_rawmask.nhwc.opt.tensor_shape.txt
+```
+
+Build command:
+
+```bash
+.venv/bin/python \
+  logs/npu_efficiency_audit/sfc_small_conv2d_bn_npu_20260715/nhwc_abi_rawmask/build_nhwc_abi_rawmask.py \
+  --records 64
+```
+
+The script exports raw-mask streaming ONNX, imports it to Circle, applies the
+NHWC ABI optimize flags, generates 64 NHWC calibration records, packages
+`calib_nhwc.h5` with `one-create-quant-dataset`, and quantizes with the
+percentile `0.1/99.9` setting.
+
+Sanity check:
+
+```text
+calib_nhwc.h5 records: 64
+input 0: [1, 1, 1025, 2] float32
+input 1-8: [1, 1, 64, 160] float32
+
+stream_rawmask.nhwc.opt.circle:
+  ADD=28 BATCH_MATMUL=4 CONCATENATION=8 CONV_2D=60 MUL=2 PAD=12
+  RESHAPE=6 SOFTMAX=2 STRIDED_SLICE=4 TRANSPOSE=8
+
+stream_rawmask.nhwc.opt.q.circle: 4.0M
+```
+
+## 2026-07-16 KV-Split Query-Scaled Variant
+
+Implemented a new variant rather than modifying the base SFC-small NPU model:
+
+```text
+spectral_feature_compression/core/model/sfc_small_conv2d_bn_npu_kvsplit.py
+recipes/dnr/models/sfc-small-conv2d-bn-npu-kvsplit.musical64.onfly.rt192k/config.yaml
+```
+
+Changes versus the base faithful SFC-small Conv2D BN NPU model:
+
+- Replaced each shared `kv_proj: Conv2d(d, 2d)` with separate
+  `key_proj: Conv2d(d, d)` and `value_proj: Conv2d(d, d)`.
+- Absorbed `head_dim ** -0.5` into encoder/decoder query parameters.  For the
+  adaptive encoder path, the scale is absorbed into `adaptive_pool`.
+- Added `convert_sfc_small_conv2d_bn_npu_state_dict_to_kvsplit()` so a base
+  checkpoint can be mapped exactly: `kv_proj.weight[:d] -> key_proj.weight`,
+  `kv_proj.weight[d:] -> value_proj.weight`, and query tensors are scaled.
+
+Validation:
+
+```bash
+.venv/bin/python -m pytest tests/test_sfc_small_conv2d_bn_npu.py -q
+```
+
+Result:
+
+```text
+11 passed
+```
+
+The equivalence test loads a converted base state dict into the KV-split model
+and checks full forward masks, separated output, and streaming output.
+
+Raw-mask streaming export and NHWC Circle artifacts:
+
+```text
+logs/npu_efficiency_audit/sfc_small_conv2d_bn_npu_kvsplit_20260716/
+  stream_rawmask.onnx
+  stream_rawmask.circle
+  stream_rawmask.nhwc.opt.circle
+  stream_rawmask.nhwc.opt.tensor_shape.txt
+  stream_rawmask.circle.operators.json
+  stream_rawmask.nhwc.opt.circle.operators.json
+```
+
+Measured counts:
+
+```text
+raw-mask ONNX:
+  nodes=149
+  Add=28 Concat=8 Constant=6 Conv=62 MatMul=4 Relu=29
+  Reshape=6 Softmax=2 Transpose=4
+
+raw-mask imported Circle:
+  nodes=250
+  ADD=28 BATCH_MATMUL=4 CONCATENATION=8 CONV_2D=62 PAD=12
+  RESHAPE=6 SOFTMAX=2 TRANSPOSE=128
+
+raw-mask NHWC optimized Circle:
+  nodes=132
+  ADD=28 BATCH_MATMUL=4 CONCATENATION=8 CONV_2D=62 PAD=12
+  RESHAPE=6 SOFTMAX=2 TRANSPOSE=10
+```
+
+This removes the expected `STRIDED_SLICE=4` and `MUL=2` from the previous
+raw-mask NHWC optimized Circle graph.  The graph has two more Conv2D nodes
+because key/value projection is now represented by two Conv2D ops instead of one
+wide Conv2D plus slices.
