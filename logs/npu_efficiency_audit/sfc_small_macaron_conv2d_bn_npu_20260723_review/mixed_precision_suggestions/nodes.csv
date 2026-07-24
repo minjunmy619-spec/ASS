@@ -1,0 +1,131 @@
+rank,score,name,op,depth,rough_ops,latency_risk,boundary_risk,qerror,eligible,output_shape,producers,consumers,reasons
+1,93.186,/output/Conv,CONV_2D,116,110700,23.525,10.500,0,1,1x1x1025x6,128,,quality-sensitive CONV_2D; graph output path; name hint: out; late-stage node
+2,90.500,/Softmax_1,SOFTMAX,106,147600,15.910,13.000,0,1,1x4x1025x36,118,120,quality-sensitive SOFTMAX; name hint: softmax; late-stage node
+3,83.571,/MatMul_2,BATCH_MATMUL,104,1180800,26.689,5.000,0,1,1x4x1025x36,116,118,quality-sensitive BATCH_MATMUL; late-stage node
+4,83.571,/MatMul_3,BATCH_MATMUL,108,1180800,26.689,5.000,0,1,1x4x8x1025,113;120,122,quality-sensitive BATCH_MATMUL; late-stage node
+5,80.500,/Softmax,SOFTMAX,8,147600,15.910,13.000,0,1,1x4x36x1025,9,11,quality-sensitive SOFTMAX; name hint: softmax
+6,73.571,/MatMul,BATCH_MATMUL,6,1180800,26.689,5.000,0,1,1x4x36x1025,7,9,quality-sensitive BATCH_MATMUL
+7,73.571,/MatMul_1,BATCH_MATMUL,10,1180800,26.689,5.000,0,1,1x4x8x36,4;11,13,quality-sensitive BATCH_MATMUL
+8,67.119,/value_proj_1/Conv,CONV_2D,101,36864,22.055,13.000,0,1,1x1x36x32,110,112,quality-sensitive CONV_2D; name hint: value; late-stage node
+9,67.119,/key_proj_1/Conv,CONV_2D,101,36864,22.055,13.000,0,1,1x1x36x32,110,115,quality-sensitive CONV_2D; name hint: key; late-stage node
+10,65.081,/output/conv_6/Conv,CONV_2D,97,589824,25.761,13.000,0,1,1x1x36x128,106,108,quality-sensitive CONV_2D; name hint: out; late-stage node
+11,64.613,/value/conv_3/Conv,CONV_2D,93,1115136,26.612,13.000,0,1,1x1x36x176,101,106,quality-sensitive CONV_2D; name hint: value; late-stage node
+12,55.312,/input/conv_1/Conv,CONV_2D,100,110592,23.524,13.000,0,1,1x1x36x32,109,111;114,quality-sensitive CONV_2D; late-stage node
+13,55.081,/freq_path/pre_ffn/output/conv/Conv,CONV_2D,25,589824,25.761,13.000,0,1,1x1x36x128,27,29,quality-sensitive CONV_2D; name hint: out
+14,55.081,/freq_path/mixer/output/conv/Conv,CONV_2D,29,589824,25.761,13.000,0,1,1x1x36x128,31,33,quality-sensitive CONV_2D; name hint: out
+15,55.081,/freq_path/post_ffn/output/conv/Conv,CONV_2D,37,589824,25.761,13.000,0,1,1x1x36x128,40,42,quality-sensitive CONV_2D; name hint: out
+16,55.081,/output/conv_1/Conv,CONV_2D,45,589824,25.761,13.000,0,1,1x1x36x128,49,51,quality-sensitive CONV_2D; name hint: out
+17,55.081,/output/conv_2/Conv,CONV_2D,49,589824,25.761,13.000,0,1,1x1x36x128,53,55,quality-sensitive CONV_2D; name hint: out
+18,55.081,/output/conv_3/Conv,CONV_2D,57,589824,25.761,13.000,0,1,1x1x36x128,62,64,quality-sensitive CONV_2D; name hint: out
+19,55.081,/freq_path/pre_ffn/output/conv_1/Conv,CONV_2D,65,589824,25.761,13.000,0,1,1x1x36x128,71,73,quality-sensitive CONV_2D; name hint: out
+20,55.081,/freq_path/mixer/output/conv_1/Conv,CONV_2D,69,589824,25.761,13.000,0,1,1x1x36x128,75,77,quality-sensitive CONV_2D; name hint: out
+21,55.081,/freq_path/post_ffn/output/conv_1/Conv,CONV_2D,77,589824,25.761,13.000,0,1,1x1x36x128,84,86,quality-sensitive CONV_2D; name hint: out
+22,55.081,/output/conv_4/Conv,CONV_2D,85,589824,25.761,13.000,0,1,1x1x36x128,93,95,quality-sensitive CONV_2D; name hint: out
+23,55.081,/output/conv_5/Conv,CONV_2D,89,589824,25.761,13.000,0,1,1x1x36x128,97,99,quality-sensitive CONV_2D; name hint: out
+24,54.677,/ffn/ffn.0/conv_1/Conv;/ffn/ffn.0/act_1/Relu,CONV_2D,112,262400,24.679,13.000,0,1,1x1x1025x16,124,126,quality-sensitive CONV_2D; late-stage node
+25,54.658,/value_proj/Conv,CONV_2D,3,1049600,26.532,13.000,0,1,1x1x1025x32,1,3,quality-sensitive CONV_2D; name hint: value
+26,54.658,/key_proj/Conv,CONV_2D,3,1049600,26.532,13.000,0,1,1x1x1025x32,1,6,quality-sensitive CONV_2D; name hint: key
+27,54.613,/freq_path/pre_ffn/value/conv/Conv,CONV_2D,21,1115136,26.612,13.000,0,1,1x1x36x176,22,27,quality-sensitive CONV_2D; name hint: value
+28,54.613,/freq_path/post_ffn/value/conv/Conv,CONV_2D,33,1115136,26.612,13.000,0,1,1x1x36x176,35,40,quality-sensitive CONV_2D; name hint: value
+29,54.613,/value/conv/Conv,CONV_2D,41,1115136,26.612,13.000,0,1,1x1x36x176,44,49,quality-sensitive CONV_2D; name hint: value
+30,54.613,/value/conv_1/Conv,CONV_2D,53,1115136,26.612,13.000,0,1,1x1x36x176,57,62,quality-sensitive CONV_2D; name hint: value
+31,54.613,/freq_path/pre_ffn/value/conv_1/Conv,CONV_2D,61,1115136,26.612,13.000,0,1,1x1x36x176,66,71,quality-sensitive CONV_2D; name hint: value
+32,54.613,/freq_path/post_ffn/value/conv_1/Conv,CONV_2D,73,1115136,26.612,13.000,0,1,1x1x36x176,79,84,quality-sensitive CONV_2D; name hint: value
+33,54.613,/value/conv_2/Conv,CONV_2D,81,1115136,26.612,13.000,0,1,1x1x36x176,88,93,quality-sensitive CONV_2D; name hint: value
+34,54.274,/output/conv/Conv,CONV_2D,18,1769472,27.230,13.000,0,1,1x1x36x128,19,21;29,quality-sensitive CONV_2D; name hint: out
+35,53.658,/aggregate/conv_1/Conv,CONV_2D,111,1049600,26.532,13.000,0,1,1x1x1025x32,123,125;127,quality-sensitive CONV_2D; late-stage node
+36,53.658,/ffn/ffn.1/conv_1/Conv,CONV_2D,113,1049600,26.532,13.000,0,1,1x1x1025x32,125,127,quality-sensitive CONV_2D; late-stage node
+37,53.613,/gate/conv_3/Conv,CONV_2D,93,1115136,26.612,13.000,0,1,1x1x36x176,101,104;105,quality-sensitive CONV_2D; late-stage node
+38,49.813,/Sigmoid_3,LOGISTIC,94,6336,11.703,13.000,0,1,1x1x36x176,103,105,quality-sensitive LOGISTIC; late-stage node
+39,47.047,/freq_path/Add_2,ADD,38,4608,11.278,13.000,0,1,1x1x36x128,33;41,43;51,graph output path
+40,47.047,/Add_2,ADD,46,4608,11.278,13.000,0,1,1x1x36x128,42;50,52;55,graph output path
+41,47.047,/Add_3,ADD,50,4608,11.278,13.000,0,1,1x1x36x128,51;54,56;64,graph output path
+42,47.047,/freq_path_1/Add_2,ADD,78,4608,11.278,13.000,0,1,1x1x36x128,77;85,87;95,graph output path
+43,47.047,/Add_5,ADD,86,4608,11.278,13.000,0,1,1x1x36x128,86;94,96;99,graph output path
+44,47.047,/Add_6,ADD,90,4608,11.278,13.000,0,1,1x1x36x128,95;98,100;108,graph output path
+45,46.119,/aggregate/conv/Conv,CONV_2D,13,36864,22.055,13.000,0,1,1x1x36x32,14,16;18,quality-sensitive CONV_2D
+46,46.119,/ffn/ffn.1/conv/Conv,CONV_2D,15,36864,22.055,13.000,0,1,1x1x36x32,16,18,quality-sensitive CONV_2D
+47,45.100,/ffn/ffn.0/conv/Conv;/ffn/ffn.0/act/Relu,CONV_2D,14,147456,23.908,13.000,0,1,1x1x36x64,15,17,quality-sensitive CONV_2D
+48,43.613,/freq_path/pre_ffn/gate/conv/Conv,CONV_2D,21,1115136,26.612,13.000,0,1,1x1x36x176,22,25;26,quality-sensitive CONV_2D
+49,43.613,/freq_path/post_ffn/gate/conv/Conv,CONV_2D,33,1115136,26.612,13.000,0,1,1x1x36x176,35,38;39,quality-sensitive CONV_2D
+50,43.613,/gate/conv/Conv,CONV_2D,41,1115136,26.612,13.000,0,1,1x1x36x176,44,47;48,quality-sensitive CONV_2D
+51,43.613,/gate/conv_1/Conv,CONV_2D,53,1115136,26.612,13.000,0,1,1x1x36x176,57,60;61,quality-sensitive CONV_2D
+52,43.613,/freq_path/pre_ffn/gate/conv_1/Conv,CONV_2D,61,1115136,26.612,13.000,0,1,1x1x36x176,66,69;70,quality-sensitive CONV_2D
+53,43.613,/freq_path/post_ffn/gate/conv_1/Conv,CONV_2D,73,1115136,26.612,13.000,0,1,1x1x36x176,79,82;83,quality-sensitive CONV_2D
+54,43.613,/gate/conv_2/Conv,CONV_2D,81,1115136,26.612,13.000,0,1,1x1x36x176,88,91;92,quality-sensitive CONV_2D
+55,42.850,/input/conv/Conv,CONV_2D,2,3148800,28.000,13.000,0,1,1x1x1025x32,0,2;5,quality-sensitive CONV_2D
+56,41.813,/Mul_6,MUL,95,6336,11.703,5.000,0,1,1x1x36x176,103;104,106,late-stage node
+57,41.813,/Mul_7,MUL,96,6336,11.703,5.000,0,1,1x1x36x176,102;105,107,late-stage node
+58,39.813,/freq_path/pre_ffn/Sigmoid,LOGISTIC,22,6336,11.703,13.000,0,1,1x1x36x176,24,26,quality-sensitive LOGISTIC
+59,39.813,/freq_path/post_ffn/Sigmoid,LOGISTIC,34,6336,11.703,13.000,0,1,1x1x36x176,37,39,quality-sensitive LOGISTIC
+60,39.813,/Sigmoid,LOGISTIC,42,6336,11.703,13.000,0,1,1x1x36x176,46,48,quality-sensitive LOGISTIC
+61,39.813,/Sigmoid_1,LOGISTIC,54,6336,11.703,13.000,0,1,1x1x36x176,59,61,quality-sensitive LOGISTIC
+62,39.813,/freq_path/pre_ffn_1/Sigmoid,LOGISTIC,62,6336,11.703,13.000,0,1,1x1x36x176,68,70,quality-sensitive LOGISTIC
+63,39.813,/freq_path/post_ffn_1/Sigmoid,LOGISTIC,74,6336,11.703,13.000,0,1,1x1x36x176,81,83,quality-sensitive LOGISTIC
+64,39.813,/Sigmoid_2,LOGISTIC,82,6336,11.703,13.000,0,1,1x1x36x176,90,92,quality-sensitive LOGISTIC
+65,39.138,/conv/Conv,DEPTHWISE_CONV_2D,40,9216,20.204,13.000,0,1,1x1x36x128,43,45;46,quality-sensitive DEPTHWISE_CONV_2D
+66,39.138,/conv_1/Conv,DEPTHWISE_CONV_2D,48,9216,20.204,13.000,0,1,1x1x36x128,52,54,quality-sensitive DEPTHWISE_CONV_2D
+67,39.138,/conv_2/Conv,DEPTHWISE_CONV_2D,52,9216,20.204,13.000,0,1,1x1x36x128,56,58;59,quality-sensitive DEPTHWISE_CONV_2D
+68,39.138,/conv_3/Conv,DEPTHWISE_CONV_2D,80,9216,20.204,13.000,0,1,1x1x36x128,87,89;90,quality-sensitive DEPTHWISE_CONV_2D
+69,39.138,/conv_4/Conv,DEPTHWISE_CONV_2D,88,9216,20.204,13.000,0,1,1x1x36x128,96,98,quality-sensitive DEPTHWISE_CONV_2D
+70,39.138,/conv_5/Conv,DEPTHWISE_CONV_2D,92,9216,20.204,13.000,0,1,1x1x36x128,100,102;103,quality-sensitive DEPTHWISE_CONV_2D
+71,37.657,/freq_path/pre_ffn/axis_mix/conv/Conv,DEPTHWISE_CONV_2D,20,69120,22.896,13.000,0,1,1x1x36x128,21,23;24,quality-sensitive DEPTHWISE_CONV_2D
+72,37.657,/freq_path/mixer/axis_mix/conv/Conv,DEPTHWISE_CONV_2D,28,69120,22.896,13.000,0,1,1x1x36x128,30,32,quality-sensitive DEPTHWISE_CONV_2D
+73,37.657,/freq_path/post_ffn/axis_mix/conv/Conv,DEPTHWISE_CONV_2D,32,69120,22.896,13.000,0,1,1x1x36x128,34,36;37,quality-sensitive DEPTHWISE_CONV_2D
+74,37.657,/freq_path/pre_ffn/axis_mix/conv_1/Conv,DEPTHWISE_CONV_2D,60,69120,22.896,13.000,0,1,1x1x36x128,65,67;68,quality-sensitive DEPTHWISE_CONV_2D
+75,37.657,/freq_path/mixer/axis_mix/conv_1/Conv,DEPTHWISE_CONV_2D,68,69120,22.896,13.000,0,1,1x1x36x128,74,76,quality-sensitive DEPTHWISE_CONV_2D
+76,37.657,/freq_path/post_ffn/axis_mix/conv_1/Conv,DEPTHWISE_CONV_2D,72,69120,22.896,13.000,0,1,1x1x36x128,78,80;81,quality-sensitive DEPTHWISE_CONV_2D
+77,32.047,/Add_7,ADD,98,4608,11.278,13.000,0,1,1x1x36x128,99;107,109,late-stage node
+78,31.813,/freq_path/pre_ffn/Mul,MUL,23,6336,11.703,5.000,0,1,1x1x36x176,24;25,27,low-priority fallback
+79,31.813,/freq_path/pre_ffn/Mul_1,MUL,24,6336,11.703,5.000,0,1,1x1x36x176,23;26,28,low-priority fallback
+80,31.813,/freq_path/post_ffn/Mul,MUL,35,6336,11.703,5.000,0,1,1x1x36x176,37;38,40,low-priority fallback
+81,31.813,/freq_path/post_ffn/Mul_1,MUL,36,6336,11.703,5.000,0,1,1x1x36x176,36;39,41,low-priority fallback
+82,31.813,/Mul,MUL,43,6336,11.703,5.000,0,1,1x1x36x176,46;47,49,low-priority fallback
+83,31.813,/Mul_1,MUL,44,6336,11.703,5.000,0,1,1x1x36x176,45;48,50,low-priority fallback
+84,31.813,/Mul_2,MUL,55,6336,11.703,5.000,0,1,1x1x36x176,59;60,62,low-priority fallback
+85,31.813,/Mul_3,MUL,56,6336,11.703,5.000,0,1,1x1x36x176,58;61,63,low-priority fallback
+86,31.813,/freq_path/pre_ffn_1/Mul,MUL,63,6336,11.703,5.000,0,1,1x1x36x176,68;69,71,low-priority fallback
+87,31.813,/freq_path/pre_ffn_1/Mul_1,MUL,64,6336,11.703,5.000,0,1,1x1x36x176,67;70,72,low-priority fallback
+88,31.813,/freq_path/post_ffn_1/Mul,MUL,75,6336,11.703,5.000,0,1,1x1x36x176,81;82,84,low-priority fallback
+89,31.813,/freq_path/post_ffn_1/Mul_1,MUL,76,6336,11.703,5.000,0,1,1x1x36x176,80;83,85,low-priority fallback
+90,31.813,/Mul_4,MUL,83,6336,11.703,5.000,0,1,1x1x36x176,90;91,93,low-priority fallback
+91,31.813,/Mul_5,MUL,84,6336,11.703,5.000,0,1,1x1x36x176,89;92,94,low-priority fallback
+92,30.605,/Add_9,ADD,114,32800,13.899,13.000,0,1,1x1x1025x32,124;126,128,late-stage node
+93,29.500,/Add_8,ADD,105,147600,15.910,13.000,0,1,1x4x1025x36,117,119,late-stage node
+94,23.061,/Add_1,ADD,16,1152,9.434,13.000,0,1,1x1x36x32,15;17,19,low-priority fallback
+95,22.047,/freq_path/Add,ADD,26,4608,11.278,13.000,0,1,1x1x36x128,20;28,30;33,low-priority fallback
+96,22.047,/freq_path/Add_1,ADD,30,4608,11.278,13.000,0,1,1x1x36x128,29;32,34;42,low-priority fallback
+97,22.047,/Add_4,ADD,58,4608,11.278,13.000,0,1,1x1x36x128,55;63,65;73,low-priority fallback
+98,22.047,/freq_path_1/Add,ADD,66,4608,11.278,13.000,0,1,1x1x36x128,64;72,74;77,low-priority fallback
+99,22.047,/freq_path_1/Add_1,ADD,70,4608,11.278,13.000,0,1,1x1x36x128,73;76,78;86,low-priority fallback
+100,19.500,/Add,ADD,7,147600,15.910,13.000,0,1,1x4x36x1025,8,10,low-priority fallback
+101,-1011.939,/value_proj_1/Conv/post_tr,TRANSPOSE,102,1152,9.434,17.000,0,0,1x32x1x36,111,113,name hint: value; late-stage node; memory/shape op: avoid isolated int16; excluded op type
+102,-1011.939,/key_proj_1/Conv/post_tr,TRANSPOSE,102,1152,9.434,17.000,0,0,1x32x1x36,114,116,name hint: key; late-stage node; memory/shape op: avoid isolated int16; excluded op type
+103,-1020.396,/output/Conv/pads,PAD,115,32864,13.902,25.000,0,0,1x1x1027x32,127,129,name hint: out; late-stage node; memory/shape op: avoid isolated int16; excluded op type
+104,-1024.395,/value_proj/Conv/post_tr,TRANSPOSE,4,32800,13.899,17.000,0,0,1x32x1x1025,2,4,name hint: value; memory/shape op: avoid isolated int16; excluded op type
+105,-1024.395,/key_proj/Conv/post_tr,TRANSPOSE,4,32800,13.899,17.000,0,0,1x32x1x1025,5,7,name hint: key; memory/shape op: avoid isolated int16; excluded op type
+106,-1025.395,/aggregate/conv_1/Conv/pre_tr,TRANSPOSE,110,32800,13.899,17.000,0,0,1x1x1025x32,122,124,late-stage node; memory/shape op: avoid isolated int16; excluded op type
+107,-1026.500,/Transpose_1,TRANSPOSE,107,147600,15.910,17.000,0,0,1x4x36x1025,119,121,late-stage node; memory/shape op: avoid isolated int16; excluded op type
+108,-1027.978,/output/conv/Conv/pads,PAD,17,1216,9.506,25.000,0,0,1x1x38x32,18,20,name hint: out; memory/shape op: avoid isolated int16; excluded op type
+109,-1028.939,/Reshape_4,RESHAPE,103,1152,9.434,25.000,0,0,1x4x8x36,112,121,late-stage node; memory/shape op: avoid isolated int16; excluded op type
+110,-1028.939,/Reshape_3,RESHAPE,103,1152,9.434,25.000,0,0,1x4x8x36,115,117,late-stage node; memory/shape op: avoid isolated int16; excluded op type
+111,-1029.993,/input/conv_1/Conv/pads,PAD,99,4864,11.351,25.000,0,0,1x1x38x128,108,110,late-stage node; memory/shape op: avoid isolated int16; excluded op type
+112,-1031.395,/Reshape_5,RESHAPE,109,32800,13.899,25.000,0,0,1x32x1x1025,121,123,late-stage node; memory/shape op: avoid isolated int16; excluded op type
+113,-1032.939,/aggregate/conv/Conv/pre_tr,TRANSPOSE,12,1152,9.434,17.000,0,0,1x1x36x32,13,15,memory/shape op: avoid isolated int16; excluded op type
+114,-1036.500,/Transpose,TRANSPOSE,9,147600,15.910,17.000,0,0,1x4x1025x36,10,12,memory/shape op: avoid isolated int16; excluded op type
+115,-1037.486,/input/conv/Conv/pads,PAD,1,2054,10.202,22.500,0,0,1x1x1027x2,,1,memory/shape op: avoid isolated int16; excluded op type
+116,-1038.939,/Reshape_2,RESHAPE,11,1152,9.434,25.000,0,0,1x32x1x36,12,14,memory/shape op: avoid isolated int16; excluded op type
+117,-1040.194,/freq_path/pre_ffn/axis_mix/conv/Conv/pads,PAD,19,6400,11.717,25.000,0,0,1x1x50x128,20,22,memory/shape op: avoid isolated int16; excluded op type
+118,-1040.194,/freq_path/mixer/axis_mix/conv/Conv/pads,PAD,27,6400,11.717,25.000,0,0,1x1x50x128,29,31,memory/shape op: avoid isolated int16; excluded op type
+119,-1040.194,/freq_path/post_ffn/axis_mix/conv/Conv/pads,PAD,31,6400,11.717,25.000,0,0,1x1x50x128,33,35,memory/shape op: avoid isolated int16; excluded op type
+120,-1040.194,/freq_path/pre_ffn/axis_mix/conv_1/Conv/pads,PAD,59,6400,11.717,25.000,0,0,1x1x50x128,64,66,memory/shape op: avoid isolated int16; excluded op type
+121,-1040.194,/freq_path/mixer/axis_mix/conv_1/Conv/pads,PAD,67,6400,11.717,25.000,0,0,1x1x50x128,73,75,memory/shape op: avoid isolated int16; excluded op type
+122,-1040.194,/freq_path/post_ffn/axis_mix/conv_1/Conv/pads,PAD,71,6400,11.717,25.000,0,0,1x1x50x128,77,79,memory/shape op: avoid isolated int16; excluded op type
+123,-1040.462,/Concat,CONCATENATION,39,9216,12.204,25.000,0,0,1x2x36x128,42,44,memory/shape op: avoid isolated int16; excluded op type
+124,-1040.462,/Concat_1,CONCATENATION,47,9216,12.204,25.000,0,0,1x2x36x128,51,53,memory/shape op: avoid isolated int16; excluded op type
+125,-1040.462,/Concat_2,CONCATENATION,51,9216,12.204,25.000,0,0,1x2x36x128,55,57,memory/shape op: avoid isolated int16; excluded op type
+126,-1040.462,/Concat_3,CONCATENATION,79,9216,12.204,25.000,0,0,1x2x36x128,86,88,memory/shape op: avoid isolated int16; excluded op type
+127,-1040.462,/Concat_4,CONCATENATION,87,9216,12.204,25.000,0,0,1x2x36x128,95,97,memory/shape op: avoid isolated int16; excluded op type
+128,-1040.462,/Concat_5,CONCATENATION,91,9216,12.204,25.000,0,0,1x2x36x128,99,101,memory/shape op: avoid isolated int16; excluded op type
+129,-1041.395,/Reshape_1,RESHAPE,5,32800,13.899,25.000,0,0,1x4x8x1025,3,12,memory/shape op: avoid isolated int16; excluded op type
+130,-1041.395,/Reshape,RESHAPE,5,32800,13.899,25.000,0,0,1x4x8x1025,6,8,memory/shape op: avoid isolated int16; excluded op type

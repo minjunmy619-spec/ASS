@@ -16,7 +16,12 @@ ROOT = Path("/home/cmj/works/ASS")
 ONE_CMDS = Path(os.environ.get("ONE_CMDS", "/home/cmj/works/ONE/build/compiler/one-cmds"))
 ONE_BUILD_COMPILER = Path(os.environ.get("ONE_BUILD_COMPILER", str(ONE_CMDS.parent)))
 DEFAULT_ONE_QUANTIZE = ONE_CMDS / "one-quantize"
-DEFAULT_CIRCLE_INSPECT = ONE_CMDS / "circle-inspect"
+DEFAULT_CIRCLE_INSPECT = Path(
+    os.environ.get(
+        "ONE_CIRCLE_INSPECT",
+        str(ONE_BUILD_COMPILER / "circle-inspect" / "circle-inspect"),
+    )
+)
 DEFAULT_OUT_ROOT = ROOT / "logs" / "one_stock_quant_sweep"
 
 

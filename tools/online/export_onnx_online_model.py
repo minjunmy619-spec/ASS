@@ -433,6 +433,7 @@ def get_allowed_ops(preset: str) -> set[str]:
         "none": set(),
         "edge_npu_recommended": {
             "Add",
+            "AveragePool",
             "BatchNormalization",
             "Cast",
             "Clip",
@@ -514,6 +515,12 @@ def main():
     )
     parser.add_argument("--out", type=Path, required=True, help="Output ONNX path")
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional initialization seed for reproducible config-only structural exports.",
+    )
 
     parser.add_argument("--n-chan", type=int, required=True, help="Number of audio channels M")
     parser.add_argument("--frames", type=int, default=64, help="Fixed number of frames T for export")
@@ -583,6 +590,8 @@ def main():
     if args.opset < 11 or args.opset > 14:
         raise ValueError(f"Unsupported opset {args.opset}. Current NPU compilation supports ONNX opset 11~14 only.")
 
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
     core, source_mode = load_export_core(args.model_path, args.device)
     frequency_preprocess_meta = load_frequency_preprocess_metadata(args.model_path)
     dc_bypass_meta = load_dc_bypass_metadata(args.model_path)

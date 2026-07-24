@@ -1,0 +1,246 @@
+trainer:
+  _target_: lightning.Trainer
+  default_root_dir: ${working_directory}
+  logger:
+    _target_: lightning.pytorch.loggers.TensorBoardLogger
+    save_dir: ${working_directory}
+    name: ''
+    version: ''
+  max_epochs: 150
+  check_val_every_n_epoch: 1
+  gradient_clip_val: 5.0
+  sync_batchnorm: true
+  deterministic: false
+  benchmark: true
+  precision: bf16-mixed
+  limit_train_batches: 1354
+  limit_val_batches: 10
+  use_distributed_sampler: false
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      filename: '{epoch:04d}'
+      save_top_k: 5
+      monitor: validation/loss
+      mode: min
+      save_last: true
+    - _target_: lightning.pytorch.callbacks.RichProgressBar
+      refresh_rate: 5
+    - _target_: lightning.pytorch.callbacks.RichModelSummary
+      max_depth: 3
+datamodule:
+  _target_: spectral_feature_compression.common.datamodules.on_the_fly_stem_datamodule.OnTheFlyStemDataModule
+  sr: 44100
+  duration: 6.0
+  batch_size: 4
+  val_batch_size: 1
+  test_batch_size: 1
+  num_workers: 4
+  dataset_length: 240000
+  val_dataset_length: 2000
+  test_dataset_length: 2000
+  train_seed: null
+  val_seed: 2026
+  test_seed: 2027
+  source_order: [speech, music, effects]
+  source_manifest_csv: [./data/dcase2026_task4_dev_set/manifests/train_sources.csv]
+  val_source_manifest_csv: [./data/dcase2026_task4_dev_set/manifests/validation_sources.csv]
+  test_source_manifest_csv: [./data/dcase2026_task4_dev_set/manifests/validation_sources.csv]
+  synthesis:
+    backend: dry_mix
+    mixture_duration: 6.0
+    short_clip_policy: concatenate
+    same_stem_placement:
+      mode: random_sequential
+      initial_offset_sec_range: [0.0, 0.5]
+      gap_sec_range: [0.0, 0.45]
+      overlap_sec_range: [0.0, 0.3]
+      allow_self_overlap: true
+      max_self_overlap: 2
+    normalize_sources: true
+    source_normalization:
+      mode:
+        speech: percentile_rms
+        music: full_rms
+        effects: percentile_rms
+      target_rms:
+        speech: 0.12
+        music: 0.1
+        effects: 0.1
+      top_percent:
+        speech: 35.0
+        effects: 45.0
+      activity_threshold_db: -48.0
+      min_rms_db:
+        speech: -48.0
+        music: -54.0
+        effects: -54.0
+      max_gain_db:
+        speech: 12.0
+        music: 10.0
+        effects: 12.0
+    source_activity_threshold: 0.0001
+    crop_retry: 8
+    peak_norm_db: -1.0
+    peak_norm_mode: scale_down
+    synthesis_profiles:
+      - name: football_commentary_focus
+        weight: 0.3
+        active_stem_count:
+          mode: weighted
+          weights:
+            2: 0.35
+            3: 0.65
+        stem_sampling_weights:
+          speech: 3.0
+          music: 0.4
+          effects: 3.0
+        clips_per_active_stem:
+          speech: [1, 2]
+          music: [1, 1]
+          effects: [2, 5]
+        stem_gain_db:
+          speech: [-3, 5]
+          music: [-14, -3]
+          effects: [-8, 8]
+        stem_snr_db:
+          enabled: true
+          anchor: speech
+          range:
+            music: [6, 18]
+            effects: [-6, 9]
+      - name: live_concert_vocal_music
+        weight: 0.25
+        active_stem_count:
+          mode: weighted
+          weights:
+            2: 0.25
+            3: 0.75
+        stem_sampling_weights:
+          speech: 2.5
+          music: 3.0
+          effects: 1.5
+        clips_per_active_stem:
+          speech: [1, 2]
+          music: [1, 1]
+          effects: [1, 4]
+        stem_gain_db:
+          speech: [-6, 4]
+          music: [-4, 5]
+          effects: [-10, 2]
+        stem_snr_db:
+          enabled: true
+          anchor: music
+          range:
+            speech: [-4, 8]
+            effects: [3, 16]
+      - name: karaoke_music_control
+        weight: 0.2
+        active_stem_count:
+          mode: weighted
+          weights:
+            1: 0.25
+            2: 0.45
+            3: 0.3
+        stem_sampling_weights:
+          speech: 2.0
+          music: 4.0
+          effects: 0.8
+        clips_per_active_stem:
+          speech: [1, 1]
+          music: [1, 1]
+          effects: [1, 2]
+        stem_gain_db:
+          speech: [-10, 3]
+          music: [-2, 5]
+          effects: [-16, -2]
+        stem_snr_db:
+          enabled: true
+          anchor: music
+          range:
+            speech: [-3, 12]
+            effects: [8, 20]
+      - name: general_cass
+        weight: 0.25
+        active_stem_count:
+          mode: weighted
+          weights:
+            0: 0.01
+            1: 0.16
+            2: 0.34
+            3: 0.49
+        stem_sampling_weights:
+          speech: 1.4
+          music: 1.2
+          effects: 1.4
+        clips_per_active_stem:
+          speech: [1, 2]
+          music: [1, 1]
+          effects: [1, 5]
+        stem_gain_db:
+          speech: [-8, 6]
+          music: [-10, 5]
+          effects: [-12, 8]
+        stem_snr_db:
+          enabled: true
+          anchor: random_active
+          range:
+            speech: [-4, 10]
+            music: [-8, 8]
+            effects: [-10, 8]
+task:
+  _target_: spectral_feature_compression.core.tasks.sup_task.SupTask
+  n_fft: 2048
+  hop_length: 512
+  css_validation: true
+  ema_weight: null
+  ema_update_freq: null
+  model:
+    _target_: spectral_feature_compression.core.model.sfc_small_macaron_conv2d_cln_npu.build_sfc_small_macaron_conv2d_cln_npu_system
+    n_fft: 2048
+    hop_length: 512
+    fs: 44100
+    n_src: 3
+    n_chan: 1
+    n_bands: 36
+    band_config: musical
+    d_inner: 32
+    d_model: 128
+    ffn_hidden: 176
+    n_separator_layers: 2
+    n_sfc_heads: 4
+    learnable_pos_bias: true
+    frequency_kernel_size: 15
+    time_kernel_size: 2
+    dilation_cycle: [1]
+    norm_eps: 1.0e-05
+    encoder_ffn_expansion: 2
+    decoder_ffn_hidden: 16
+    masking: true
+    use_learnable_query: true
+    scaling: false
+    css_segment_size: 12
+    css_shift_size: 6
+    css_batch_size: 1
+  loss:
+    _target_: spectral_feature_compression.core.loss.snr.ThresSNRLossWithInactiveSource
+    solve_perm: false
+    n_src: 3
+    zeroref_weight: 0.1
+    only_denominator: false
+  optimizer_config:
+    _target_: aiaccel.torch.lightning.OptimizerConfig
+    optimizer_generator:
+      _partial_: true
+      _target_: torch.optim.AdamW
+      lr: 0.001
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+    scheduler_generator:
+      _partial_: true
+      _target_: spectral_feature_compression.common.lr_schedulers.warmup.WarmUpStepLR
+      warmup_steps: 5000
+      decay_start_step: 101550
+      decay_stop_step: 203100
+      step_size: 1354
+      decay: 0.96
+    scheduler_interval: step
