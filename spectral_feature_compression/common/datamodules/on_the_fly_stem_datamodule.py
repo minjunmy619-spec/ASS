@@ -16,6 +16,7 @@ import lightning as lt
 from spectral_feature_compression.common.datasets.on_the_fly_stem_dataset import (
     FixedStemMixDataset,
     OnTheFlyStemDataset,
+    ProbabilisticInterleaveDataset,
 )
 
 
@@ -32,6 +33,8 @@ class OnTheFlyStemDataModule(lt.LightningDataModule):
         source_pools: Mapping[str, Sequence[str | Path] | str | Path] | None = None,
         source_manifest_csv: Sequence[str | Path] | str | Path | None = None,
         fixed_mix_manifest_csv: Sequence[str | Path] | str | Path | None = None,
+        supplemental_fixed_mix_manifest_csv: Sequence[str | Path] | str | Path | None = None,
+        supplemental_fixed_mix_probability: float = 0.0,
         batch_size: int,
         sr: int = 44100,
         duration: float = 6.0,
@@ -72,6 +75,15 @@ class OnTheFlyStemDataModule(lt.LightningDataModule):
             raise ValueError(f"test_batch_size must be positive, got {test_batch_size}")
         if num_workers < 0:
             raise ValueError(f"num_workers must be non-negative, got {num_workers}")
+        if not 0.0 <= supplemental_fixed_mix_probability <= 1.0:
+            raise ValueError(
+                "supplemental_fixed_mix_probability must be in [0, 1], "
+                f"got {supplemental_fixed_mix_probability}"
+            )
+        if supplemental_fixed_mix_probability > 0.0 and supplemental_fixed_mix_manifest_csv is None:
+            raise ValueError(
+                "supplemental_fixed_mix_probability is positive but supplemental_fixed_mix_manifest_csv is not set"
+            )
 
         if sum(item is not None for item in (source_pools, source_manifest_csv, fixed_mix_manifest_csv)) != 1:
             raise ValueError("Provide exactly one of source_pools, source_manifest_csv, or fixed_mix_manifest_csv")
@@ -95,6 +107,8 @@ class OnTheFlyStemDataModule(lt.LightningDataModule):
         self.source_pools = source_pools
         self.source_manifest_csv = source_manifest_csv
         self.fixed_mix_manifest_csv = fixed_mix_manifest_csv
+        self.supplemental_fixed_mix_manifest_csv = supplemental_fixed_mix_manifest_csv
+        self.supplemental_fixed_mix_probability = float(supplemental_fixed_mix_probability)
         self.val_source_pools = val_source_pools
         self.val_source_manifest_csv = val_source_manifest_csv
         self.val_fixed_mix_manifest_csv = val_fixed_mix_manifest_csv
@@ -188,11 +202,16 @@ class OnTheFlyStemDataModule(lt.LightningDataModule):
         dataset_length: int,
         seed: int | None,
         synthesis: Mapping[str, Any],
+        supplemental_fixed_mix_manifest_csv: Sequence[str | Path] | str | Path | None = None,
+        supplemental_fixed_mix_probability: float = 0.0,
     ):
         kwargs = self._common_dataset_kwargs(synthesis)
         use_rendered_mixture = bool(kwargs.pop("use_rendered_mixture", True))
         fixed_mix_strict_shape = bool(kwargs.pop("fixed_mix_strict_shape", True))
+        fixed_mix_max_additivity_error_db = kwargs.pop("fixed_mix_max_additivity_error_db", None)
         if fixed_mix_manifest_csv is not None:
+            if supplemental_fixed_mix_manifest_csv is not None:
+                raise ValueError("supplemental fixed mixes require an on-the-fly primary training dataset")
             return FixedStemMixDataset(
                 fixed_mix_manifest_csv=fixed_mix_manifest_csv,
                 source_order=kwargs["source_order"],
@@ -201,6 +220,7 @@ class OnTheFlyStemDataModule(lt.LightningDataModule):
                 manifest_split=manifest_split,
                 use_rendered_mixture=use_rendered_mixture,
                 strict_shape=fixed_mix_strict_shape,
+                max_additivity_error_db=fixed_mix_max_additivity_error_db,
                 return_metadata=False,
             )
         kwargs["dataset_length"] = dataset_length
@@ -208,7 +228,25 @@ class OnTheFlyStemDataModule(lt.LightningDataModule):
         kwargs["source_pools"] = source_pools
         kwargs["source_manifest_csv"] = source_manifest_csv
         kwargs["manifest_split"] = manifest_split
-        return OnTheFlyStemDataset(**kwargs)
+        primary_dataset = OnTheFlyStemDataset(**kwargs)
+        if supplemental_fixed_mix_manifest_csv is None or supplemental_fixed_mix_probability <= 0.0:
+            return primary_dataset
+        supplemental_dataset = FixedStemMixDataset(
+            fixed_mix_manifest_csv=supplemental_fixed_mix_manifest_csv,
+            source_order=kwargs["source_order"],
+            sr=kwargs["sr"],
+            duration=kwargs["duration"],
+            use_rendered_mixture=use_rendered_mixture,
+            strict_shape=fixed_mix_strict_shape,
+            max_additivity_error_db=fixed_mix_max_additivity_error_db,
+            return_metadata=False,
+        )
+        return ProbabilisticInterleaveDataset(
+            primary_dataset,
+            supplemental_dataset,
+            probability=supplemental_fixed_mix_probability,
+            seed=0 if seed is None else seed,
+        )
 
     def _has_test_sources(self) -> bool:
         return (
@@ -230,6 +268,8 @@ class OnTheFlyStemDataModule(lt.LightningDataModule):
                 dataset_length=self.dataset_length,
                 seed=self.train_seed,
                 synthesis=self.synthesis,
+                supplemental_fixed_mix_manifest_csv=self.supplemental_fixed_mix_manifest_csv,
+                supplemental_fixed_mix_probability=self.supplemental_fixed_mix_probability,
             )
 
         if stage in {None, "fit", "validate"}:

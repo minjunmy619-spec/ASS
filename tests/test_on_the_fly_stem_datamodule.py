@@ -17,10 +17,23 @@ from spectral_feature_compression.common.datamodules.on_the_fly_stem_datamodule 
 from spectral_feature_compression.common.datasets.on_the_fly_stem_dataset import (
     FixedStemMixDataset,
     OnTheFlyStemDataset,
+    ProbabilisticInterleaveDataset,
 )
 from tools.export_fixed_stem_mixes import export_fixed_stem_mixes
 
 _STEMS = ("speech", "music", "effects")
+
+
+class _IndexDataset:
+    def __init__(self, prefix: str, length: int) -> None:
+        self.prefix = prefix
+        self.length = length
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: int) -> str:
+        return f"{self.prefix}:{index}"
 
 
 def _write_wav(path: Path, value: float, *, sr: int = 8000, n_samples: int = 1600) -> None:
@@ -83,6 +96,17 @@ def _base_synthesis() -> dict[str, Any]:
     }
 
 
+def test_probabilistic_interleave_dataset_selects_supplemental_examples() -> None:
+    primary = _IndexDataset("synthetic", 10)
+    supplemental = _IndexDataset("real", 3)
+
+    only_synthetic = ProbabilisticInterleaveDataset(primary, supplemental, probability=0.0, seed=7)
+    only_real = ProbabilisticInterleaveDataset(primary, supplemental, probability=1.0, seed=7)
+
+    assert [only_synthetic[index] for index in range(4)] == [f"synthetic:{index}" for index in range(4)]
+    assert [only_real[index] for index in range(4)] == ["real:0", "real:1", "real:2", "real:0"]
+
+
 def test_on_the_fly_stem_dataset_returns_fixed_duration_and_consistent_mix(tmp_path: Path) -> None:
     pools = _make_source_pools(tmp_path)
     dataset = OnTheFlyStemDataset(
@@ -143,6 +167,35 @@ def test_on_the_fly_stem_dataset_samples_source_clip_duration_range(tmp_path: Pa
 
     assert long_clip.numel() == 2000
     assert short_clip.numel() == 1000
+
+
+def test_on_the_fly_stem_dataset_supports_per_stem_source_clip_duration_ranges(tmp_path: Path) -> None:
+    pools = {}
+    for stem in _STEMS:
+        path = tmp_path / stem / f"{stem}.wav"
+        _write_wav(path, 0.1, sr=8000, n_samples=8000)
+        pools[stem] = str(path)
+    dataset = OnTheFlyStemDataset(
+        source_pools=pools,
+        source_order=_STEMS,
+        sr=8000,
+        duration=1.0,
+        dataset_length=1,
+        source_clip_duration_range={
+            "speech": [0.10, 0.10],
+            "music": [0.15, 0.15],
+            "effects": [0.05, 0.05],
+        },
+        seed=0,
+    )
+
+    speech, _ = dataset._sample_audio("speech", dataset._rng_for_index(0))
+    music, _ = dataset._sample_audio("music", dataset._rng_for_index(0))
+    effects, _ = dataset._sample_audio("effects", dataset._rng_for_index(0))
+
+    assert speech.numel() == 800
+    assert music.numel() == 1200
+    assert effects.numel() == 400
 
 
 def test_on_the_fly_stem_dataset_normalizes_active_sources_before_gain(tmp_path: Path) -> None:
@@ -496,6 +549,28 @@ def test_fixed_stem_mix_exporter_outputs_datamodule_manifest(tmp_path: Path) -> 
     assert tuple(val_ref.shape) == (1, 3, 1, 4000)
     torch.testing.assert_close(val_wav, val_ref.sum(dim=1), rtol=0.0, atol=0.0)
 
+    blended_datamodule = OnTheFlyStemDataModule(
+        source_manifest_csv=source_csv,
+        supplemental_fixed_mix_manifest_csv=fixed_csv,
+        supplemental_fixed_mix_probability=1.0,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=2,
+        val_dataset_length=1,
+        batch_size=1,
+        num_workers=0,
+        synthesis={
+            "active_stem_count": {"mode": "fixed", "value": 3},
+            "clips_per_active_stem": 1,
+            "peak_norm_db": None,
+        },
+    )
+    blended_datamodule.setup("fit")
+    assert isinstance(blended_datamodule.train_dataset, ProbabilisticInterleaveDataset)
+    blended_wav, blended_ref = next(iter(blended_datamodule.train_dataloader()))
+    torch.testing.assert_close(blended_wav, blended_ref.sum(dim=1), rtol=0.0, atol=0.0)
+
 
 def test_fixed_stem_mix_dataset_strict_shape_rejects_mismatches(tmp_path: Path) -> None:
     _make_source_pools(tmp_path)
@@ -556,6 +631,63 @@ def test_fixed_stem_mix_dataset_strict_shape_rejects_mismatches(tmp_path: Path) 
     )
     with pytest.raises(ValueError, match="manifest shape is inconsistent"):
         datamodule.setup("fit")
+
+
+def test_fixed_stem_mix_dataset_rejects_nonadditive_rendered_mixture(tmp_path: Path) -> None:
+    n_samples = 4000
+    paths: dict[str, Path] = {}
+    for stem, value in zip(_STEMS, (0.1, 0.2, 0.05), strict=True):
+        paths[stem] = tmp_path / f"{stem}.wav"
+        sf.write(paths[stem], np.full(n_samples, value, dtype=np.float32), 8000, subtype="FLOAT")
+    paths["mixture"] = tmp_path / "mixture.wav"
+    sf.write(paths["mixture"], np.full(n_samples, 0.9, dtype=np.float32), 8000, subtype="FLOAT")
+
+    manifest = tmp_path / "nonadditive.csv"
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "mixture_filepath",
+                "speech_filepath",
+                "music_filepath",
+                "effects_filepath",
+                "sample_rate",
+                "n_samples",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "mixture_filepath": str(paths["mixture"]),
+                **{f"{stem}_filepath": str(paths[stem]) for stem in _STEMS},
+                "sample_rate": "8000",
+                "n_samples": str(n_samples),
+            }
+        )
+
+    dataset = FixedStemMixDataset(
+        fixed_mix_manifest_csv=manifest,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        max_additivity_error_db=-40.0,
+    )
+    with pytest.raises(ValueError, match="additivity error"):
+        dataset[0]
+
+    datamodule = OnTheFlyStemDataModule(
+        fixed_mix_manifest_csv=manifest,
+        source_order=_STEMS,
+        sr=8000,
+        duration=0.5,
+        dataset_length=1,
+        batch_size=1,
+        num_workers=0,
+        synthesis={"fixed_mix_max_additivity_error_db": -40.0},
+    )
+    datamodule.setup("fit")
+    with pytest.raises(ValueError, match="additivity error"):
+        datamodule.train_dataset[0]
 
 
 def test_on_the_fly_stem_datamodule_builds_tuple_batches(tmp_path: Path) -> None:

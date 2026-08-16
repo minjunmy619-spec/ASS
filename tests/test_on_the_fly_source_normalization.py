@@ -95,6 +95,61 @@ def test_quiet_normalization_rejection_cannot_be_undone_by_random_gain():
     torch.testing.assert_close(stems[1], torch.ones_like(stems[1]))
 
 
+def test_quiet_non_anchor_source_is_not_boosted_by_relative_snr():
+    ds = _dataset(
+        {
+            "target_rms": 1.0,
+            "mode": {"speech": "full_rms", "music": "full_rms"},
+            "min_rms_db": {"music": -45.0},
+        }
+    )
+    ds.stem_snr_db = {
+        "enabled": True,
+        "anchor": "speech",
+        "range": {"music": [0.0, 0.0]},
+    }
+    stems = torch.zeros(3, 1000, dtype=torch.float32)
+    stems[0] = 1.0
+    stems[1] = 0.001
+
+    snr_ineligible = ds._normalize_active_sources(stems, ["speech", "music"])
+    before = stems[1].clone()
+    ds._apply_relative_snr(
+        stems,
+        ["speech", "music"],
+        random.Random(0),
+        snr_ineligible_stems=snr_ineligible,
+    )
+
+    assert "music" in snr_ineligible
+    torch.testing.assert_close(stems[1], before)
+
+
+def test_relative_snr_can_measure_only_active_regions():
+    ds = _dataset({"target_rms": 1.0, "mode": "full_rms"})
+    ds.relative_snr_measurement = {
+        "mode": "active_rms",
+        "frame_ms": 100.0,
+        "hop_ms": 100.0,
+        "activity_threshold_db": -40.0,
+    }
+    ds.sr = 1000
+    ds.stem_snr_db = {
+        "enabled": True,
+        "anchor": "speech",
+        "range": {"effects": [0.0, 0.0]},
+    }
+    stems = torch.zeros(3, 1000, dtype=torch.float32)
+    stems[0] = 0.5
+    stems[2, :100] = 0.25
+
+    ds._apply_relative_snr(stems, ["speech", "effects"], random.Random(0))
+
+    active_effects_rms = stems[2, :100].square().mean().sqrt()
+    speech_rms = stems[0].square().mean().sqrt()
+    torch.testing.assert_close(active_effects_rms, speech_rms, rtol=1e-4, atol=1e-4)
+
+
 def test_relative_snr_skips_when_anchor_is_too_quiet():
     ds = _dataset({"target_rms": 1.0, "mode": "full_rms"})
     ds.stem_snr_db = {

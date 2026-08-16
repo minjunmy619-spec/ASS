@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 from collections.abc import Mapping, Sequence
+import math
 from pathlib import Path
 import sys
 
@@ -195,6 +196,10 @@ class TeacherStudentDistillationTask(SupTask):
         low_frequency_hz: float = 300.0,
         silent_source_weight: float = 0.0,
         silent_source_db: float = -60.0,
+        frame_silent_source_weight: float = 0.0,
+        frame_silent_source_db: float = -50.0,
+        frame_silent_window_ms: float = 80.0,
+        frame_silent_hop_ms: float = 40.0,
         source_activity_loss_weight: float = 0.0,
         source_activity_db: float = -50.0,
         source_activity_active_weight: float = 1.0,
@@ -262,6 +267,7 @@ class TeacherStudentDistillationTask(SupTask):
             "mixture_consistency_weight": mixture_consistency_weight,
             "low_frequency_weight": low_frequency_weight,
             "silent_source_weight": silent_source_weight,
+            "frame_silent_source_weight": frame_silent_source_weight,
             "source_activity_loss_weight": source_activity_loss_weight,
             "robust_label_loss_weight": robust_label_loss_weight,
             "complex_ri_weight": complex_ri_weight,
@@ -274,6 +280,10 @@ class TeacherStudentDistillationTask(SupTask):
         }.items():
             if value < 0.0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
+        if frame_silent_source_weight > 0.0 and fs is None:
+            raise ValueError("frame_silent_source_weight requires fs")
+        if frame_silent_window_ms <= 0.0 or frame_silent_hop_ms <= 0.0:
+            raise ValueError("frame_silent_window_ms and frame_silent_hop_ms must be positive")
         robust_label_loss = str(robust_label_loss).lower()
         if robust_label_loss not in {"charbonnier", "l1"}:
             raise ValueError("robust_label_loss must be 'charbonnier' or 'l1'")
@@ -299,9 +309,7 @@ class TeacherStudentDistillationTask(SupTask):
             raise ValueError(f"residual_source_index must be non-negative, got {residual_source_index}")
         source_loss_weight_normalization = str(source_loss_weight_normalization).lower()
         if source_loss_weight_normalization not in {"subset_mean", "full_mean", "none"}:
-            raise ValueError(
-                "source_loss_weight_normalization must be one of 'subset_mean', 'full_mean', or 'none'"
-            )
+            raise ValueError("source_loss_weight_normalization must be one of 'subset_mean', 'full_mean', or 'none'")
         band_mapping = "none" if distillation_band_mapping is None else str(distillation_band_mapping).lower()
         band_mapping_aliases = {
             "off": "none",
@@ -331,6 +339,10 @@ class TeacherStudentDistillationTask(SupTask):
         self.low_frequency_hz = low_frequency_hz
         self.silent_source_weight = silent_source_weight
         self.silent_source_db = silent_source_db
+        self.frame_silent_source_weight = float(frame_silent_source_weight)
+        self.frame_silent_source_db = float(frame_silent_source_db)
+        self.frame_silent_window_ms = float(frame_silent_window_ms)
+        self.frame_silent_hop_ms = float(frame_silent_hop_ms)
         self.source_activity_loss_weight = source_activity_loss_weight
         self.source_activity_db = source_activity_db
         self.source_activity_active_weight = source_activity_active_weight
@@ -622,6 +634,34 @@ class TeacherStudentDistillationTask(SupTask):
         if not inactive.any():
             return est.new_zeros(())
         return est_power[inactive].mean()
+
+    def _frame_silent_source_penalty(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        if self.fs is None:
+            raise ValueError("frame-local silent-source loss requires fs")
+        batch, n_src, n_chan, n_samples = ref.shape
+        window = max(1, int(round(self.frame_silent_window_ms * self.fs / 1000.0)))
+        hop = max(1, int(round(self.frame_silent_hop_ms * self.fs / 1000.0)))
+        n_frames = max(1, math.ceil(max(0, n_samples - window) / hop) + 1)
+        padded_samples = (n_frames - 1) * hop + window
+
+        def frame_power(value: torch.Tensor) -> torch.Tensor:
+            flattened = value.float().square().reshape(batch * n_src * n_chan, 1, n_samples)
+            if padded_samples > n_samples:
+                flattened = F.pad(flattened, (0, padded_samples - n_samples))
+            pooled = F.avg_pool1d(flattened, kernel_size=window, stride=hop)
+            return pooled.reshape(batch, n_src, n_chan, n_frames).mean(dim=2)
+
+        ref_power = frame_power(ref)
+        est_power = frame_power(est)
+        inactive = ref_power <= 10 ** (self.frame_silent_source_db / 10.0)
+        if not inactive.any():
+            return est.new_zeros(())
+        weights = torch.ones_like(est_power)
+        source_weights = self._source_weights_for(est_power[:, :, 0])
+        if source_weights is not None:
+            weights *= source_weights.view(1, -1, 1)
+        inactive_weights = weights * inactive
+        return (est_power * inactive_weights).sum() / inactive_weights.sum().clamp_min(1.0)
 
     def _source_activity_l1(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         per_source_l1 = (est - ref).abs().mean(dim=(-1, -2))
@@ -1044,11 +1084,7 @@ class TeacherStudentDistillationTask(SupTask):
             if (
                 student_value is None
                 or teacher_value is None
-                or (
-                    student_domain is not None
-                    and teacher_domain is not None
-                    and student_domain != teacher_domain
-                )
+                or (student_domain is not None and teacher_domain is not None and student_domain != teacher_domain)
             ):
                 # Match spectral pseudo-masks when true model masks are not
                 # exposed by the model output contract or declare incompatible
@@ -1216,6 +1252,11 @@ class TeacherStudentDistillationTask(SupTask):
             silent_loss = self._silent_source_penalty(est, ref)
             loss = loss + self.silent_source_weight * silent_loss
             log_dict[f"{log_prefix}/loss_silent_source"] = silent_loss
+
+        if self.frame_silent_source_weight > 0.0:
+            frame_silent_loss = self._frame_silent_source_penalty(est, ref)
+            loss = loss + self.frame_silent_source_weight * frame_silent_loss
+            log_dict[f"{log_prefix}/loss_frame_silent_source"] = frame_silent_loss
 
         if self.source_activity_loss_weight > 0.0:
             activity_loss = self._source_activity_l1(est, ref)

@@ -1,0 +1,85 @@
+_base_: ../tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475/config.yaml
+
+# RIR rendering is deliberately disabled until the actual source manifest has
+# trustworthy `is_wet` metadata and measured RIR paths are supplied. Enabling
+# it without that metadata risks applying a second room response to wet audio.
+broadcast_rir_probability: 0.0
+broadcast_rir_paths: []
+
+datamodule:
+  # Point this at a fixed real DX/MX/FX manifest and raise the probability only
+  # after the manifest passes tools/audit_separation_manifest.py.
+  supplemental_fixed_mix_manifest_csv: null
+  supplemental_fixed_mix_probability: 0.0
+  synthesis:
+    # Fail before training on fixed mixes whose delivered stems do not sum to
+    # the delivered mixture closely enough for residual-Effects supervision.
+    fixed_mix_max_additivity_error_db: -40.0
+    backend: broadcast_mix
+    # Shorter source reads make the configured multi-event placement effective
+    # instead of letting the first long file consume the complete 6 s window.
+    source_clip_duration_range:
+      speech: [0.8, 3.5]
+      music: [3.0, 6.0]
+      effects: [0.15, 1.5]
+    short_clip_policy: pad_or_concatenate
+    short_clip_pad_probability:
+      speech: 0.45
+      music: 0.15
+      effects: 0.70
+    relative_snr_measurement:
+      mode: active_rms
+      frame_ms: 40.0
+      hop_ms: 20.0
+      activity_threshold_db: -48.0
+    # BroadcastStemRenderer owns the final shared peak limiter.
+    peak_norm_db: null
+    broadcast:
+      room:
+        probability: ${broadcast_rir_probability}
+        rir_paths: ${broadcast_rir_paths}
+        shared_stems: [speech, effects]
+        wet_mix: [0.12, 0.45]
+        max_rir_seconds: 1.0
+        preserve_rms: false
+        unknown_wet_policy: assume_wet
+      channel_eq:
+        probability: 0.35
+        low_cut_hz: [20.0, 180.0]
+        high_cut_hz: [6500.0, 20000.0]
+        transition_hz: 250.0
+      source_compression:
+        probability: 0.30
+        stems: [speech, music, effects]
+        threshold_db: [-28.0, -14.0]
+        ratio: [1.5, 3.0]
+        frame_ms: 20.0
+        attack_ms: 10.0
+        release_ms: 120.0
+      ducking:
+        probability: 0.45
+        speech_stem: speech
+        target_stems: [music, effects]
+        attenuation_db: [-10.0, -3.0]
+        activity_threshold_db: -48.0
+        frame_ms: 20.0
+        attack_ms: 30.0
+        release_ms: 300.0
+      bus_compression:
+        probability: 0.50
+        threshold_db: [-24.0, -12.0]
+        ratio: [1.5, 3.5]
+        frame_ms: 20.0
+        attack_ms: 10.0
+        release_ms: 150.0
+      bus_peak_limit_db: -1.0
+
+task:
+  # Existing silent_source_weight only sees stems that are silent for the full
+  # crop. This term penalizes local leakage during inactive target frames.
+  frame_silent_source_weight: 0.08
+  # Synthesized inactive placements are exact zeros; keep valid quiet programme
+  # material (for example, -60 dBFS ambience) out of the silence mask.
+  frame_silent_source_db: -80.0
+  frame_silent_window_ms: 80.0
+  frame_silent_hop_ms: 40.0

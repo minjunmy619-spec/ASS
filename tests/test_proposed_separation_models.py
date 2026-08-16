@@ -2618,6 +2618,50 @@ def test_distillation_task_source_weights_prioritize_speech_losses() -> None:
     assert speech_task._source_activity_l1(est, ref) > base_task._source_activity_l1(est, ref)
 
 
+def test_distillation_task_penalizes_frame_local_leakage_inside_active_source() -> None:
+    task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        fs=1000,
+        frame_silent_source_weight=0.1,
+        frame_silent_source_db=-50.0,
+        frame_silent_window_ms=100.0,
+        frame_silent_hop_ms=100.0,
+    )
+    ref = torch.zeros(1, 3, 1, 1000)
+    est = torch.zeros_like(ref)
+    ref[:, 0, :, :500] = 0.5
+    est[:, 0, :, 500:] = 0.1
+
+    assert task._silent_source_penalty(est, ref) == 0.0
+    assert task._frame_silent_source_penalty(est, ref) > 0.0
+
+
+def test_distillation_frame_silence_threshold_keeps_quiet_valid_reference_active() -> None:
+    task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        fs=1000,
+        frame_silent_source_weight=0.1,
+        frame_silent_source_db=-80.0,
+        frame_silent_window_ms=500.0,
+        frame_silent_hop_ms=500.0,
+    )
+    ref = torch.zeros(1, 1, 1, 1000)
+    est = torch.zeros_like(ref)
+    ref[..., :500] = 1.0e-3  # -60 dBFS: quiet, but not a silent target frame.
+    est[..., :500] = 0.7
+    est[..., 500:] = 0.1
+
+    torch.testing.assert_close(task._frame_silent_source_penalty(est, ref), torch.tensor(0.01))
+
+
 def test_distillation_task_rejects_unknown_source_weight_name() -> None:
     with pytest.raises(ValueError, match="unknown sources"):
         TeacherStudentDistillationTask(

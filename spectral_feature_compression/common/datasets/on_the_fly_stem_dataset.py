@@ -21,6 +21,11 @@ import torchaudio.functional as AF
 
 import soundfile as sf
 
+from spectral_feature_compression.common.datasets.broadcast_stem_synthesis import (
+    BroadcastStemRenderer,
+    active_rms,
+)
+
 _DEFAULT_SOURCE_ORDER = ("speech", "music", "effects")
 _DEFAULT_EXTENSIONS = (".wav", ".flac")
 
@@ -114,16 +119,16 @@ def _weighted_sample_without_replacement(
 
 
 class OnTheFlyStemDataset(Dataset):
-    """Config-driven dry 3-stem on-the-fly source-separation mixer.
+    """Config-driven on-the-fly source-separation mixer.
 
     The dataset samples mono source clips from stem-specific pools, places one or
     more clips into each active stem timeline, applies gain/SNR controls, and
     returns the existing separation-task contract: ``(wav, ref)`` where
     ``wav == ref.sum(dim=0)``.
 
-    This first backend deliberately does not add room impulse responses. Input
-    WAVs are treated as already-rendered source stems, which is safe when it is
-    unknown whether the files are dry or wet.
+    ``dry_mix`` preserves the original linear mixer. ``broadcast_mix`` applies
+    opt-in label-consistent room, channel, ducking, and dynamics processing to
+    the target stems before their exact sum is returned as the mixture.
     """
 
     def __init__(
@@ -144,13 +149,15 @@ class OnTheFlyStemDataset(Dataset):
         active_stem_count: Mapping[str, Any] | Sequence[int] | None = None,
         stem_sampling_weights: Mapping[str, float] | None = None,
         clips_per_active_stem: Mapping[str, Any] | int | Sequence[int] | None = None,
-        source_clip_duration_range: Sequence[float] | float | None = None,
+        source_clip_duration_range: Mapping[str, Any] | Sequence[float] | float | None = None,
         short_clip_policy: str = "concatenate",
         short_clip_pad_probability: float | Mapping[str, float] = 0.5,
         same_stem_placement: Mapping[str, Any] | None = None,
         stem_gain_db: Mapping[str, Any] | None = None,
         stem_snr_db: Mapping[str, Any] | None = None,
+        relative_snr_measurement: Mapping[str, Any] | None = None,
         synthesis_profiles: Sequence[Mapping[str, Any]] | None = None,
+        broadcast: Mapping[str, Any] | None = None,
         normalize_sources: bool = False,
         source_normalization: Mapping[str, Any] | None = None,
         source_activity_threshold: float = 0.0,
@@ -161,8 +168,8 @@ class OnTheFlyStemDataset(Dataset):
         return_metadata: bool = False,
     ) -> None:
         super().__init__()
-        if backend != "dry_mix":
-            raise ValueError(f"OnTheFlyStemDataset currently supports backend='dry_mix' only, got {backend!r}")
+        if backend not in {"dry_mix", "broadcast_mix"}:
+            raise ValueError(f"backend must be 'dry_mix' or 'broadcast_mix', got {backend!r}")
         if sr <= 0:
             raise ValueError(f"sr must be positive, got {sr}")
         if duration <= 0.0:
@@ -179,12 +186,23 @@ class OnTheFlyStemDataset(Dataset):
         self.sr = int(sr)
         self.duration = float(duration)
         self.n_samples = int(round(self.sr * self.duration))
-        self.source_clip_duration_range = (
-            None
-            if source_clip_duration_range is None
-            else _as_float_range(source_clip_duration_range, default=(self.duration, self.duration))
-        )
-        if self.source_clip_duration_range is not None and self.source_clip_duration_range[0] <= 0.0:
+        if isinstance(source_clip_duration_range, Mapping):
+            _validate_mapping_keys(source_clip_duration_range, self.source_order, name="source_clip_duration_range")
+            self.source_clip_duration_range: dict[str, tuple[float, float]] | tuple[float, float] | None = {
+                stem: _as_float_range(value, default=(self.duration, self.duration))
+                for stem, value in source_clip_duration_range.items()
+            }
+            clip_ranges = self.source_clip_duration_range.values()
+        elif source_clip_duration_range is None:
+            self.source_clip_duration_range = None
+            clip_ranges = ()
+        else:
+            self.source_clip_duration_range = _as_float_range(
+                source_clip_duration_range,
+                default=(self.duration, self.duration),
+            )
+            clip_ranges = (self.source_clip_duration_range,)
+        if any(value[0] <= 0.0 for value in clip_ranges):
             raise ValueError(
                 f"source_clip_duration_range values must be positive, got {self.source_clip_duration_range}"
             )
@@ -214,12 +232,18 @@ class OnTheFlyStemDataset(Dataset):
             raise ValueError(f"peak_norm_mode must be 'scale_down' or 'normalize', got {peak_norm_mode!r}")
         self.normalize_sources = bool(normalize_sources)
         self.source_normalization = dict(source_normalization or {})
+        self.relative_snr_measurement = dict(relative_snr_measurement or {})
+        valid_snr_measurement_fields = {"mode", "frame_ms", "hop_ms", "activity_threshold_db"}
+        unknown_snr_fields = sorted(set(self.relative_snr_measurement) - valid_snr_measurement_fields)
+        if unknown_snr_fields:
+            raise ValueError(f"relative_snr_measurement contains unknown fields: {unknown_snr_fields}")
+        snr_measurement_mode = str(self.relative_snr_measurement.get("mode", "full_rms"))
+        if snr_measurement_mode not in {"full_rms", "active_rms"}:
+            raise ValueError("relative_snr_measurement.mode must be 'full_rms' or 'active_rms'")
         self.source_activity_threshold = float(source_activity_threshold)
         self.crop_retry = int(crop_retry)
         if self.source_activity_threshold < 0.0:
-            raise ValueError(
-                f"source_activity_threshold must be non-negative, got {source_activity_threshold}"
-            )
+            raise ValueError(f"source_activity_threshold must be non-negative, got {source_activity_threshold}")
         if self.crop_retry <= 0:
             raise ValueError(f"crop_retry must be positive, got {crop_retry}")
 
@@ -228,6 +252,7 @@ class OnTheFlyStemDataset(Dataset):
         )
         if (source_pools is None) == (source_manifest_csv is None):
             raise ValueError("Provide exactly one of source_pools or source_manifest_csv")
+        self.source_metadata: dict[str, dict[str, Any]] = {}
         if source_manifest_csv is not None:
             self.source_files = self._load_source_manifest(
                 source_manifest_csv,
@@ -249,6 +274,12 @@ class OnTheFlyStemDataset(Dataset):
         self.stem_snr_db = dict(stem_snr_db or {})
         self.synthesis_profiles = self._parse_synthesis_profiles(synthesis_profiles)
         self._validate_source_normalization_config()
+        self.backend = str(backend)
+        self.broadcast_renderer = (
+            BroadcastStemRenderer(sr=self.sr, source_order=self.source_order, config=broadcast)
+            if self.backend == "broadcast_mix"
+            else None
+        )
 
     def _parse_synthesis_profiles(
         self,
@@ -394,6 +425,7 @@ class OnTheFlyStemDataset(Dataset):
                     if not path.is_file():
                         raise FileNotFoundError(f"Manifest row points to a missing audio file: {path}")
                     source_files[stem].append(path)
+                    self.source_metadata[str(path)] = dict(row)
 
         for stem, files in source_files.items():
             unique_files = sorted(set(files))
@@ -499,7 +531,12 @@ class OnTheFlyStemDataset(Dataset):
         path = rng.choice(self.source_files[stem])
         max_samples = self.n_samples
         if self.source_clip_duration_range is not None:
-            clip_duration = _sample_uniform(rng, self.source_clip_duration_range)
+            duration_range = (
+                self.source_clip_duration_range.get(stem, (self.duration, self.duration))
+                if isinstance(self.source_clip_duration_range, Mapping)
+                else self.source_clip_duration_range
+            )
+            clip_duration = _sample_uniform(rng, duration_range)
             max_samples = max(1, int(round(self.sr * clip_duration)))
         audio = self._load_audio(path, rng, max_samples=max_samples)
         return audio, path
@@ -770,7 +807,7 @@ class OnTheFlyStemDataset(Dataset):
         if snr_ineligible_stems is not None and anchor_name in snr_ineligible_stems:
             return
         anchor_idx = self.source_order.index(anchor_name)
-        anchor_rms_raw = stems[anchor_idx].square().mean().sqrt()
+        anchor_rms_raw = self._snr_rms(stems[anchor_idx])
         anchor_min_rms_db = cfg.get("anchor_min_rms_db", None)
         if anchor_min_rms_db is not None:
             anchor_min_rms = float(10.0 ** (float(anchor_min_rms_db) / 20.0))
@@ -783,12 +820,29 @@ class OnTheFlyStemDataset(Dataset):
         for stem_name in active_stems:
             if stem_name == anchor_name:
                 continue
+            if snr_ineligible_stems is not None and stem_name in snr_ineligible_stems:
+                continue
             stem_idx = self.source_order.index(stem_name)
-            stem_rms = stems[stem_idx].square().mean().sqrt().clamp_min(1.0e-8)
+            stem_rms_raw = self._snr_rms(stems[stem_idx])
+            if float(stem_rms_raw.item()) <= 1.0e-8:
+                continue
+            stem_rms = stem_rms_raw.clamp_min(1.0e-8)
             snr_db = _sample_uniform(rng, _range_for_key(ranges, stem_name, (0.0, 0.0)))
             # Positive SNR means the anchor is louder than this stem.
             target_rms = anchor_rms * float(10.0 ** (-snr_db / 20.0))
             stems[stem_idx] *= target_rms / stem_rms
+
+    def _snr_rms(self, stem: torch.Tensor) -> torch.Tensor:
+        config = getattr(self, "relative_snr_measurement", {})
+        if str(config.get("mode", "full_rms")) == "active_rms":
+            return active_rms(
+                stem.unsqueeze(0),
+                sr=self.sr,
+                frame_ms=float(config.get("frame_ms", 40.0)),
+                hop_ms=float(config.get("hop_ms", 20.0)),
+                activity_threshold_db=float(config.get("activity_threshold_db", -48.0)),
+            )
+        return stem.float().square().mean().sqrt()
 
     def _apply_peak_norm(self, stems: torch.Tensor) -> torch.Tensor:
         if self.peak_norm_db is None:
@@ -851,6 +905,15 @@ class OnTheFlyStemDataset(Dataset):
             snr_ineligible_stems,
             None if profile is None else profile.get("stem_snr_db"),
         )
+        if self.broadcast_renderer is not None:
+            rendered, render_metadata = self.broadcast_renderer.render(
+                stems[:, None, :],
+                rng=rng,
+                source_paths=metadata["source_paths"],
+                source_metadata=self.source_metadata,
+            )
+            stems = rendered[:, 0]
+            metadata["broadcast"] = render_metadata
         stems = self._apply_peak_norm(stems)
 
         ref = stems[:, None, :].contiguous()
@@ -859,6 +922,36 @@ class OnTheFlyStemDataset(Dataset):
             metadata["index"] = int(index)
             return wav, ref, metadata
         return wav, ref
+
+
+class ProbabilisticInterleaveDataset(Dataset):
+    """Deterministically select supplemental examples at a configured rate."""
+
+    def __init__(
+        self,
+        primary_dataset: Dataset,
+        supplemental_dataset: Dataset,
+        *,
+        probability: float,
+        seed: int = 0,
+    ) -> None:
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(f"probability must be in [0, 1], got {probability}")
+        if len(primary_dataset) <= 0 or len(supplemental_dataset) <= 0:
+            raise ValueError("primary and supplemental datasets must not be empty")
+        self.primary_dataset = primary_dataset
+        self.supplemental_dataset = supplemental_dataset
+        self.probability = float(probability)
+        self.seed = int(seed)
+
+    def __len__(self) -> int:
+        return len(self.primary_dataset)
+
+    def __getitem__(self, index: int):
+        rng = random.Random(self.seed + int(index))
+        if rng.random() < self.probability:
+            return self.supplemental_dataset[int(index) % len(self.supplemental_dataset)]
+        return self.primary_dataset[index]
 
 
 class FixedStemMixDataset(Dataset):
@@ -883,6 +976,7 @@ class FixedStemMixDataset(Dataset):
         mixture_filepath_column: str = "mixture_filepath",
         use_rendered_mixture: bool = True,
         strict_shape: bool = True,
+        max_additivity_error_db: float | None = None,
         return_metadata: bool = False,
     ) -> None:
         super().__init__()
@@ -901,6 +995,11 @@ class FixedStemMixDataset(Dataset):
         self.mixture_filepath_column = str(mixture_filepath_column)
         self.use_rendered_mixture = bool(use_rendered_mixture)
         self.strict_shape = bool(strict_shape)
+        if max_additivity_error_db is not None and not math.isfinite(float(max_additivity_error_db)):
+            raise ValueError("max_additivity_error_db must be finite when provided")
+        self.max_additivity_error_db = (
+            None if max_additivity_error_db is None else float(max_additivity_error_db)
+        )
         self.return_metadata = bool(return_metadata)
         self.rows = self._load_fixed_manifest(fixed_mix_manifest_csv, manifest_split=manifest_split)
         if self.strict_shape:
@@ -1074,6 +1173,17 @@ class FixedStemMixDataset(Dataset):
             wav = self._load_rendered_audio(mixture_path, target_sr=target_sr, n_samples=n_samples)[
                 None, :
             ].contiguous()
+            if self.max_additivity_error_db is not None:
+                residual_power = (wav - ref.sum(dim=0)).float().square().mean()
+                if float(residual_power) > 0.0:
+                    mixture_power = wav.float().square().mean().clamp_min(1.0e-12)
+                    error_db = 10.0 * math.log10(float(residual_power / mixture_power))
+                    if error_db > self.max_additivity_error_db:
+                        row_label = str(row.get("mixture_id", row.get("index", index)))
+                        raise ValueError(
+                            f"Fixed mixture {row_label} additivity error is {error_db:.2f} dB, "
+                            f"above configured maximum {self.max_additivity_error_db:.2f} dB"
+                        )
         else:
             wav = ref.sum(dim=0).contiguous()
         if self.return_metadata:
