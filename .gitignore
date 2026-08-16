@@ -9,6 +9,8 @@ singularity/
 bak*
 *token.txt
 .venv/
+typing-adventure/
+dcase2026baseline/
 
 # Local dataset archives (large; never commit)
 data/
