@@ -200,6 +200,13 @@ class TeacherStudentDistillationTask(SupTask):
         frame_silent_source_db: float = -50.0,
         frame_silent_window_ms: float = 80.0,
         frame_silent_hop_ms: float = 40.0,
+        clap_semantic_loss: nn.Module | None = None,
+        clap_semantic_loss_weight: float = 0.0,
+        whisper_feature_loss: nn.Module | None = None,
+        whisper_feature_loss_weight: float = 0.0,
+        whisper_source: str = "speech",
+        perceptual_loss_start_step: int = 0,
+        perceptual_loss_every_n_steps: int = 1,
         source_activity_loss_weight: float = 0.0,
         source_activity_db: float = -50.0,
         source_activity_active_weight: float = 1.0,
@@ -268,6 +275,8 @@ class TeacherStudentDistillationTask(SupTask):
             "low_frequency_weight": low_frequency_weight,
             "silent_source_weight": silent_source_weight,
             "frame_silent_source_weight": frame_silent_source_weight,
+            "clap_semantic_loss_weight": clap_semantic_loss_weight,
+            "whisper_feature_loss_weight": whisper_feature_loss_weight,
             "source_activity_loss_weight": source_activity_loss_weight,
             "robust_label_loss_weight": robust_label_loss_weight,
             "complex_ri_weight": complex_ri_weight,
@@ -284,6 +293,16 @@ class TeacherStudentDistillationTask(SupTask):
             raise ValueError("frame_silent_source_weight requires fs")
         if frame_silent_window_ms <= 0.0 or frame_silent_hop_ms <= 0.0:
             raise ValueError("frame_silent_window_ms and frame_silent_hop_ms must be positive")
+        if clap_semantic_loss_weight > 0.0 and clap_semantic_loss is None:
+            raise ValueError("clap_semantic_loss_weight requires clap_semantic_loss")
+        if whisper_feature_loss_weight > 0.0 and whisper_feature_loss is None:
+            raise ValueError("whisper_feature_loss_weight requires whisper_feature_loss")
+        if perceptual_loss_start_step < 0:
+            raise ValueError(f"perceptual_loss_start_step must be non-negative, got {perceptual_loss_start_step}")
+        if perceptual_loss_every_n_steps <= 0:
+            raise ValueError(
+                f"perceptual_loss_every_n_steps must be positive, got {perceptual_loss_every_n_steps}"
+            )
         robust_label_loss = str(robust_label_loss).lower()
         if robust_label_loss not in {"charbonnier", "l1"}:
             raise ValueError("robust_label_loss must be 'charbonnier' or 'l1'")
@@ -343,11 +362,25 @@ class TeacherStudentDistillationTask(SupTask):
         self.frame_silent_source_db = float(frame_silent_source_db)
         self.frame_silent_window_ms = float(frame_silent_window_ms)
         self.frame_silent_hop_ms = float(frame_silent_hop_ms)
+        self.clap_semantic_loss = clap_semantic_loss
+        self.clap_semantic_loss_weight = float(clap_semantic_loss_weight)
+        self.whisper_feature_loss = whisper_feature_loss
+        self.whisper_feature_loss_weight = float(whisper_feature_loss_weight)
+        self.whisper_source = str(whisper_source)
+        self.perceptual_loss_start_step = int(perceptual_loss_start_step)
+        self.perceptual_loss_every_n_steps = int(perceptual_loss_every_n_steps)
         self.source_activity_loss_weight = source_activity_loss_weight
         self.source_activity_db = source_activity_db
         self.source_activity_active_weight = source_activity_active_weight
         self.source_activity_inactive_weight = source_activity_inactive_weight
         self.source_order = tuple(source_order or ("speech", "music", "effects"))
+        if self.whisper_feature_loss_weight > 0.0 and self.whisper_source not in self.source_order:
+            raise ValueError(
+                f"whisper_source={self.whisper_source!r} is not in source_order={self.source_order}"
+            )
+        self.whisper_source_index = (
+            self.source_order.index(self.whisper_source) if self.whisper_source in self.source_order else 0
+        )
         self.source_loss_weight_normalization = source_loss_weight_normalization
         self.source_weighted_snr_loss_weight = float(source_weighted_snr_loss_weight)
         self.explicit_source_loss_weight = float(explicit_source_loss_weight)
@@ -662,6 +695,34 @@ class TeacherStudentDistillationTask(SupTask):
             weights *= source_weights.view(1, -1, 1)
         inactive_weights = weights * inactive
         return (est_power * inactive_weights).sum() / inactive_weights.sum().clamp_min(1.0)
+
+    def _compute_frozen_perceptual_losses(
+        self,
+        est: torch.Tensor,
+        ref: torch.Tensor,
+        *,
+        log_prefix: str,
+    ) -> dict[str, torch.Tensor]:
+        step = int(self.global_step)
+        if step < self.perceptual_loss_start_step:
+            return {}
+        if log_prefix == "training" and step % self.perceptual_loss_every_n_steps != 0:
+            return {}
+
+        losses: dict[str, torch.Tensor] = {}
+        if self.clap_semantic_loss_weight > 0.0:
+            if self.clap_semantic_loss is None:
+                raise RuntimeError("clap_semantic_loss is unexpectedly missing")
+            losses["clap_semantic"] = self.clap_semantic_loss(est, ref)
+        if self.whisper_feature_loss_weight > 0.0:
+            if self.whisper_feature_loss is None:
+                raise RuntimeError("whisper_feature_loss is unexpectedly missing")
+            source_index = self.whisper_source_index
+            losses["whisper_feature"] = self.whisper_feature_loss(
+                est[:, source_index],
+                ref[:, source_index],
+            )
+        return losses
 
     def _source_activity_l1(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         per_source_l1 = (est - ref).abs().mean(dim=(-1, -2))
@@ -1257,6 +1318,16 @@ class TeacherStudentDistillationTask(SupTask):
             frame_silent_loss = self._frame_silent_source_penalty(est, ref)
             loss = loss + self.frame_silent_source_weight * frame_silent_loss
             log_dict[f"{log_prefix}/loss_frame_silent_source"] = frame_silent_loss
+
+        perceptual_losses = self._compute_frozen_perceptual_losses(est, ref, log_prefix=log_prefix)
+        if "clap_semantic" in perceptual_losses:
+            clap_loss = perceptual_losses["clap_semantic"]
+            loss = loss + self.clap_semantic_loss_weight * clap_loss
+            log_dict[f"{log_prefix}/loss_clap_semantic"] = clap_loss
+        if "whisper_feature" in perceptual_losses:
+            whisper_loss = perceptual_losses["whisper_feature"]
+            loss = loss + self.whisper_feature_loss_weight * whisper_loss
+            log_dict[f"{log_prefix}/loss_whisper_feature"] = whisper_loss
 
         if self.source_activity_loss_weight > 0.0:
             activity_loss = self._source_activity_l1(est, ref)

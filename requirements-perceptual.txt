@@ -1,0 +1,5 @@
+# Optional frozen loss/evaluation networks used by the CLAP + Whisper recipe.
+# Install after the base project environment:
+#   .venv/bin/python -m pip install -r requirements-perceptual.txt
+laion-clap
+openai-whisper

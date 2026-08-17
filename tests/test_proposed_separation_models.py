@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 
@@ -2660,6 +2661,146 @@ def test_distillation_frame_silence_threshold_keeps_quiet_valid_reference_active
     est[..., 500:] = 0.1
 
     torch.testing.assert_close(task._frame_silent_source_penalty(est, ref), torch.tensor(0.01))
+
+
+def test_distillation_task_integrates_frozen_perceptual_losses() -> None:
+    class _ClapLoss(torch.nn.Module):
+        def forward(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+            return (est - ref).square().mean()
+
+    class _WhisperLoss(torch.nn.Module):
+        def forward(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+            return (est - ref).abs().mean()
+
+    task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        source_order=("speech", "music", "effects"),
+        clap_semantic_loss=_ClapLoss(),
+        clap_semantic_loss_weight=0.1,
+        whisper_feature_loss=_WhisperLoss(),
+        whisper_feature_loss_weight=0.2,
+        whisper_source="speech",
+        perceptual_loss_every_n_steps=4,
+    )
+    est = torch.ones(1, 3, 1, 16)
+    ref = torch.zeros_like(est)
+
+    losses = task._compute_frozen_perceptual_losses(est, ref, log_prefix="training")
+
+    assert set(losses) == {"clap_semantic", "whisper_feature"}
+    torch.testing.assert_close(losses["clap_semantic"], torch.tensor(1.0))
+    torch.testing.assert_close(losses["whisper_feature"], torch.tensor(1.0))
+
+
+def test_distillation_task_requires_configured_perceptual_modules() -> None:
+    with pytest.raises(ValueError, match="clap_semantic_loss"):
+        TeacherStudentDistillationTask(
+            model=torch.nn.Identity(),
+            loss=torch.nn.L1Loss(),
+            n_fft=32,
+            hop_length=8,
+            optimizer_config=object(),  # type: ignore[arg-type]
+            clap_semantic_loss_weight=0.1,
+        )
+
+    with pytest.raises(ValueError, match="whisper_source"):
+        TeacherStudentDistillationTask(
+            model=torch.nn.Identity(),
+            loss=torch.nn.L1Loss(),
+            n_fft=32,
+            hop_length=8,
+            optimizer_config=object(),  # type: ignore[arg-type]
+            whisper_feature_loss=torch.nn.L1Loss(),
+            whisper_feature_loss_weight=0.1,
+            whisper_source="dialog",
+        )
+
+
+def test_distillation_task_perceptual_loss_schedule_uses_optimizer_steps() -> None:
+    class _CountingLoss(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            return (est - ref).abs().mean()
+
+    clap_loss = _CountingLoss()
+    whisper_loss = _CountingLoss()
+    task = TeacherStudentDistillationTask(
+        model=torch.nn.Identity(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        clap_semantic_loss=clap_loss,
+        clap_semantic_loss_weight=0.1,
+        whisper_feature_loss=whisper_loss,
+        whisper_feature_loss_weight=0.1,
+        perceptual_loss_start_step=2,
+        perceptual_loss_every_n_steps=4,
+    )
+    est = torch.ones(1, 3, 1, 16)
+    ref = torch.zeros_like(est)
+
+    object.__setattr__(task, "_trainer", SimpleNamespace(global_step=1, current_epoch=0))
+    assert task._compute_frozen_perceptual_losses(est, ref, log_prefix="training") == {}
+    object.__setattr__(task, "_trainer", SimpleNamespace(global_step=3, current_epoch=0))
+    assert task._compute_frozen_perceptual_losses(est, ref, log_prefix="training") == {}
+    object.__setattr__(task, "_trainer", SimpleNamespace(global_step=4, current_epoch=0))
+    assert set(task._compute_frozen_perceptual_losses(est, ref, log_prefix="training")) == {
+        "clap_semantic",
+        "whisper_feature",
+    }
+    object.__setattr__(task, "_trainer", SimpleNamespace(global_step=5, current_epoch=0))
+    assert set(task._compute_frozen_perceptual_losses(est, ref, log_prefix="validation")) == {
+        "clap_semantic",
+        "whisper_feature",
+    }
+    assert clap_loss.calls == whisper_loss.calls == 2
+
+
+def test_distillation_task_weights_and_logs_perceptual_losses() -> None:
+    class _Separator(torch.nn.Module):
+        def forward(self, wav: torch.Tensor) -> torch.Tensor:
+            return wav[:, None].expand(-1, 3, -1, -1)
+
+    class _UnitLoss(torch.nn.Module):
+        def forward(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+            return est.new_ones(())
+
+    task = TeacherStudentDistillationTask(
+        model=_Separator(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        clap_semantic_loss=_UnitLoss(),
+        clap_semantic_loss_weight=0.1,
+        whisper_feature_loss=_UnitLoss(),
+        whisper_feature_loss_weight=0.2,
+    )
+    object.__setattr__(task, "_trainer", SimpleNamespace(global_step=0, current_epoch=3))
+    logged: dict[str, torch.Tensor] = {}
+
+    def capture_log(values: dict[str, torch.Tensor], **_kwargs) -> None:
+        logged.update(values)
+
+    task.log_dict = capture_log  # type: ignore[method-assign]
+    wav = torch.ones(1, 1, 16)
+    ref = torch.zeros(1, 3, 1, 16)
+
+    loss = task._step(wav, ref, log_prefix="training")
+
+    torch.testing.assert_close(loss, torch.tensor(1.3))
+    torch.testing.assert_close(logged["training/loss_clap_semantic"], torch.tensor(1.0))
+    torch.testing.assert_close(logged["training/loss_whisper_feature"], torch.tensor(1.0))
+    torch.testing.assert_close(logged["training/loss"], torch.tensor(1.3))
 
 
 def test_distillation_task_rejects_unknown_source_weight_name() -> None:

@@ -1,0 +1,51 @@
+_base_: ../tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475.broadcast-v1/config.yaml
+
+# This is a perceptual fine-tuning recipe. Resume it from a converged separation
+# checkpoint rather than using the frozen loss networks during initial training.
+fine_tune_checkpoint_path: ???
+perceptual_teacher_checkpoint_path: ???
+clap_checkpoint_path: null
+clap_allow_download: true
+clap_prompt_config_path: ${working_directory}/clap_prompts.yaml
+whisper_model_name: base
+whisper_download_root: null
+
+trainer:
+  # CLAP, Whisper, and the existing separation teacher all occupy accelerator
+  # memory. Preserve the effective base batch with gradient accumulation.
+  accumulate_grad_batches: 4
+
+datamodule:
+  batch_size: 1
+
+task:
+  pretrained_model_path: ${fine_tune_checkpoint_path}
+  teacher_checkpoint_path: ${perceptual_teacher_checkpoint_path}
+  clap_semantic_loss:
+    _target_: spectral_feature_compression.core.loss.frozen_audio_perceptual.ClapSemanticLoss
+    sample_rate: ${datamodule.sr}
+    source_order: ${datamodule.source_order}
+    prompt_config_path: ${clap_prompt_config_path}
+    checkpoint_path: ${clap_checkpoint_path}
+    model_id: 1
+    allow_download: ${clap_allow_download}
+    reference_activity_db: -60.0
+    positive_weight: 0.5
+    negative_weight: 1.0
+    negative_margin: 0.0
+  clap_semantic_loss_weight: 0.10
+
+  whisper_feature_loss:
+    _target_: spectral_feature_compression.core.loss.frozen_audio_perceptual.WhisperFeatureMatchingLoss
+    sample_rate: ${datamodule.sr}
+    model_name: ${whisper_model_name}
+    download_root: ${whisper_download_root}
+    selected_layers: null
+    reference_activity_db: -60.0
+  whisper_feature_loss_weight: 0.10
+  whisper_source: speech
+
+  # The recipe itself is the post-warm-up fine-tuning stage. Evaluate the
+  # expensive losses on every validation batch but only every fourth train step.
+  perceptual_loss_start_step: 0
+  perceptual_loss_every_n_steps: 4

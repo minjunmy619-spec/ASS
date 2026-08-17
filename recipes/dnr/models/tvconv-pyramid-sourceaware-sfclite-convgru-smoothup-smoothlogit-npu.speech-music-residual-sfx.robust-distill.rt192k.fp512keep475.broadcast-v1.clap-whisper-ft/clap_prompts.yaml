@@ -1,0 +1,13 @@
+positive_prompts:
+  speech: clear human speech and television dialogue
+  music: background music and instrumental music
+  effects: sound effects, foley, and environmental ambience
+
+negative_prompts:
+  speech:
+    - background music, sound effects, or environmental ambience without dialogue
+  music:
+    - human speaking or television dialogue
+  effects:
+    - human speaking or television dialogue
+    - music or singing
