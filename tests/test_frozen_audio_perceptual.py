@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import torch
+
+import pytest
 
 from spectral_feature_compression.core.loss.frozen_audio_perceptual import (
     ClapSemanticLoss,
@@ -41,6 +44,8 @@ class _DummyClap(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.projection = torch.nn.Linear(3, 3, bias=False)
+        with torch.no_grad():
+            self.projection.weight.copy_(torch.eye(3))
 
     def get_text_embedding(self, prompts: list[str], *, use_tensor: bool) -> torch.Tensor:
         assert use_tensor is True
@@ -150,11 +155,7 @@ def test_clap_semantic_loss_is_frozen_and_returns_per_stem_scores() -> None:
     assert float(estimate.grad.abs().sum()) > 0.0
     assert all(parameter.grad is None for parameter in clap.parameters())
     assert all(not parameter.requires_grad for parameter in clap.parameters())
-    assert set(loss_module.state_dict()) == {
-        "positive_text_embeddings",
-        "negative_text_embeddings",
-        "has_negative_prompt",
-    }
+    assert tuple(loss_module.state_dict()) == ()
     assert tuple(loss_module.named_parameters()) == ()
 
 
@@ -200,6 +201,10 @@ negative_prompts:
   speech: music or sound effects
   music: spoken dialogue
   effects: spoken dialogue
+prompt_banks:
+  speech: [human speech, spoken dialogue]
+  music: [background music]
+  effects: [foley effects]
 """,
         encoding="utf-8",
     )
@@ -207,9 +212,200 @@ negative_prompts:
     loss_module = ClapSemanticLoss(
         sample_rate=48000,
         prompt_config_path=prompt_config,
+        prompt_bank_weight=0.1,
         clap_model=_DummyClap(),
     )
 
     assert loss_module.source_has_negative_prompt("speech") is True
     assert loss_module.source_has_negative_prompt("music") is True
     assert loss_module.source_has_negative_prompt("effects") is True
+    assert loss_module.has_prompt_banks is True
+    assert tuple(loss_module.prompt_bank_window_scores(_distinct_reference_stems()).shape) == (1, 3, 1, 3)
+    assert tuple(loss_module.state_dict()) == ()
+
+
+def _distinct_reference_stems(samples: int = 2400) -> torch.Tensor:
+    alternating = torch.ones(samples)
+    alternating[1::2] = -1.0
+    return torch.stack(
+        (
+            torch.ones(samples),
+            -torch.ones(samples),
+            alternating,
+        )
+    )[None, :, None, :]
+
+
+def test_clap_audio_to_audio_loss_matches_references_and_penalizes_swaps() -> None:
+    loss_module = ClapSemanticLoss(
+        sample_rate=48000,
+        positive_weight=0.0,
+        negative_weight=0.0,
+        audio_match_weight=1.0,
+        audio_antibleed_weight=1.0,
+        clap_model=_DummyClap(),
+    )
+    reference = _distinct_reference_stems()
+    exact_components = loss_module.loss_components(reference, reference)
+    swapped = reference[:, (1, 0, 2)].clone().requires_grad_(True)
+    swapped_components = loss_module.loss_components(swapped, reference)
+
+    torch.testing.assert_close(exact_components["audio_match"], torch.tensor(0.0), atol=1e-6, rtol=0.0)
+    torch.testing.assert_close(
+        exact_components["audio_antibleed"],
+        torch.tensor(0.0),
+        atol=1e-6,
+        rtol=0.0,
+    )
+    assert swapped_components["audio_match"] > exact_components["audio_match"]
+    assert swapped_components["audio_antibleed"] > exact_components["audio_antibleed"]
+
+    perturbed = (swapped.detach() + 0.05 * torch.randn_like(swapped)).requires_grad_(True)
+    active_reference = reference.clone().requires_grad_(True)
+    total = loss_module(perturbed, active_reference)
+    total.backward()
+    assert perturbed.grad is not None
+    assert float(perturbed.grad.abs().sum()) > 0.0
+    assert active_reference.grad is None
+    assert all(parameter.grad is None for parameter in loss_module.clap_model.parameters())
+
+
+def test_clap_audio_to_audio_reference_branch_is_frozen_and_silence_is_masked() -> None:
+    loss_module = ClapSemanticLoss(
+        sample_rate=48000,
+        positive_weight=0.0,
+        negative_weight=0.0,
+        audio_match_weight=1.0,
+        audio_antibleed_weight=1.0,
+        clap_model=_DummyClap(),
+    )
+    estimate = torch.randn(1, 3, 1, 2400, requires_grad=True)
+    reference = torch.zeros_like(estimate, requires_grad=True)
+
+    loss = loss_module(estimate, reference)
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.zeros_like(loss))
+    torch.testing.assert_close(estimate.grad, torch.zeros_like(estimate))
+    assert reference.grad is None
+
+
+def test_clap_audio_to_audio_masks_inactive_final_window() -> None:
+    loss_module = ClapSemanticLoss(
+        sample_rate=48000,
+        positive_weight=0.0,
+        negative_weight=0.0,
+        audio_match_weight=1.0,
+        clap_model=_DummyClap(),
+    )
+    reference = torch.zeros(1, 3, 1, 15 * 48000)
+    reference[..., : 10 * 48000] = _distinct_reference_stems(10 * 48000)
+    estimate = reference.clone()
+    estimate[..., 10 * 48000 :] = torch.randn_like(estimate[..., 10 * 48000 :])
+
+    components = loss_module.loss_components(estimate, reference)
+
+    torch.testing.assert_close(components["audio_match"], torch.tensor(0.0), atol=1e-6, rtol=0.0)
+
+
+def test_clap_prompt_bank_uses_prompt_count_normalized_class_scores() -> None:
+    short_banks = {
+        "speech": ("human speech",),
+        "music": ("background music",),
+        "effects": ("foley effects",),
+    }
+    repeated_banks = {source: prompts * 3 for source, prompts in short_banks.items()}
+    short = ClapSemanticLoss(
+        sample_rate=48000,
+        prompt_banks=short_banks,
+        prompt_bank_weight=1.0,
+        positive_weight=0.0,
+        negative_weight=0.0,
+        clap_model=_DummyClap(),
+    )
+    repeated = ClapSemanticLoss(
+        sample_rate=48000,
+        prompt_banks=repeated_banks,
+        prompt_bank_weight=1.0,
+        positive_weight=0.0,
+        negative_weight=0.0,
+        clap_model=_DummyClap(),
+    )
+    estimate = _distinct_reference_stems().requires_grad_(True)
+    reference = _distinct_reference_stems()
+
+    short_scores = short.prompt_bank_window_scores(estimate)
+    repeated_scores = repeated.prompt_bank_window_scores(estimate)
+    torch.testing.assert_close(short_scores, repeated_scores)
+    torch.testing.assert_close(short(estimate, reference), repeated(estimate, reference))
+
+
+def test_clap_combined_window_metrics_share_estimate_encoding() -> None:
+    clap = _RecordingClap()
+    loss_module = ClapSemanticLoss(
+        sample_rate=48000,
+        prompt_banks={
+            "speech": ("human speech",),
+            "music": ("background music",),
+            "effects": ("foley effects",),
+        },
+        clap_model=clap,
+    )
+    reference = _distinct_reference_stems()
+
+    metrics = loss_module.window_metrics(reference, reference)
+
+    assert tuple(metrics["positive_similarity"].shape) == (1, 3, 1)
+    assert tuple(metrics["prompt_bank_scores"].shape) == (1, 3, 1, 3)
+    assert tuple(metrics["same_stem_similarity"].shape) == (1, 3, 1)
+    assert clap.audio_input_shapes == [(3, 2400), (3, 2400)]
+
+
+def test_clap_prompt_bank_requires_complete_nonempty_source_banks() -> None:
+    with pytest.raises(ValueError, match="missing sources"):
+        ClapSemanticLoss(
+            sample_rate=48000,
+            prompt_banks={"speech": ("human speech",)},
+            prompt_bank_weight=1.0,
+            clap_model=_DummyClap(),
+        )
+
+    with pytest.raises(ValueError, match="non-empty prompts"):
+        ClapSemanticLoss(
+            sample_rate=48000,
+            prompt_banks={"speech": (), "music": ("music",), "effects": ("effects",)},
+            prompt_bank_weight=1.0,
+            clap_model=_DummyClap(),
+        )
+
+
+def test_clap_constructs_the_requested_audio_encoder_and_excludes_prompt_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class _LoadableDummyClap(_DummyClap):
+        def load_ckpt(self, *, ckpt: str | None, model_id: int) -> None:
+            calls["checkpoint"] = ckpt
+            calls["model_id"] = model_id
+
+    def construct_clap(**kwargs: object) -> _LoadableDummyClap:
+        calls["constructor"] = kwargs
+        return _LoadableDummyClap()
+
+    monkeypatch.setitem(sys.modules, "laion_clap", SimpleNamespace(CLAP_Module=construct_clap))
+    loss_module = ClapSemanticLoss(
+        sample_rate=48000,
+        checkpoint_path="/models/music_speech_audioset.pt",
+        amodel="HTSAT-base",
+    )
+
+    assert calls["constructor"] == {
+        "enable_fusion": False,
+        "device": "cpu",
+        "amodel": "HTSAT-base",
+    }
+    assert calls["checkpoint"] == "/models/music_speech_audioset.pt"
+    assert calls["model_id"] == 1
+    assert loss_module.amodel == "HTSAT-base"
+    assert tuple(loss_module.state_dict()) == ()

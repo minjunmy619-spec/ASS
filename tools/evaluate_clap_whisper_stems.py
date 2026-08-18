@@ -26,7 +26,7 @@ _DEFAULT_CLAP_PROMPT_CONFIG = (
     Path(__file__).resolve().parents[1]
     / "recipes/dnr/models"
     / "tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx."
-    "robust-distill.rt192k.fp512keep475.broadcast-v1.clap-whisper-ft"
+    "robust-distill.rt192k.fp512keep475.broadcast-v1.clap-a2a-bank-whisper-ft"
     / "clap_prompts.yaml"
 )
 
@@ -100,6 +100,18 @@ def _summary(values: Sequence[float | None]) -> dict[str, float | int | None]:
     }
 
 
+def _masked_weighted_mean(
+    values: torch.Tensor,
+    valid: torch.Tensor,
+    weights: torch.Tensor,
+) -> float | None:
+    masked_weights = valid.to(weights.dtype) * weights
+    denominator = masked_weights.sum()
+    if not bool(denominator > 0):
+        return None
+    return float((values * masked_weights).sum() / denominator)
+
+
 def evaluate_manifest(
     manifest_path: str | Path,
     *,
@@ -127,12 +139,28 @@ def evaluate_manifest(
     missing = sorted(required - fieldnames)
     if missing:
         raise ValueError(f"Manifest {manifest_path} is missing columns: {missing}")
+    reference_fields = {f"reference_{source}_filepath" for source in source_order}
+    present_reference_fields = reference_fields & fieldnames
+    if present_reference_fields and present_reference_fields != reference_fields:
+        missing_reference_fields = sorted(reference_fields - present_reference_fields)
+        raise ValueError(
+            f"Manifest {manifest_path} has partial reference stems; missing columns: {missing_reference_fields}"
+        )
+    has_references = bool(present_reference_fields)
+    if has_references and not hasattr(clap_scorer, "reference_window_metrics"):
+        raise ValueError("Reference stem columns require a CLAP scorer with reference_window_metrics()")
     if not rows:
         raise ValueError(f"Manifest contains no rows: {manifest_path}")
 
     output_rows = []
+    clap_metric_names = ["positive_similarity", "negative_similarity", "purity_margin"]
+    has_prompt_banks = bool(getattr(clap_scorer, "has_prompt_banks", False))
+    if has_prompt_banks:
+        clap_metric_names.extend(("prompt_bank_probability", "prompt_bank_margin"))
+    if has_references:
+        clap_metric_names.extend(("reference_similarity", "relative_cross_stem_excess"))
     clap_values = {
-        source: {"positive_similarity": [], "negative_similarity": [], "purity_margin": []}
+        source: {metric: [] for metric in clap_metric_names}
         for source in source_order
     }
     whisper_values = {
@@ -155,15 +183,67 @@ def evaluate_manifest(
             raise ValueError(f"Separated stems must have equal lengths in row {row_idx}, got {stem_lengths}")
         stacked = torch.stack(audio)
         stems = stacked[None, :, None, :].to(target_device)
+        reference_stems = None
+        if has_references:
+            reference_audio = []
+            for source in source_order:
+                value = str(row.get(f"reference_{source}_filepath", "")).strip()
+                if not value:
+                    raise ValueError(f"Empty reference_{source}_filepath in {manifest_path} row {row_idx}")
+                path = _resolve_path(value, manifest_dir=manifest_path.parent)
+                reference_audio.append(_load_mono(path, sample_rate=sample_rate))
+            all_lengths = [item.numel() for item in audio + reference_audio]
+            if len(set(all_lengths)) != 1:
+                raise ValueError(
+                    f"Separated and reference stems must have equal lengths in row {row_idx}, got {all_lengths}"
+                )
+            reference_stems = torch.stack(reference_audio)[None, :, None, :].to(target_device)
         with torch.no_grad():
-            if hasattr(clap_scorer, "semantic_window_scores"):
+            if hasattr(clap_scorer, "window_metrics"):
+                combined_metrics = clap_scorer.window_metrics(stems, reference_stems)
+                positive = combined_metrics["positive_similarity"]
+                negative = combined_metrics["negative_similarity"]
+                bank_scores = combined_metrics.get("prompt_bank_scores")
+                reference_metrics = (
+                    {
+                        name: combined_metrics[name]
+                        for name in (
+                            "same_stem_similarity",
+                            "relative_cross_stem_excess",
+                            "reference_active",
+                            "cross_stem_valid",
+                        )
+                    }
+                    if reference_stems is not None
+                    else None
+                )
+            elif hasattr(clap_scorer, "semantic_window_scores"):
                 positive, negative = clap_scorer.semantic_window_scores(stems)
+                bank_scores = clap_scorer.prompt_bank_window_scores(stems) if has_prompt_banks else None
+                reference_metrics = (
+                    clap_scorer.reference_window_metrics(stems, reference_stems)
+                    if reference_stems is not None
+                    else None
+                )
             else:
                 positive, negative = clap_scorer.semantic_scores(stems)
                 positive = positive[..., None]
                 negative = negative[..., None]
+                bank_scores = clap_scorer.prompt_bank_window_scores(stems) if has_prompt_banks else None
+                reference_metrics = (
+                    clap_scorer.reference_window_metrics(stems, reference_stems)
+                    if reference_stems is not None
+                    else None
+                )
         positive = positive[0].detach().cpu()
         negative = negative[0].detach().cpu()
+        if bank_scores is not None:
+            bank_scores = bank_scores[0].detach().cpu()
+            bank_probabilities = bank_scores.softmax(dim=-1)
+        else:
+            bank_probabilities = None
+        if reference_metrics is not None:
+            reference_metrics = {name: value[0].detach().cpu() for name, value in reference_metrics.items()}
         if hasattr(clap_scorer, "window_bounds"):
             window_bounds = clap_scorer.window_bounds(stacked.shape[-1])
         else:
@@ -187,28 +267,85 @@ def evaluate_manifest(
             positive_mean = float((positive_values * window_weights).sum())
             negative_mean = float((negative_values * window_weights).sum()) if has_negative else None
             purity_margin = positive_mean - negative_mean if negative_mean is not None else None
+            prompt_probability_values = None
+            prompt_margin_values = None
+            if bank_scores is not None and bank_probabilities is not None:
+                prompt_probability_values = bank_probabilities[source_idx, :, source_idx]
+                other_source_mask = torch.arange(len(source_order)) != source_idx
+                prompt_margin_values = (
+                    bank_scores[source_idx, :, source_idx]
+                    - bank_scores[source_idx, :, other_source_mask].max(dim=-1).values
+                )
+            reference_similarity_values = None
+            reference_active_values = None
+            relative_excess_values = None
+            relative_excess_valid = None
+            if reference_metrics is not None:
+                reference_similarity_values = reference_metrics["same_stem_similarity"][source_idx]
+                reference_active_values = reference_metrics["reference_active"][source_idx]
+                relative_excess_values = reference_metrics["relative_cross_stem_excess"][source_idx]
+                relative_excess_valid = reference_metrics["cross_stem_valid"][source_idx]
             source_scores = {
                 "positive_similarity": positive_mean,
                 "negative_similarity": negative_mean,
                 "purity_margin": purity_margin,
                 "window_count": len(window_bounds),
-                "windows": [
-                    {
-                        "start_seconds": start / sample_rate,
-                        "end_seconds": end / sample_rate,
-                        "positive_similarity": float(positive_values[window_idx]),
-                        "negative_similarity": (
-                            float(negative_values[window_idx]) if has_negative else None
-                        ),
-                        "purity_margin": (
-                            float(positive_values[window_idx] - negative_values[window_idx])
-                            if has_negative
-                            else None
-                        ),
-                    }
-                    for window_idx, (start, end) in enumerate(window_bounds)
-                ],
             }
+            if prompt_probability_values is not None and prompt_margin_values is not None:
+                source_scores["prompt_bank_probability"] = float(
+                    (prompt_probability_values * window_weights).sum()
+                )
+                source_scores["prompt_bank_margin"] = float((prompt_margin_values * window_weights).sum())
+            if (
+                reference_similarity_values is not None
+                and reference_active_values is not None
+                and relative_excess_values is not None
+                and relative_excess_valid is not None
+            ):
+                source_scores["reference_similarity"] = _masked_weighted_mean(
+                    reference_similarity_values,
+                    reference_active_values,
+                    window_weights,
+                )
+                source_scores["relative_cross_stem_excess"] = _masked_weighted_mean(
+                    relative_excess_values,
+                    relative_excess_valid,
+                    window_weights,
+                )
+            windows = []
+            for window_idx, (start, end) in enumerate(window_bounds):
+                window = {
+                    "start_seconds": start / sample_rate,
+                    "end_seconds": end / sample_rate,
+                    "positive_similarity": float(positive_values[window_idx]),
+                    "negative_similarity": float(negative_values[window_idx]) if has_negative else None,
+                    "purity_margin": (
+                        float(positive_values[window_idx] - negative_values[window_idx])
+                        if has_negative
+                        else None
+                    ),
+                }
+                if prompt_probability_values is not None and prompt_margin_values is not None:
+                    window["prompt_bank_probability"] = float(prompt_probability_values[window_idx])
+                    window["prompt_bank_margin"] = float(prompt_margin_values[window_idx])
+                if (
+                    reference_similarity_values is not None
+                    and reference_active_values is not None
+                    and relative_excess_values is not None
+                    and relative_excess_valid is not None
+                ):
+                    window["reference_similarity"] = (
+                        float(reference_similarity_values[window_idx])
+                        if bool(reference_active_values[window_idx])
+                        else None
+                    )
+                    window["relative_cross_stem_excess"] = (
+                        float(relative_excess_values[window_idx])
+                        if bool(relative_excess_valid[window_idx])
+                        else None
+                    )
+                windows.append(window)
+            source_scores["windows"] = windows
             clap_row[source] = source_scores
             for metric in clap_values[source]:
                 clap_values[source][metric].append(source_scores[metric])
@@ -244,6 +381,11 @@ def evaluate_manifest(
     return {
         "manifest": str(manifest_path),
         "sample_rate": sample_rate,
+        "has_reference_stems": has_references,
+        "clap_config": {
+            "audio_model": getattr(clap_scorer, "amodel", None),
+            "audio_antibleed_margin": getattr(clap_scorer, "audio_antibleed_margin", None),
+        },
         "row_count": len(output_rows),
         "rows": output_rows,
         "summary": summary,
@@ -257,7 +399,7 @@ def _parse_sources(value: str) -> tuple[str, ...]:
     return result
 
 
-def _parse_args() -> Any:
+def _parse_args(argv: Sequence[str] | None = None) -> Any:
     parser = ArgumentParser(description="Evaluate real separated stems with frozen CLAP and Whisper")
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--source-order", default="speech,music,effects")
@@ -265,6 +407,8 @@ def _parse_args() -> Any:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--clap-checkpoint", type=Path)
     parser.add_argument("--clap-model-id", type=int, default=1)
+    parser.add_argument("--clap-audio-model", default="HTSAT-tiny")
+    parser.add_argument("--clap-audio-antibleed-margin", type=float, default=0.02)
     parser.add_argument("--clap-prompt-config", type=Path, default=_DEFAULT_CLAP_PROMPT_CONFIG)
     parser.add_argument("--allow-clap-download", action="store_true")
     parser.add_argument("--whisper-model", default="base")
@@ -273,7 +417,7 @@ def _parse_args() -> Any:
     parser.add_argument("--whisper-language")
     parser.add_argument("--disable-whisper", action="store_true")
     parser.add_argument("--output-json", type=Path)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -287,6 +431,8 @@ def main() -> None:
         prompt_config_path=args.clap_prompt_config,
         checkpoint_path=args.clap_checkpoint,
         model_id=args.clap_model_id,
+        amodel=args.clap_audio_model,
+        audio_antibleed_margin=args.clap_audio_antibleed_margin,
         allow_download=args.allow_clap_download,
     ).to(device)
 

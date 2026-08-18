@@ -207,6 +207,7 @@ class TeacherStudentDistillationTask(SupTask):
         whisper_source: str = "speech",
         perceptual_loss_start_step: int = 0,
         perceptual_loss_every_n_steps: int = 1,
+        perceptual_loss_compensate_cadence: bool = False,
         source_activity_loss_weight: float = 0.0,
         source_activity_db: float = -50.0,
         source_activity_active_weight: float = 1.0,
@@ -369,6 +370,7 @@ class TeacherStudentDistillationTask(SupTask):
         self.whisper_source = str(whisper_source)
         self.perceptual_loss_start_step = int(perceptual_loss_start_step)
         self.perceptual_loss_every_n_steps = int(perceptual_loss_every_n_steps)
+        self.perceptual_loss_compensate_cadence = bool(perceptual_loss_compensate_cadence)
         self.source_activity_loss_weight = source_activity_loss_weight
         self.source_activity_db = source_activity_db
         self.source_activity_active_weight = source_activity_active_weight
@@ -713,7 +715,20 @@ class TeacherStudentDistillationTask(SupTask):
         if self.clap_semantic_loss_weight > 0.0:
             if self.clap_semantic_loss is None:
                 raise RuntimeError("clap_semantic_loss is unexpectedly missing")
-            losses["clap_semantic"] = self.clap_semantic_loss(est, ref)
+            forward_with_components = getattr(self.clap_semantic_loss, "forward_with_components", None)
+            if callable(forward_with_components):
+                clap_total, clap_components = forward_with_components(est, ref)
+                if not isinstance(clap_total, torch.Tensor) or clap_total.ndim != 0:
+                    raise TypeError("CLAP forward_with_components() must return a scalar tensor total")
+                if not isinstance(clap_components, Mapping):
+                    raise TypeError("CLAP forward_with_components() must return a component mapping")
+                losses["clap_semantic"] = clap_total
+                for name, value in clap_components.items():
+                    if not isinstance(value, torch.Tensor) or value.ndim != 0:
+                        raise TypeError(f"CLAP component {name!r} must be a scalar tensor")
+                    losses[f"clap_semantic_{name}"] = value
+            else:
+                losses["clap_semantic"] = self.clap_semantic_loss(est, ref)
         if self.whisper_feature_loss_weight > 0.0:
             if self.whisper_feature_loss is None:
                 raise RuntimeError("whisper_feature_loss is unexpectedly missing")
@@ -1320,14 +1335,24 @@ class TeacherStudentDistillationTask(SupTask):
             log_dict[f"{log_prefix}/loss_frame_silent_source"] = frame_silent_loss
 
         perceptual_losses = self._compute_frozen_perceptual_losses(est, ref, log_prefix=log_prefix)
+        perceptual_scale = (
+            float(self.perceptual_loss_every_n_steps)
+            if log_prefix == "training" and self.perceptual_loss_compensate_cadence
+            else 1.0
+        )
         if "clap_semantic" in perceptual_losses:
             clap_loss = perceptual_losses["clap_semantic"]
-            loss = loss + self.clap_semantic_loss_weight * clap_loss
+            loss = loss + perceptual_scale * self.clap_semantic_loss_weight * clap_loss
             log_dict[f"{log_prefix}/loss_clap_semantic"] = clap_loss
         if "whisper_feature" in perceptual_losses:
             whisper_loss = perceptual_losses["whisper_feature"]
-            loss = loss + self.whisper_feature_loss_weight * whisper_loss
+            loss = loss + perceptual_scale * self.whisper_feature_loss_weight * whisper_loss
             log_dict[f"{log_prefix}/loss_whisper_feature"] = whisper_loss
+        if perceptual_losses:
+            log_dict[f"{log_prefix}/perceptual_cadence_scale"] = loss.new_tensor(perceptual_scale)
+        for name, component_loss in perceptual_losses.items():
+            if name.startswith("clap_semantic_"):
+                log_dict[f"{log_prefix}/loss_{name}"] = component_loss
 
         if self.source_activity_loss_weight > 0.0:
             activity_loss = self._source_activity_l1(est, ref)

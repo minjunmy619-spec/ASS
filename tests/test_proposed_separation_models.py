@@ -2803,6 +2803,73 @@ def test_distillation_task_weights_and_logs_perceptual_losses() -> None:
     torch.testing.assert_close(logged["training/loss"], torch.tensor(1.3))
 
 
+def test_distillation_task_can_compensate_sparse_perceptual_loss_cadence() -> None:
+    class _Separator(torch.nn.Module):
+        def forward(self, wav: torch.Tensor) -> torch.Tensor:
+            return wav[:, None].expand(-1, 3, -1, -1)
+
+    class _UnitLoss(torch.nn.Module):
+        def forward(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+            return est.new_ones(())
+
+    task = TeacherStudentDistillationTask(
+        model=_Separator(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        clap_semantic_loss=_UnitLoss(),
+        clap_semantic_loss_weight=0.1,
+        whisper_feature_loss=_UnitLoss(),
+        whisper_feature_loss_weight=0.2,
+        perceptual_loss_every_n_steps=4,
+        perceptual_loss_compensate_cadence=True,
+    )
+    object.__setattr__(task, "_trainer", SimpleNamespace(global_step=0, current_epoch=0))
+    logged: dict[str, torch.Tensor] = {}
+    task.log_dict = lambda values, **_kwargs: logged.update(values)  # type: ignore[method-assign]
+
+    loss = task._step(torch.ones(1, 1, 16), torch.zeros(1, 3, 1, 16), log_prefix="training")
+
+    torch.testing.assert_close(loss, torch.tensor(2.2))
+    torch.testing.assert_close(logged["training/perceptual_cadence_scale"], torch.tensor(4.0))
+
+
+def test_distillation_task_logs_clap_multiobjective_components_without_reweighting_them() -> None:
+    class _Separator(torch.nn.Module):
+        def forward(self, wav: torch.Tensor) -> torch.Tensor:
+            return wav[:, None].expand(-1, 3, -1, -1)
+
+    class _ComponentClapLoss(torch.nn.Module):
+        def forward_with_components(
+            self,
+            est: torch.Tensor,
+            ref: torch.Tensor,
+        ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+            one = est.new_ones(())
+            return 2.0 * one, {"audio_match": one, "prompt_bank": 3.0 * one}
+
+    task = TeacherStudentDistillationTask(
+        model=_Separator(),
+        loss=torch.nn.L1Loss(),
+        n_fft=32,
+        hop_length=8,
+        optimizer_config=object(),  # type: ignore[arg-type]
+        clap_semantic_loss=_ComponentClapLoss(),
+        clap_semantic_loss_weight=0.1,
+    )
+    object.__setattr__(task, "_trainer", SimpleNamespace(global_step=0, current_epoch=0))
+    logged: dict[str, torch.Tensor] = {}
+    task.log_dict = lambda values, **_kwargs: logged.update(values)  # type: ignore[method-assign]
+
+    loss = task._step(torch.ones(1, 1, 16), torch.zeros(1, 3, 1, 16), log_prefix="training")
+
+    torch.testing.assert_close(loss, torch.tensor(1.2))
+    torch.testing.assert_close(logged["training/loss_clap_semantic"], torch.tensor(2.0))
+    torch.testing.assert_close(logged["training/loss_clap_semantic_audio_match"], torch.tensor(1.0))
+    torch.testing.assert_close(logged["training/loss_clap_semantic_prompt_bank"], torch.tensor(3.0))
+
+
 def test_distillation_task_rejects_unknown_source_weight_name() -> None:
     with pytest.raises(ValueError, match="unknown sources"):
         TeacherStudentDistillationTask(

@@ -6,6 +6,7 @@ fine_tune_checkpoint_path: ???
 perceptual_teacher_checkpoint_path: ???
 clap_checkpoint_path: null
 clap_allow_download: true
+clap_audio_model: HTSAT-tiny
 clap_prompt_config_path: ${working_directory}/clap_prompts.yaml
 whisper_model_name: base
 whisper_download_root: null
@@ -28,6 +29,7 @@ task:
     prompt_config_path: ${clap_prompt_config_path}
     checkpoint_path: ${clap_checkpoint_path}
     model_id: 1
+    amodel: ${clap_audio_model}
     allow_download: ${clap_allow_download}
     reference_activity_db: -60.0
     positive_weight: 0.5
@@ -49,3 +51,6 @@ task:
   # expensive losses on every validation batch but only every fourth train step.
   perceptual_loss_start_step: 0
   perceptual_loss_every_n_steps: 4
+  # Preserve the configured long-run loss weights when computing the frozen
+  # teachers on only one out of every four optimizer steps.
+  perceptual_loss_compensate_cadence: true

@@ -2,6 +2,11 @@
 
 Date: 2026-08-17
 
+> This document records the original single-prompt CLAP baseline. The
+> scene-independent CLAP Audio-to-Audio and Prompt Bank extension is documented
+> in `clap_a2a_prompt_bank_whisper_20260818_operation.md`; the original recipe
+> remains unchanged for controlled A/B experiments.
+
 ## Scope and terminology
 
 The research note describes **CLAP** (Contrastive Language-Audio Pretraining),
@@ -23,7 +28,7 @@ The integration has two separate paths:
 |---|---|
 | `spectral_feature_compression/core/loss/frozen_audio_perceptual.py` | Frozen CLAP and Whisper loss adapters |
 | `spectral_feature_compression/core/tasks/distillation_task.py` | Loss scheduling, weighting, source selection, and logging |
-| `tools/evaluate_clap_whisper_stems.py` | No-reference scoring of separated real WAV stems |
+| `tools/evaluate_clap_whisper_stems.py` | No-reference scoring plus optional paired-reference diagnostics |
 | `requirements-perceptual.txt` | Optional external packages |
 | `recipes/dnr/models/tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475.broadcast-v1.clap-whisper-ft/config.yaml` | Post-convergence perceptual fine-tuning recipe |
 | `recipes/dnr/models/tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475.broadcast-v1.clap-whisper-ft/clap_prompts.yaml` | Shared training/evaluation CLAP prompts |
@@ -97,8 +102,10 @@ embedding. This preserves short-crop training without padding every example to
 - All CLAP/Whisper parameters have `requires_grad=False` and stay in evaluation
   mode when the parent task enters training mode.
 - Frozen external networks move with the Lightning task but are intentionally
-  excluded from the separator checkpoint `state_dict`; text embeddings and mel
-  filters needed by the adapters remain ordinary buffers.
+  excluded from the separator checkpoint `state_dict`. Derived CLAP prompt
+  embeddings are non-persistent buffers and are rebuilt from the active model
+  and prompt configuration; adapter constants such as mel filters remain
+  ordinary buffers.
 - CLAP/Whisper are training-side modules only. They do not change separator
   parameter count, recurrent state, causal execution, exported ONNX, or Circle
   compilation.
@@ -114,11 +121,14 @@ The new task arguments are:
 | `whisper_source` | Stem used for Whisper feature matching |
 | `perceptual_loss_start_step` | Optimizer step at which both losses start |
 | `perceptual_loss_every_n_steps` | Compute cadence during training; validation always computes after the start step |
+| `perceptual_loss_compensate_cadence` | Multiply loss on evaluated train steps by the cadence to preserve its long-run mean weight |
 
 The recipe uses outer weights `0.10` and `0.10`, evaluates the expensive losses
-every fourth optimizer step, reduces the physical batch size to one, and uses
-four-step gradient accumulation. It is intended as a fine-tuning stage from a
-converged broadcast-v1 separator, not as the initial training recipe.
+every fourth optimizer step, and applies a factor of four on those steps so the
+configured mean weights remain `0.10`. Raw metric logs are not scaled. It also
+reduces the physical batch size to one and uses four-step gradient accumulation.
+It is intended as a fine-tuning stage from a converged broadcast-v1 separator,
+not as the initial training recipe.
 
 ## Installation
 
@@ -150,6 +160,7 @@ bash recipes/dnr/models/tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoo
   fine_tune_checkpoint_path=/path/to/converged_separator.ckpt \
   perceptual_teacher_checkpoint_path=/path/to/separation_teacher.ckpt \
   clap_checkpoint_path=/path/to/music_audioset_epoch_15_esc_90.14.pt \
+  clap_audio_model=HTSAT-base \
   clap_allow_download=false
 ```
 
@@ -186,13 +197,15 @@ not discard any part of a source, mix stems, add RIRs, compress, or apply the
 broadcast synthesis pipeline. CLAP uses complete-file 10-second windows and
 Whisper uses complete-file 30-second windows. The three separated stems in each
 row must have equal lengths after resampling; mismatches fail explicitly.
-The CLI defaults to the same `clap_prompts.yaml` used by the fine-tuning recipe;
-`--clap-prompt-config` is available for an intentional experiment override.
+The CLI now defaults to the prompt banks used by the versioned A2A fine-tuning
+recipe. `--clap-prompt-config` remains available for an intentional experiment
+override, including reproduction of this original single-prompt baseline.
 
 ```bash
 .venv/bin/python tools/evaluate_clap_whisper_stems.py \
   /data1/manifests/real_tv_separated.csv \
   --clap-checkpoint /models/clap/music_audioset_epoch_15_esc_90.14.pt \
+  --clap-audio-model HTSAT-base \
   --clap-prompt-config recipes/dnr/models/tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475.broadcast-v1.clap-whisper-ft/clap_prompts.yaml \
   --whisper-model base \
   --whisper-language en \

@@ -1,0 +1,37 @@
+# These banks describe source taxonomy, not programme scenes. Singing remains
+# Music in this project. Change that only if the source manifests label isolated
+# singing vocals as Speech.
+prompt_banks:
+  speech:
+    - intelligible human speech and dialogue
+    - spoken narration or voice-over
+    - a person talking through a microphone
+    - conversational speech or an interview
+    - commentary or an announcement
+  music:
+    - instrumental music or a musical soundtrack
+    - a song with singing vocals and accompaniment
+    - orchestral, acoustic, or electronic music
+    - a live band or concert performance
+    - melody, harmony, rhythm, and musical instruments
+  effects:
+    - sound effects and foley
+    - environmental ambience and background noise
+    - crowd cheering, applause, or audience noise
+    - impacts, explosions, footsteps, and mechanical sounds
+    - wind, rain, traffic, and natural environmental sounds
+
+# Retained for compatibility with the shared evaluator and legacy text scores.
+positive_prompts:
+  speech: clear intelligible human speech and dialogue
+  music: music, instruments, or a song with singing
+  effects: sound effects, foley, and environmental ambience
+
+negative_prompts:
+  speech:
+    - music, sound effects, or ambience without intelligible speech
+  music:
+    - spoken dialogue without music
+  effects:
+    - intelligible spoken dialogue
+    - music or singing

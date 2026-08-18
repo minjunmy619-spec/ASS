@@ -210,7 +210,12 @@ class WhisperFeatureMatchingLoss(_FrozenExternalModelLoss):
 
 
 class ClapSemanticLoss(_FrozenExternalModelLoss):
-    """CLAP text-audio semantic anchoring and anti-bleed loss."""
+    """CLAP text and reference-audio supervision for separated stems.
+
+    The legacy positive/negative text losses remain available. Optional
+    reference matching, relative cross-stem anti-bleed, and prompt-bank
+    classification share the same frozen CLAP model and audio embeddings.
+    """
 
     max_audio_seconds = 10.0
 
@@ -235,9 +240,16 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
         positive_weight: float = 0.5,
         negative_weight: float = 1.0,
         negative_margin: float = 0.0,
+        audio_match_weight: float = 0.0,
+        audio_antibleed_weight: float = 0.0,
+        audio_antibleed_margin: float = 0.0,
+        prompt_banks: Mapping[str, Sequence[str] | str] | None = None,
+        prompt_bank_weight: float = 0.0,
+        prompt_bank_temperature: float = 0.07,
         reference_activity_db: float = -60.0,
         checkpoint_path: str | Path | None = None,
         model_id: int = 1,
+        amodel: str = "HTSAT-tiny",
         allow_download: bool = False,
         clap_model: nn.Module | None = None,
     ) -> None:
@@ -250,13 +262,27 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
         for name, value in {
             "positive_weight": positive_weight,
             "negative_weight": negative_weight,
+            "audio_match_weight": audio_match_weight,
+            "audio_antibleed_weight": audio_antibleed_weight,
+            "prompt_bank_weight": prompt_bank_weight,
         }.items():
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative, got {value}")
-        if not math.isfinite(negative_margin):
-            raise ValueError(f"negative_margin must be finite, got {negative_margin}")
+        for name, value in {
+            "negative_margin": negative_margin,
+            "audio_antibleed_margin": audio_antibleed_margin,
+        }.items():
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite, got {value}")
+        if not math.isfinite(prompt_bank_temperature) or prompt_bank_temperature <= 0.0:
+            raise ValueError(
+                f"prompt_bank_temperature must be finite and positive, got {prompt_bank_temperature}"
+            )
         if not math.isfinite(reference_activity_db):
             raise ValueError(f"reference_activity_db must be finite, got {reference_activity_db}")
+        amodel = str(amodel).strip()
+        if not amodel:
+            raise ValueError("amodel must not be empty")
 
         if clap_model is None:
             try:
@@ -268,7 +294,7 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
                 ) from exc
             if checkpoint_path is None and not allow_download:
                 raise ValueError("Set checkpoint_path or allow_download=True before constructing ClapSemanticLoss")
-            clap_model = laion_clap.CLAP_Module(enable_fusion=False, device="cpu")
+            clap_model = laion_clap.CLAP_Module(enable_fusion=False, device="cpu", amodel=amodel)
             clap_model.load_ckpt(
                 ckpt=None if checkpoint_path is None else str(Path(checkpoint_path).expanduser()),
                 model_id=int(model_id),
@@ -279,6 +305,7 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
 
         configured_positive: Mapping[str, Any] = {}
         configured_negative: Mapping[str, Any] = {}
+        configured_banks: Mapping[str, Any] = {}
         if prompt_config_path is not None:
             prompt_path = Path(prompt_config_path).expanduser()
             if not prompt_path.is_file():
@@ -288,8 +315,15 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
                 raise ValueError(f"CLAP prompt config must contain a mapping: {prompt_path}")
             configured_positive = loaded_prompts.get("positive_prompts", {})
             configured_negative = loaded_prompts.get("negative_prompts", {})
-            if not isinstance(configured_positive, Mapping) or not isinstance(configured_negative, Mapping):
-                raise ValueError("positive_prompts and negative_prompts in the CLAP prompt config must be mappings")
+            configured_banks = loaded_prompts.get("prompt_banks", {})
+            if not all(
+                isinstance(value, Mapping)
+                for value in (configured_positive, configured_negative, configured_banks)
+            ):
+                raise ValueError(
+                    "positive_prompts, negative_prompts, and prompt_banks in the CLAP prompt config "
+                    "must be mappings"
+                )
 
         positive = {
             source: self._DEFAULT_POSITIVE_PROMPTS[source]
@@ -313,15 +347,38 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
         if negative_prompts is not None:
             for source, prompts in negative_prompts.items():
                 negative[str(source)] = (str(prompts),) if isinstance(prompts, str) else tuple(map(str, prompts))
-        unknown_prompt_sources = sorted((set(positive) | set(negative)) - set(self.source_order))
+
+        banks: dict[str, tuple[str, ...]] = {}
+        for source, prompts in configured_banks.items():
+            banks[str(source)] = (str(prompts),) if isinstance(prompts, str) else tuple(map(str, prompts))
+        if prompt_banks is not None:
+            for source, prompts in prompt_banks.items():
+                banks[str(source)] = (str(prompts),) if isinstance(prompts, str) else tuple(map(str, prompts))
+        for source, prompts in banks.items():
+            if not prompts or any(not prompt.strip() for prompt in prompts):
+                raise ValueError(f"prompt_banks[{source!r}] must contain non-empty prompts")
+
+        unknown_prompt_sources = sorted((set(positive) | set(negative) | set(banks)) - set(self.source_order))
         if unknown_prompt_sources:
             raise ValueError(f"Prompt mappings contain sources outside source_order: {unknown_prompt_sources}")
+        if banks:
+            missing_banks = sorted(set(self.source_order) - set(banks))
+            if missing_banks:
+                raise ValueError(f"prompt_banks is missing sources: {missing_banks}")
+        elif prompt_bank_weight > 0.0:
+            raise ValueError("prompt_bank_weight > 0 requires prompt_banks for every source")
 
         self.sample_rate = int(sample_rate)
         self.positive_weight = float(positive_weight)
         self.negative_weight = float(negative_weight)
         self.negative_margin = float(negative_margin)
+        self.audio_match_weight = float(audio_match_weight)
+        self.audio_antibleed_weight = float(audio_antibleed_weight)
+        self.audio_antibleed_margin = float(audio_antibleed_margin)
+        self.prompt_bank_weight = float(prompt_bank_weight)
+        self.prompt_bank_temperature = float(prompt_bank_temperature)
         self.reference_activity_db = float(reference_activity_db)
+        self.amodel = amodel
         self._set_external_model(clap_model)
 
         with torch.no_grad():
@@ -340,13 +397,41 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
                     negative_embeddings.append(F.normalize(F.normalize(embeddings, dim=-1).mean(dim=0), dim=0))
                 else:
                     negative_embeddings.append(positive_embeddings[source_idx])
-        self.register_buffer("positive_text_embeddings", positive_embeddings, persistent=True)
-        self.register_buffer("negative_text_embeddings", torch.stack(negative_embeddings), persistent=True)
-        self.register_buffer("has_negative_prompt", torch.tensor(has_negative, dtype=torch.bool), persistent=True)
+            bank_prompts = [prompt for source in self.source_order for prompt in banks.get(source, ())]
+            bank_source_indices = [
+                source_idx
+                for source_idx, source in enumerate(self.source_order)
+                for _ in banks.get(source, ())
+            ]
+            if bank_prompts:
+                prompt_bank_embeddings = self.clap_model.get_text_embedding(
+                    bank_prompts,
+                    use_tensor=True,
+                ).float()
+                prompt_bank_embeddings = F.normalize(prompt_bank_embeddings, dim=-1)
+            else:
+                prompt_bank_embeddings = positive_embeddings.new_empty((0, positive_embeddings.shape[-1]))
+        self.register_buffer("positive_text_embeddings", positive_embeddings, persistent=False)
+        self.register_buffer("negative_text_embeddings", torch.stack(negative_embeddings), persistent=False)
+        self.register_buffer("has_negative_prompt", torch.tensor(has_negative, dtype=torch.bool), persistent=False)
+        self.register_buffer(
+            "prompt_bank_text_embeddings",
+            prompt_bank_embeddings,
+            persistent=False,
+        )
+        self.register_buffer(
+            "prompt_bank_source_indices",
+            torch.tensor(bank_source_indices, dtype=torch.long),
+            persistent=False,
+        )
 
     @property
     def clap_model(self) -> Any:
         return self.external_model
+
+    @property
+    def has_prompt_banks(self) -> bool:
+        return self.prompt_bank_text_embeddings.shape[0] > 0
 
     def window_bounds(self, n_samples: int) -> tuple[tuple[int, int], ...]:
         window_samples = int(round(self.max_audio_seconds * self.sample_rate))
@@ -367,8 +452,119 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
             window_embeddings.append(F.normalize(embeddings, dim=-1).reshape(batch, n_sources, -1))
         return torch.stack(window_embeddings, dim=2)
 
-    def semantic_window_scores(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _reference_activity_by_window(self, reference_stems: torch.Tensor) -> torch.Tensor:
+        threshold = 10.0 ** (self.reference_activity_db / 10.0)
+        return torch.stack(
+            [
+                reference_stems[..., start:end].float().square().mean(dim=-1) > threshold
+                for start, end in self.window_bounds(reference_stems.shape[-1])
+            ],
+            dim=-1,
+        )
+
+    def _window_durations(self, n_samples: int, *, like: torch.Tensor) -> torch.Tensor:
+        return like.new_tensor([end - start for start, end in self.window_bounds(n_samples)])
+
+    def _duration_masked_mean(
+        self,
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        n_samples: int,
+    ) -> torch.Tensor:
+        if values.shape != mask.shape:
+            raise ValueError(f"values and mask shapes differ: {values.shape} != {mask.shape}")
+        durations = self._window_durations(n_samples, like=values)
+        duration_shape = (1,) * (values.ndim - 1) + (durations.numel(),)
+        weights = mask.to(values.dtype) * durations.reshape(duration_shape)
+        denominator = weights.sum()
+        if not bool(denominator > 0):
+            return values.sum() * 0.0
+        return (values * weights).sum() / denominator
+
+    def _semantic_window_scores_from_embeddings(
+        self,
+        embeddings: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        positive = (embeddings * self.positive_text_embeddings[None, :, None].float()).sum(dim=-1)
+        negative = (embeddings * self.negative_text_embeddings[None, :, None].float()).sum(dim=-1)
+        return positive, negative
+
+    def _prompt_bank_window_scores_from_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        if self.prompt_bank_text_embeddings.shape[0] == 0:
+            raise RuntimeError("CLAP prompt-bank scores require configured prompt_banks")
+        prompt_logits = torch.einsum(
+            "bswe,pe->bswp",
+            embeddings,
+            self.prompt_bank_text_embeddings.float(),
+        ) / self.prompt_bank_temperature
+        bank_scores = []
+        for source_idx in range(len(self.source_order)):
+            source_logits = prompt_logits[..., self.prompt_bank_source_indices == source_idx]
+            bank_scores.append(torch.logsumexp(source_logits, dim=-1) - math.log(source_logits.shape[-1]))
+        return torch.stack(bank_scores, dim=-1)
+
+    def _reference_scores_from_embeddings(
+        self,
+        estimate_embeddings: torch.Tensor,
+        reference_embeddings: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        same_stem_similarity = (estimate_embeddings * reference_embeddings).sum(dim=-1).clamp(-1.0, 1.0)
+        estimate_to_reference = torch.einsum(
+            "biwe,bjwe->bijw",
+            estimate_embeddings,
+            reference_embeddings,
+        ).clamp(-1.0, 1.0)
+        reference_to_reference = torch.einsum(
+            "biwe,bjwe->bijw",
+            reference_embeddings,
+            reference_embeddings,
+        ).clamp(-1.0, 1.0)
+        relative_cross_stem_excess = F.relu(
+            estimate_to_reference - reference_to_reference - self.audio_antibleed_margin
+        )
+        return same_stem_similarity, relative_cross_stem_excess
+
+    def _reference_window_metrics_from_embeddings(
+        self,
+        estimate_embeddings: torch.Tensor,
+        reference_embeddings: torch.Tensor,
+        reference_stems: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        same_stem_similarity, pair_excess = self._reference_scores_from_embeddings(
+            estimate_embeddings,
+            reference_embeddings,
+        )
+        active = self._reference_activity_by_window(reference_stems)
+        source_count = len(self.source_order)
+        off_diagonal = ~torch.eye(source_count, dtype=torch.bool, device=active.device)[None, :, :, None]
+        pair_active = active[:, :, None, :] & active[:, None, :, :] & off_diagonal
+        pair_count = pair_active.sum(dim=2)
+        cross_stem_excess = (pair_excess * pair_active).sum(dim=2) / pair_count.clamp_min(1)
+        return {
+            "same_stem_similarity": same_stem_similarity,
+            "relative_cross_stem_excess": cross_stem_excess,
+            "reference_active": active,
+            "cross_stem_valid": pair_count > 0,
+        }
+
+    def window_metrics(
+        self,
+        audio: torch.Tensor,
+        reference: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Encode estimates once and return all configured CLAP window metrics."""
+
         stems = _as_stem_batch(audio, n_sources=len(self.source_order), name="audio")
+        reference_stems = None
+        if reference is not None:
+            reference_stems = _as_stem_batch(
+                reference,
+                n_sources=len(self.source_order),
+                name="reference",
+            )
+            if stems.shape != reference_stems.shape:
+                raise ValueError(f"CLAP estimate/reference shapes differ: {stems.shape} != {reference_stems.shape}")
         context = (
             torch.autocast(device_type=stems.device.type, enabled=False)
             if stems.device.type in {"cpu", "cuda"}
@@ -376,9 +572,28 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
         )
         with context:
             embeddings = self._audio_embeddings_by_window(stems.float())
-            positive = (embeddings * self.positive_text_embeddings[None, :, None].float()).sum(dim=-1)
-            negative = (embeddings * self.negative_text_embeddings[None, :, None].float()).sum(dim=-1)
-        return positive, negative
+            positive, negative = self._semantic_window_scores_from_embeddings(embeddings)
+            metrics = {
+                "positive_similarity": positive,
+                "negative_similarity": negative,
+            }
+            if self.has_prompt_banks:
+                metrics["prompt_bank_scores"] = self._prompt_bank_window_scores_from_embeddings(embeddings)
+            if reference_stems is not None:
+                with torch.no_grad():
+                    reference_embeddings = self._audio_embeddings_by_window(reference_stems.float())
+                metrics.update(
+                    self._reference_window_metrics_from_embeddings(
+                        embeddings,
+                        reference_embeddings,
+                        reference_stems,
+                    )
+                )
+        return metrics
+
+    def semantic_window_scores(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        metrics = self.window_metrics(audio)
+        return metrics["positive_similarity"], metrics["negative_similarity"]
 
     def semantic_scores(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         positive, negative = self.semantic_window_scores(audio)
@@ -387,6 +602,32 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
         weights = durations / durations.sum()
         return (positive * weights).sum(dim=-1), (negative * weights).sum(dim=-1)
 
+    def prompt_bank_window_scores(self, audio: torch.Tensor) -> torch.Tensor:
+        """Return normalized multi-prompt class logits as ``[B, stem, window, class]``."""
+
+        if not self.has_prompt_banks:
+            raise RuntimeError("CLAP prompt-bank scores require configured prompt_banks")
+        metrics = self.window_metrics(audio)
+        return metrics["prompt_bank_scores"]
+
+    def reference_window_metrics(
+        self,
+        estimate: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return reference-aware CLAP diagnostics without reducing windows."""
+
+        metrics = self.window_metrics(estimate, reference)
+        return {
+            name: metrics[name]
+            for name in (
+                "same_stem_similarity",
+                "relative_cross_stem_excess",
+                "reference_active",
+                "cross_stem_valid",
+            )
+        }
+
     def source_has_negative_prompt(self, source: str) -> bool:
         try:
             source_index = self.source_order.index(str(source))
@@ -394,23 +635,125 @@ class ClapSemanticLoss(_FrozenExternalModelLoss):
             raise ValueError(f"Unknown CLAP source: {source!r}") from exc
         return bool(self.has_negative_prompt[source_index])
 
-    def forward(self, estimate: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    def loss_components(self, estimate: torch.Tensor, reference: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Compute unweighted CLAP objective components using one estimate encoding pass."""
+
         estimate_stems = _as_stem_batch(estimate, n_sources=len(self.source_order), name="estimate")
         reference_stems = _as_stem_batch(reference, n_sources=len(self.source_order), name="reference")
         if estimate_stems.shape != reference_stems.shape:
             raise ValueError(
                 f"CLAP estimate/reference shapes differ: {estimate_stems.shape} != {reference_stems.shape}"
             )
-        active = reference_stems.float().square().mean(dim=-1) > 10.0 ** (self.reference_activity_db / 10.0)
-        if not active.any():
-            return estimate_stems.float().sum() * 0.0
+        zero = estimate_stems.float().sum() * 0.0
+        components = {
+            "text_positive": zero,
+            "text_negative": zero,
+            "audio_match": zero,
+            "audio_antibleed": zero,
+            "prompt_bank": zero,
+        }
+        active = reference_stems.float().square().mean(dim=-1) > 10.0 ** (
+            self.reference_activity_db / 10.0
+        )
+        if not active.any() or not any(
+            weight > 0.0
+            for weight in (
+                self.positive_weight,
+                self.negative_weight,
+                self.audio_match_weight,
+                self.audio_antibleed_weight,
+                self.prompt_bank_weight,
+            )
+        ):
+            return components
 
-        positive_similarity, negative_similarity = self.semantic_scores(estimate_stems)
-        positive_loss = ((1.0 - positive_similarity) * active).sum() / active.sum().clamp_min(1)
-        negative_mask = active & self.has_negative_prompt[None]
-        if negative_mask.any():
-            negative_penalty = F.relu(negative_similarity - self.negative_margin)
-            negative_loss = (negative_penalty * negative_mask).sum() / negative_mask.sum().clamp_min(1)
-        else:
-            negative_loss = estimate_stems.float().sum() * 0.0
-        return self.positive_weight * positive_loss + self.negative_weight * negative_loss
+        context = (
+            torch.autocast(device_type=estimate_stems.device.type, enabled=False)
+            if estimate_stems.device.type in {"cpu", "cuda"}
+            else nullcontext()
+        )
+        with context:
+            estimate_embeddings = self._audio_embeddings_by_window(estimate_stems.float())
+            window_activity = self._reference_activity_by_window(reference_stems)
+            if self.positive_weight > 0.0 or self.negative_weight > 0.0:
+                positive, negative = self._semantic_window_scores_from_embeddings(estimate_embeddings)
+                durations = self._window_durations(estimate_stems.shape[-1], like=positive)
+                duration_weights = durations / durations.sum()
+                positive = (positive * duration_weights).sum(dim=-1)
+                negative = (negative * duration_weights).sum(dim=-1)
+                if self.positive_weight > 0.0:
+                    components["text_positive"] = ((1.0 - positive) * active).sum() / active.sum()
+                negative_mask = active & self.has_negative_prompt[None]
+                if self.negative_weight > 0.0 and negative_mask.any():
+                    penalty = F.relu(negative - self.negative_margin)
+                    components["text_negative"] = (penalty * negative_mask).sum() / negative_mask.sum()
+
+            if self.audio_match_weight > 0.0 or self.audio_antibleed_weight > 0.0:
+                with torch.no_grad():
+                    reference_embeddings = self._audio_embeddings_by_window(reference_stems.float())
+                same_stem_similarity, pair_excess = self._reference_scores_from_embeddings(
+                    estimate_embeddings,
+                    reference_embeddings,
+                )
+                if self.audio_match_weight > 0.0:
+                    components["audio_match"] = self._duration_masked_mean(
+                        1.0 - same_stem_similarity,
+                        window_activity,
+                        n_samples=estimate_stems.shape[-1],
+                    )
+                if self.audio_antibleed_weight > 0.0:
+                    source_count = len(self.source_order)
+                    off_diagonal = ~torch.eye(
+                        source_count,
+                        dtype=torch.bool,
+                        device=window_activity.device,
+                    )[None, :, :, None]
+                    pair_activity = (
+                        window_activity[:, :, None, :]
+                        & window_activity[:, None, :, :]
+                        & off_diagonal
+                    )
+                    components["audio_antibleed"] = self._duration_masked_mean(
+                        pair_excess,
+                        pair_activity,
+                        n_samples=estimate_stems.shape[-1],
+                    )
+
+            if self.prompt_bank_weight > 0.0:
+                bank_scores = self._prompt_bank_window_scores_from_embeddings(estimate_embeddings)
+                targets = torch.arange(
+                    len(self.source_order),
+                    device=bank_scores.device,
+                )[None, :, None].expand(bank_scores.shape[:-1])
+                bank_loss = F.cross_entropy(
+                    bank_scores.reshape(-1, len(self.source_order)),
+                    targets.reshape(-1),
+                    reduction="none",
+                ).reshape(targets.shape)
+                components["prompt_bank"] = self._duration_masked_mean(
+                    bank_loss,
+                    window_activity,
+                    n_samples=estimate_stems.shape[-1],
+                )
+        return components
+
+    def combine_loss_components(self, components: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        return (
+            self.positive_weight * components["text_positive"]
+            + self.negative_weight * components["text_negative"]
+            + self.audio_match_weight * components["audio_match"]
+            + self.audio_antibleed_weight * components["audio_antibleed"]
+            + self.prompt_bank_weight * components["prompt_bank"]
+        )
+
+    def forward_with_components(
+        self,
+        estimate: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        components = self.loss_components(estimate, reference)
+        return self.combine_loss_components(components), components
+
+    def forward(self, estimate: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        total, _ = self.forward_with_components(estimate, reference)
+        return total

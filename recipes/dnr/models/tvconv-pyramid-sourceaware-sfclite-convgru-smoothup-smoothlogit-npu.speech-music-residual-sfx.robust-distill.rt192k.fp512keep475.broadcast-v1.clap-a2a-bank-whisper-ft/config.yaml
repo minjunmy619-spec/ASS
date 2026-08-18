@@ -1,0 +1,33 @@
+_base_: ../tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475.broadcast-v1.clap-whisper-ft/config.yaml
+
+# Scene-independent perceptual fine-tuning. This recipe requires pinned local
+# separator, teacher, and CLAP checkpoints.
+clap_a2a_checkpoint_path: ???
+clap_allow_download: false
+clap_audio_model: HTSAT-base
+clap_prompt_config_path: ${working_directory}/clap_prompts.yaml
+
+task:
+  clap_semantic_loss:
+    prompt_config_path: ${clap_prompt_config_path}
+    checkpoint_path: ${clap_a2a_checkpoint_path}
+
+    # Audio-to-audio alignment is the primary CLAP objective. Relative
+    # anti-bleed only penalizes cross-stem affinity beyond the clean-reference
+    # baseline, so correlated programme stems are not forced apart blindly.
+    audio_match_weight: 0.05
+    audio_antibleed_weight: 0.05
+    audio_antibleed_margin: 0.02
+
+    # Multi-prompt classification is a low-weight semantic boundary. Disable
+    # the older single positive/negative prompt objective in this ablation.
+    positive_weight: 0.0
+    negative_weight: 0.0
+    prompt_bank_weight: 0.02
+    prompt_bank_temperature: 0.07
+
+  # Internal CLAP component weights above are already absolute task weights.
+  clap_semantic_loss_weight: 1.0
+
+  # Keep the existing scene-independent Speech estimate/reference feature loss.
+  whisper_feature_loss_weight: 0.10
