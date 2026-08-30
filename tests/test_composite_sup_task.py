@@ -9,6 +9,7 @@ import torch
 from aiaccel.config import load_config, resolve_inherit
 from aiaccel.torch.lightning import OptimizerConfig
 
+from spectral_feature_compression.core.loss.composite_separation import CompositeSeparationSpectralLoss
 from spectral_feature_compression.core.tasks.composite_sup_task import CompositeSupTask
 
 
@@ -66,6 +67,49 @@ def test_normalized_mixture_consistency_is_scale_invariant() -> None:
     loss.backward()
     assert est.grad is not None
     assert torch.isfinite(est.grad).all()
+
+
+def test_speech_leakage_tf_loss_is_reference_anchored_and_has_targeted_gradients() -> None:
+    samples = 1024
+    timeline = torch.arange(samples, dtype=torch.float32) / samples
+    speech = 0.5 * torch.sin(2.0 * torch.pi * 16.0 * timeline)
+    reference = torch.zeros(1, 3, 1, samples)
+    reference[:, 0, 0] = speech
+    clean_estimate = reference.clone().requires_grad_(True)
+    loss_module = CompositeSeparationSpectralLoss(
+        n_fft=128,
+        hop_length=32,
+        source_order=("speech", "music", "effects"),
+        speech_leakage_weight=1.0,
+        speech_leakage_n_fft=128,
+        speech_leakage_hop_length=32,
+        speech_leakage_speech_active_db=-40.0,
+        speech_leakage_target_relative_db=12.0,
+    )
+
+    clean_loss, clean_components = loss_module(clean_estimate, reference)
+
+    torch.testing.assert_close(clean_loss, torch.zeros_like(clean_loss))
+    torch.testing.assert_close(clean_components["speech_leakage_tf_music"], torch.zeros_like(clean_loss))
+    torch.testing.assert_close(clean_components["speech_leakage_tf_effects"], torch.zeros_like(clean_loss))
+
+    leaked_estimate = reference.clone()
+    leaked_estimate[:, 1, 0] += 0.1 * speech
+    leaked_estimate.requires_grad_(True)
+    leaked_loss, leaked_components = loss_module(leaked_estimate, reference)
+    leaked_loss.backward()
+
+    assert leaked_components["speech_leakage_tf_music"] > 0.0
+    torch.testing.assert_close(leaked_components["speech_leakage_tf_effects"], torch.zeros_like(leaked_loss))
+    assert leaked_loss > clean_loss
+    assert leaked_estimate.grad is not None
+    assert float(leaked_estimate.grad[:, 1].abs().sum()) > 0.0
+    torch.testing.assert_close(
+        leaked_estimate.grad[:, 0],
+        torch.zeros_like(leaked_estimate.grad[:, 0]),
+        rtol=0.0,
+        atol=1.0e-7,
+    )
 
 
 def test_repaired_sfc_teacher_recipe_resolves_and_instantiates() -> None:

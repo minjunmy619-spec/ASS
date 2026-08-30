@@ -1,0 +1,73 @@
+_base_: ../tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475.broadcast-v1.clap-a2a-bank-whisper-ft/config.yaml
+
+# Keep the source taxonomy exactly aligned with the A2A prompt-bank recipe.
+clap_prompt_config_path: ${working_directory}/../tvconv-pyramid-sourceaware-sfclite-convgru-smoothup-smoothlogit-npu.speech-music-residual-sfx.robust-distill.rt192k.fp512keep475.broadcast-v1.clap-a2a-bank-whisper-ft/clap_prompts.yaml
+
+datamodule:
+  synthesis:
+    # These profiles extend, rather than replace, the established broadcast-v1
+    # distribution. Both targets remain present so the loss sees weak, not
+    # merely absent, background stems during Speech activity.
+    additional_synthesis_profiles:
+      - name: speech_dominant_overlap
+        weight: 0.25
+        active_stem_count: {mode: fixed, value: 3}
+        stem_sampling_weights: {speech: 1.0, music: 1.0, effects: 1.0}
+        clips_per_active_stem:
+          speech: [1, 2]
+          music: [1, 1]
+          effects: [1, 3]
+        stem_snr_db:
+          enabled: true
+          anchor: speech
+          range:
+            music: [12.0, 24.0]
+            effects: [12.0, 24.0]
+      - name: speech_extreme_low_background
+        weight: 0.10
+        active_stem_count: {mode: fixed, value: 3}
+        stem_sampling_weights: {speech: 1.0, music: 1.0, effects: 1.0}
+        clips_per_active_stem:
+          speech: [1, 2]
+          music: [1, 1]
+          effects: [1, 2]
+        stem_snr_db:
+          enabled: true
+          anchor: speech
+          range:
+            music: [24.0, 36.0]
+            effects: [24.0, 36.0]
+
+task:
+  # This term runs every train step and is independent of frozen-teacher
+  # cadence. It penalizes excess Music/Effects energy only in GT Speech-active,
+  # target-quiet time-frequency regions.
+  speech_leakage_weight: 0.04
+  speech_leakage_source: speech
+  speech_leakage_target_sources: [music, effects]
+  speech_leakage_n_fft: 1024
+  speech_leakage_hop_length: 256
+  speech_leakage_speech_active_db: -45.0
+  speech_leakage_target_relative_db: 12.0
+  speech_leakage_mask_softness_db: 3.0
+  speech_leakage_tolerance_ratio: 0.0
+
+  # One frozen Whisper encoder supplies both normal Speech fidelity matching
+  # and GT-anchored, frame-wise cross-stem leakage supervision.
+  whisper_feature_loss:
+    _target_: spectral_feature_compression.core.loss.frozen_audio_perceptual.WhisperStemPerceptualLoss
+    sample_rate: ${datamodule.sr}
+    source_order: ${datamodule.source_order}
+    model_name: ${whisper_model_name}
+    download_root: ${whisper_download_root}
+    selected_layer_policy: middle
+    reference_activity_db: -60.0
+    speech_source: speech
+    bleed_target_sources: [music, effects]
+    speech_feature_match_weight: 0.10
+    cross_stem_bleed_weight: 0.02
+    speech_active_db: -45.0
+    target_quiet_relative_db: 12.0
+    mask_softness_db: 3.0
+    relative_bleed_margin: 0.02
+  whisper_feature_loss_weight: 1.0

@@ -20,7 +20,8 @@ import torchaudio.functional as AF
 
 import soundfile as sf
 
-from spectral_feature_compression.core.loss.frozen_audio_perceptual import ClapSemanticLoss
+from spectral_feature_compression.core.loss.composite_separation import CompositeSeparationSpectralLoss
+from spectral_feature_compression.core.loss.frozen_audio_perceptual import ClapSemanticLoss, WhisperStemPerceptualLoss
 
 _DEFAULT_CLAP_PROMPT_CONFIG = (
     Path(__file__).resolve().parents[1]
@@ -118,6 +119,8 @@ def evaluate_manifest(
     clap_scorer: Any,
     whisper_transcriber: Callable[[Path], Mapping[str, Any]] | None = None,
     whisper_stems: Sequence[str] = ("speech",),
+    speech_leakage_scorer: Any | None = None,
+    whisper_leakage_scorer: Any | None = None,
     source_order: Sequence[str] = ("speech", "music", "effects"),
     sample_rate: int = 44100,
     device: str | torch.device = "cpu",
@@ -149,6 +152,8 @@ def evaluate_manifest(
     has_references = bool(present_reference_fields)
     if has_references and not hasattr(clap_scorer, "reference_window_metrics"):
         raise ValueError("Reference stem columns require a CLAP scorer with reference_window_metrics()")
+    if not has_references and (speech_leakage_scorer is not None or whisper_leakage_scorer is not None):
+        raise ValueError("Speech leakage metrics require all reference stem columns")
     if not rows:
         raise ValueError(f"Manifest contains no rows: {manifest_path}")
 
@@ -167,6 +172,8 @@ def evaluate_manifest(
         source: {"avg_logprob": [], "no_speech_probability": [], "transcript_characters": []}
         for source in whisper_stems
     }
+    speech_leakage_values: dict[str, list[float]] = {}
+    whisper_leakage_values: dict[str, list[float]] = {}
     target_device = torch.device(device)
     for row_idx, row in enumerate(rows, start=2):
         paths = {}
@@ -235,6 +242,24 @@ def evaluate_manifest(
                     if reference_stems is not None
                     else None
                 )
+            if speech_leakage_scorer is not None:
+                if reference_stems is None:
+                    raise RuntimeError("Reference stems unexpectedly missing for speech leakage metrics")
+                raw_components = speech_leakage_scorer.speech_leakage_components(stems, reference_stems)
+                speech_leakage_row = {name: float(value) for name, value in raw_components.items()}
+                for name, value in speech_leakage_row.items():
+                    speech_leakage_values.setdefault(name, []).append(value)
+            else:
+                speech_leakage_row = {}
+            if whisper_leakage_scorer is not None:
+                if reference_stems is None:
+                    raise RuntimeError("Reference stems unexpectedly missing for Whisper leakage metrics")
+                _, raw_components = whisper_leakage_scorer.forward_with_components(stems, reference_stems)
+                whisper_leakage_row = {name: float(value) for name, value in raw_components.items()}
+                for name, value in whisper_leakage_row.items():
+                    whisper_leakage_values.setdefault(name, []).append(value)
+            else:
+                whisper_leakage_row = {}
         positive = positive[0].detach().cpu()
         negative = negative[0].detach().cpu()
         if bank_scores is not None:
@@ -364,6 +389,8 @@ def evaluate_manifest(
                 "recording_id": str(row.get("recording_id", row.get("mixture_id", row_idx - 2))),
                 "clap": clap_row,
                 "whisper": whisper_row,
+                "speech_leakage": speech_leakage_row,
+                "whisper_relative_bleed": whisper_leakage_row,
             }
         )
 
@@ -377,6 +404,14 @@ def evaluate_manifest(
         summary["whisper"] = {
             source: {metric: _summary(values) for metric, values in metrics.items()}
             for source, metrics in whisper_values.items()
+        }
+    if speech_leakage_scorer is not None:
+        summary["speech_leakage"] = {
+            name: _summary(values) for name, values in speech_leakage_values.items()
+        }
+    if whisper_leakage_scorer is not None:
+        summary["whisper_relative_bleed"] = {
+            name: _summary(values) for name, values in whisper_leakage_values.items()
         }
     return {
         "manifest": str(manifest_path),
@@ -411,11 +446,25 @@ def _parse_args(argv: Sequence[str] | None = None) -> Any:
     parser.add_argument("--clap-audio-antibleed-margin", type=float, default=0.02)
     parser.add_argument("--clap-prompt-config", type=Path, default=_DEFAULT_CLAP_PROMPT_CONFIG)
     parser.add_argument("--allow-clap-download", action="store_true")
+    parser.add_argument("--enable-speech-leakage-metrics", action="store_true")
+    parser.add_argument("--speech-leakage-source", default="speech")
+    parser.add_argument("--speech-leakage-target-sources", default="music,effects")
+    parser.add_argument("--speech-leakage-n-fft", type=int, default=1024)
+    parser.add_argument("--speech-leakage-hop-length", type=int, default=256)
+    parser.add_argument("--speech-leakage-speech-active-db", type=float, default=-45.0)
+    parser.add_argument("--speech-leakage-target-relative-db", type=float, default=12.0)
+    parser.add_argument("--speech-leakage-mask-softness-db", type=float, default=3.0)
+    parser.add_argument("--speech-leakage-tolerance-ratio", type=float, default=0.0)
     parser.add_argument("--whisper-model", default="base")
     parser.add_argument("--whisper-download-root", type=Path)
     parser.add_argument("--whisper-stems", default="speech,music,effects")
     parser.add_argument("--whisper-language")
     parser.add_argument("--disable-whisper", action="store_true")
+    parser.add_argument("--enable-whisper-relative-bleed", action="store_true")
+    parser.add_argument("--whisper-relative-bleed-margin", type=float, default=0.0)
+    parser.add_argument("--whisper-relative-bleed-speech-active-db", type=float, default=-45.0)
+    parser.add_argument("--whisper-relative-bleed-target-relative-db", type=float, default=12.0)
+    parser.add_argument("--whisper-relative-bleed-mask-softness-db", type=float, default=3.0)
     parser.add_argument("--output-json", type=Path)
     return parser.parse_args(argv)
 
@@ -435,9 +484,28 @@ def main() -> None:
         audio_antibleed_margin=args.clap_audio_antibleed_margin,
         allow_download=args.allow_clap_download,
     ).to(device)
+    speech_leakage_scorer = None
+    if args.enable_speech_leakage_metrics:
+        speech_leakage_scorer = CompositeSeparationSpectralLoss(
+            n_fft=args.speech_leakage_n_fft,
+            hop_length=args.speech_leakage_hop_length,
+            source_order=source_order,
+            speech_leakage_weight=1.0,
+            speech_leakage_source=args.speech_leakage_source,
+            speech_leakage_target_sources=_parse_sources(args.speech_leakage_target_sources),
+            speech_leakage_n_fft=args.speech_leakage_n_fft,
+            speech_leakage_hop_length=args.speech_leakage_hop_length,
+            speech_leakage_speech_active_db=args.speech_leakage_speech_active_db,
+            speech_leakage_target_relative_db=args.speech_leakage_target_relative_db,
+            speech_leakage_mask_softness_db=args.speech_leakage_mask_softness_db,
+            speech_leakage_tolerance_ratio=args.speech_leakage_tolerance_ratio,
+        ).to(device)
 
     transcriber = None
+    whisper_leakage_scorer = None
     whisper_stems: tuple[str, ...] = ()
+    if args.enable_whisper_relative_bleed and args.disable_whisper:
+        raise ValueError("--enable-whisper-relative-bleed requires Whisper; omit --disable-whisper")
     if not args.disable_whisper:
         try:
             import whisper
@@ -454,6 +522,20 @@ def main() -> None:
         )
         whisper_model.eval()
         whisper_stems = _parse_sources(args.whisper_stems)
+        if args.enable_whisper_relative_bleed:
+            whisper_leakage_scorer = WhisperStemPerceptualLoss(
+                sample_rate=args.sample_rate,
+                source_order=source_order,
+                speech_feature_match_weight=0.0,
+                cross_stem_bleed_weight=1.0,
+                speech_active_db=args.whisper_relative_bleed_speech_active_db,
+                target_quiet_relative_db=args.whisper_relative_bleed_target_relative_db,
+                mask_softness_db=args.whisper_relative_bleed_mask_softness_db,
+                relative_bleed_margin=args.whisper_relative_bleed_margin,
+                selected_layer_policy="middle",
+                whisper_model=whisper_model,
+                mel_filters=whisper.audio.mel_filters("cpu", int(whisper_model.dims.n_mels)),
+            ).to(device)
 
         def transcriber(path: Path) -> Mapping[str, Any]:
             audio_16k = _load_mono(path, sample_rate=16000)
@@ -492,6 +574,8 @@ def main() -> None:
         clap_scorer=clap_scorer,
         whisper_transcriber=transcriber,
         whisper_stems=whisper_stems,
+        speech_leakage_scorer=speech_leakage_scorer,
+        whisper_leakage_scorer=whisper_leakage_scorer,
         source_order=source_order,
         sample_rate=args.sample_rate,
         device=device,

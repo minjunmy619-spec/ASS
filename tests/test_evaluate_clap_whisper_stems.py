@@ -65,6 +65,20 @@ class _ReferenceAwareFakeClapScorer(_FakeClapScorer):
         }
 
 
+class _FakeSpeechLeakageScorer:
+    def speech_leakage_components(
+        self,
+        estimate: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        assert estimate.shape == reference.shape
+        return {
+            "speech_leakage_tf": estimate.new_tensor(0.25),
+            "speech_leakage_tf_music": estimate.new_tensor(0.5),
+            "speech_leakage_tf_effects": estimate.new_tensor(0.0),
+        }
+
+
 def test_evaluate_manifest_scores_real_rendered_stem_paths(tmp_path: Path) -> None:
     paths = {}
     for stem, value in zip(("speech", "music", "effects"), (0.2, 0.1, 0.05), strict=True):
@@ -226,6 +240,34 @@ def test_evaluate_manifest_reports_prompt_bank_and_reference_audio_metrics(tmp_p
     json.dumps(report, allow_nan=False)
 
 
+def test_evaluate_manifest_reports_reference_gated_speech_leakage_metrics(tmp_path: Path) -> None:
+    row = {}
+    fieldnames = []
+    for prefix in ("", "reference_"):
+        for stem, value in zip(("speech", "music", "effects"), (0.2, 0.1, 0.0), strict=True):
+            path = tmp_path / f"{prefix}{stem}.wav"
+            sf.write(path, np.full(800, value, dtype=np.float32), 8000, subtype="FLOAT")
+            field = f"{prefix}{stem}_filepath"
+            fieldnames.append(field)
+            row[field] = path
+    manifest = tmp_path / "paired_leakage.csv"
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(row)
+
+    report = evaluate_manifest(
+        manifest,
+        clap_scorer=_ReferenceAwareFakeClapScorer(),
+        speech_leakage_scorer=_FakeSpeechLeakageScorer(),
+        sample_rate=8000,
+    )
+
+    assert report["rows"][0]["speech_leakage"]["speech_leakage_tf_music"] == pytest.approx(0.5)
+    assert report["summary"]["speech_leakage"]["speech_leakage_tf"]["mean"] == pytest.approx(0.25)
+    json.dumps(report, allow_nan=False)
+
+
 def test_evaluate_manifest_rejects_partial_reference_columns(tmp_path: Path) -> None:
     manifest = tmp_path / "partial_reference.csv"
     fieldnames = [
@@ -241,3 +283,24 @@ def test_evaluate_manifest_rejects_partial_reference_columns(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="partial reference stems"):
         evaluate_manifest(manifest, clap_scorer=_ReferenceAwareFakeClapScorer(), sample_rate=8000)
+
+
+def test_evaluate_manifest_rejects_speech_leakage_metrics_without_references(tmp_path: Path) -> None:
+    paths = {}
+    for stem in ("speech", "music", "effects"):
+        path = tmp_path / f"{stem}.wav"
+        sf.write(path, np.zeros(800, dtype=np.float32), 8000, subtype="FLOAT")
+        paths[stem] = path
+    manifest = tmp_path / "unpaired.csv"
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[f"{stem}_filepath" for stem in paths])
+        writer.writeheader()
+        writer.writerow({f"{stem}_filepath": path for stem, path in paths.items()})
+
+    with pytest.raises(ValueError, match="require all reference"):
+        evaluate_manifest(
+            manifest,
+            clap_scorer=_FakeClapScorer(),
+            speech_leakage_scorer=_FakeSpeechLeakageScorer(),
+            sample_rate=8000,
+        )

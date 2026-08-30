@@ -157,6 +157,7 @@ class OnTheFlyStemDataset(Dataset):
         stem_snr_db: Mapping[str, Any] | None = None,
         relative_snr_measurement: Mapping[str, Any] | None = None,
         synthesis_profiles: Sequence[Mapping[str, Any]] | None = None,
+        additional_synthesis_profiles: Sequence[Mapping[str, Any]] | None = None,
         broadcast: Mapping[str, Any] | None = None,
         normalize_sources: bool = False,
         source_normalization: Mapping[str, Any] | None = None,
@@ -272,7 +273,8 @@ class OnTheFlyStemDataset(Dataset):
         self.placement = self._parse_placement(same_stem_placement)
         self.stem_gain_db = dict(stem_gain_db or {})
         self.stem_snr_db = dict(stem_snr_db or {})
-        self.synthesis_profiles = self._parse_synthesis_profiles(synthesis_profiles)
+        all_synthesis_profiles = tuple(synthesis_profiles or ()) + tuple(additional_synthesis_profiles or ())
+        self.synthesis_profiles = self._parse_synthesis_profiles(all_synthesis_profiles)
         self._validate_source_normalization_config()
         self.backend = str(backend)
         self.broadcast_renderer = (

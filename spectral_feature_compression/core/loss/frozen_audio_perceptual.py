@@ -86,6 +86,7 @@ class WhisperFeatureMatchingLoss(_FrozenExternalModelLoss):
         sample_rate: int,
         model_name: str = "base",
         selected_layers: Sequence[int] | None = None,
+        selected_layer_policy: str = "quartiles",
         reference_activity_db: float = -60.0,
         download_root: str | Path | None = None,
         whisper_model: nn.Module | None = None,
@@ -125,8 +126,16 @@ class WhisperFeatureMatchingLoss(_FrozenExternalModelLoss):
         n_blocks = len(whisper_model.encoder.blocks)
         if n_blocks <= 0:
             raise ValueError("Whisper encoder must contain at least one block")
+        selected_layer_policy = str(selected_layer_policy).lower()
+        if selected_layer_policy not in {"quartiles", "middle"}:
+            raise ValueError("selected_layer_policy must be 'quartiles' or 'middle'")
         if selected_layers is None:
-            selected_layers = (n_blocks // 4, n_blocks // 2, (3 * n_blocks) // 4, n_blocks - 1)
+            if selected_layer_policy == "quartiles":
+                selected_layers = (n_blocks // 4, n_blocks // 2, (3 * n_blocks) // 4, n_blocks - 1)
+            else:
+                count = min(3, n_blocks)
+                start = (n_blocks - count) // 2
+                selected_layers = tuple(range(start, start + count))
         parsed_layers = tuple(sorted(set(int(layer) for layer in selected_layers)))
         if not parsed_layers or parsed_layers[0] < 0 or parsed_layers[-1] >= n_blocks:
             raise ValueError(f"selected_layers must be within [0, {n_blocks - 1}], got {parsed_layers}")
@@ -134,6 +143,7 @@ class WhisperFeatureMatchingLoss(_FrozenExternalModelLoss):
         self.sample_rate = int(sample_rate)
         self.reference_activity_db = float(reference_activity_db)
         self.selected_layers = parsed_layers
+        self.selected_layer_policy = selected_layer_policy
         self.register_buffer("mel_filters", mel_filters, persistent=True)
         self.register_buffer("stft_window", torch.hann_window(400), persistent=False)
         self._set_external_model(whisper_model)
@@ -207,6 +217,182 @@ class WhisperFeatureMatchingLoss(_FrozenExternalModelLoss):
                 for estimate_feature, target_feature in zip(estimate_features, target_features, strict=True)
             ]
         return torch.stack(losses).mean()
+
+
+class WhisperStemPerceptualLoss(WhisperFeatureMatchingLoss):
+    """Frozen Whisper supervision for Speech fidelity and relative cross-stem bleed.
+
+    Unlike a zero-target penalty, cross-stem similarity is compared with the
+    clean target/reference similarity. This preserves legitimate singing in
+    Music and voice-like Effects that occur in the labelled target stem.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_order: Sequence[str] = ("speech", "music", "effects"),
+        speech_source: str = "speech",
+        bleed_target_sources: Sequence[str] | None = None,
+        speech_feature_match_weight: float = 1.0,
+        cross_stem_bleed_weight: float = 0.0,
+        speech_active_db: float = -45.0,
+        target_quiet_relative_db: float = 12.0,
+        mask_softness_db: float = 3.0,
+        relative_bleed_margin: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        source_order = tuple(str(source) for source in source_order)
+        if not source_order or len(set(source_order)) != len(source_order):
+            raise ValueError(f"source_order must contain unique source names, got {source_order}")
+        speech_source = str(speech_source)
+        if speech_source not in source_order:
+            raise ValueError(f"speech_source={speech_source!r} is not in source_order={source_order}")
+        targets = (
+            tuple(source for source in source_order if source != speech_source)
+            if bleed_target_sources is None
+            else tuple(str(source) for source in bleed_target_sources)
+        )
+        if not targets:
+            raise ValueError("bleed_target_sources must contain at least one non-speech source")
+        unknown = sorted(set(targets) - set(source_order))
+        if unknown:
+            raise ValueError(f"bleed_target_sources contains unknown sources: {unknown}")
+        if speech_source in targets:
+            raise ValueError("bleed_target_sources must not contain speech_source")
+        for name, value in {
+            "speech_feature_match_weight": speech_feature_match_weight,
+            "cross_stem_bleed_weight": cross_stem_bleed_weight,
+            "speech_active_db": speech_active_db,
+            "target_quiet_relative_db": target_quiet_relative_db,
+            "mask_softness_db": mask_softness_db,
+            "relative_bleed_margin": relative_bleed_margin,
+        }.items():
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite, got {value}")
+        if speech_feature_match_weight < 0.0 or cross_stem_bleed_weight < 0.0:
+            raise ValueError("Whisper stem perceptual weights must be non-negative")
+        if mask_softness_db <= 0.0:
+            raise ValueError("mask_softness_db must be positive")
+
+        super().__init__(**kwargs)
+        self.source_order = source_order
+        self.speech_source = speech_source
+        self.speech_source_index = source_order.index(speech_source)
+        self.bleed_target_sources = targets
+        self.bleed_target_indices = tuple(source_order.index(source) for source in targets)
+        self.speech_feature_match_weight = float(speech_feature_match_weight)
+        self.cross_stem_bleed_weight = float(cross_stem_bleed_weight)
+        self.speech_active_db = float(speech_active_db)
+        self.target_quiet_relative_db = float(target_quiet_relative_db)
+        self.mask_softness_db = float(mask_softness_db)
+        self.relative_bleed_margin = float(relative_bleed_margin)
+
+    def _stem_features(self, stems: torch.Tensor, *, require_grad: bool) -> tuple[torch.Tensor, ...]:
+        batch, source_count, samples = stems.shape
+        flattened = stems.reshape(batch * source_count, samples)
+        context = nullcontext() if require_grad else torch.no_grad()
+        with context:
+            features = self._encoder_features(self._log_mel(flattened))
+        return tuple(
+            feature.reshape(batch, source_count, feature.shape[1], feature.shape[2]) for feature in features
+        )
+
+    @staticmethod
+    def _frame_power(stems: torch.Tensor, n_frames: int) -> torch.Tensor:
+        return F.adaptive_avg_pool1d(stems.float().square(), n_frames)
+
+    def loss_components(self, estimate: torch.Tensor, reference: torch.Tensor) -> dict[str, torch.Tensor]:
+        estimate_stems = _as_stem_batch(estimate, n_sources=len(self.source_order), name="estimate")
+        reference_stems = _as_stem_batch(reference, n_sources=len(self.source_order), name="reference")
+        if estimate_stems.shape != reference_stems.shape:
+            raise ValueError(
+                f"Whisper estimate/reference shapes differ: {estimate_stems.shape} != {reference_stems.shape}"
+            )
+        zero = estimate_stems.float().sum() * 0.0
+        components = {
+            "speech_feature_match": zero,
+            "cross_stem_bleed": zero,
+            **{f"cross_stem_bleed_{source}": zero for source in self.bleed_target_sources},
+        }
+        if self.speech_feature_match_weight == 0.0 and self.cross_stem_bleed_weight == 0.0:
+            return components
+
+        with self._autocast_disabled(estimate_stems):
+            estimate_features = self._stem_features(estimate_stems.float(), require_grad=True)
+            reference_features = self._stem_features(reference_stems.float(), require_grad=False)
+            speech_reference = reference_stems[:, self.speech_source_index]
+            speech_active_samples = speech_reference.float().square().mean(dim=-1)
+            batch_active = speech_active_samples > 10.0 ** (self.reference_activity_db / 10.0)
+            if self.speech_feature_match_weight > 0.0 and batch_active.any():
+                feature_losses = [
+                    F.l1_loss(
+                        estimate_feature[batch_active, self.speech_source_index].float(),
+                        reference_feature[batch_active, self.speech_source_index].float(),
+                    )
+                    for estimate_feature, reference_feature in zip(
+                        estimate_features,
+                        reference_features,
+                        strict=True,
+                    )
+                ]
+                components["speech_feature_match"] = torch.stack(feature_losses).mean()
+
+            if self.cross_stem_bleed_weight > 0.0:
+                target_losses: dict[str, list[torch.Tensor]] = {
+                    source: [] for source in self.bleed_target_sources
+                }
+                for estimate_feature, reference_feature in zip(estimate_features, reference_features, strict=True):
+                    n_frames = estimate_feature.shape[2]
+                    frame_power = self._frame_power(reference_stems, n_frames)
+                    speech_power = frame_power[:, self.speech_source_index]
+                    speech_db = 10.0 * torch.log10(speech_power.clamp_min(1.0e-10))
+                    speech_active = torch.sigmoid((speech_db - self.speech_active_db) / self.mask_softness_db)
+                    speech_reference_feature = F.normalize(
+                        reference_feature[:, self.speech_source_index].float(), dim=-1
+                    )
+                    for source, target_index in zip(
+                        self.bleed_target_sources,
+                        self.bleed_target_indices,
+                        strict=True,
+                    ):
+                        target_power = frame_power[:, target_index]
+                        target_db = 10.0 * torch.log10(target_power.clamp_min(1.0e-10))
+                        target_quiet = torch.sigmoid(
+                            (speech_db - target_db - self.target_quiet_relative_db) / self.mask_softness_db
+                        )
+                        mask = speech_active * target_quiet
+                        estimate_target = F.normalize(estimate_feature[:, target_index].float(), dim=-1)
+                        reference_target = F.normalize(reference_feature[:, target_index].float(), dim=-1)
+                        estimate_similarity = (estimate_target * speech_reference_feature).sum(dim=-1)
+                        reference_similarity = (reference_target * speech_reference_feature).sum(dim=-1)
+                        excess = F.relu(estimate_similarity - reference_similarity - self.relative_bleed_margin)
+                        denominator = mask.sum()
+                        value = zero if not bool(denominator > 0) else (mask * excess).sum() / denominator
+                        target_losses[source].append(value)
+                for source, losses in target_losses.items():
+                    components[f"cross_stem_bleed_{source}"] = torch.stack(losses).mean()
+                components["cross_stem_bleed"] = torch.stack(
+                    [components[f"cross_stem_bleed_{source}"] for source in self.bleed_target_sources]
+                ).mean()
+        return components
+
+    def combine_loss_components(self, components: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        return (
+            self.speech_feature_match_weight * components["speech_feature_match"]
+            + self.cross_stem_bleed_weight * components["cross_stem_bleed"]
+        )
+
+    def forward_with_components(
+        self,
+        estimate: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        components = self.loss_components(estimate, reference)
+        return self.combine_loss_components(components), components
+
+    def forward(self, estimate: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        total, _ = self.forward_with_components(estimate, reference)
+        return total
 
 
 class ClapSemanticLoss(_FrozenExternalModelLoss):

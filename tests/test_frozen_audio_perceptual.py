@@ -11,6 +11,7 @@ import pytest
 from spectral_feature_compression.core.loss.frozen_audio_perceptual import (
     ClapSemanticLoss,
     WhisperFeatureMatchingLoss,
+    WhisperStemPerceptualLoss,
 )
 
 
@@ -123,6 +124,55 @@ def test_whisper_feature_matching_ignores_reference_silent_examples() -> None:
 
     torch.testing.assert_close(loss, torch.zeros_like(loss))
     torch.testing.assert_close(estimate.grad, torch.zeros_like(estimate))
+
+
+def test_whisper_stem_perceptual_loss_is_reference_anchored_and_penalizes_speech_leakage() -> None:
+    samples = 1600
+    timeline = torch.arange(samples, dtype=torch.float32) / 16000.0
+    speech = 0.5 * torch.sin(2.0 * torch.pi * 220.0 * timeline)
+    reference = torch.zeros(1, 3, 1, samples)
+    reference[:, 0, 0] = speech
+    loss_module = WhisperStemPerceptualLoss(
+        sample_rate=16000,
+        source_order=("speech", "music", "effects"),
+        speech_feature_match_weight=0.5,
+        cross_stem_bleed_weight=1.0,
+        selected_layers=(0, 1),
+        reference_activity_db=-80.0,
+        speech_active_db=-45.0,
+        target_quiet_relative_db=12.0,
+        whisper_model=_DummyWhisper(),
+        mel_filters=torch.rand(4, 201),
+    )
+    clean_estimate = reference.clone().requires_grad_(True)
+
+    clean_total, clean_components = loss_module.forward_with_components(clean_estimate, reference)
+
+    torch.testing.assert_close(clean_total, torch.zeros_like(clean_total), atol=1.0e-6, rtol=0.0)
+    torch.testing.assert_close(
+        clean_components["cross_stem_bleed"],
+        torch.zeros_like(clean_total),
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+
+    leaked_estimate = reference.clone()
+    leaked_estimate[:, 1, 0] += 0.15 * speech
+    leaked_estimate.requires_grad_(True)
+    leaked_total, leaked_components = loss_module.forward_with_components(leaked_estimate, reference)
+    leaked_total.backward()
+
+    assert leaked_components["cross_stem_bleed_music"] > 0.0
+    torch.testing.assert_close(
+        leaked_components["cross_stem_bleed_effects"],
+        torch.zeros_like(leaked_total),
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+    assert leaked_total > clean_total
+    assert leaked_estimate.grad is not None
+    assert float(leaked_estimate.grad[:, 1].abs().sum()) > 0.0
+    assert all(parameter.grad is None for parameter in loss_module.whisper_model.parameters())
 
 
 def test_clap_semantic_loss_is_frozen_and_returns_per_stem_scores() -> None:

@@ -227,6 +227,15 @@ class TeacherStudentDistillationTask(SupTask):
         multi_resolution_stft_weight: float = 0.0,
         multi_resolution_stft_resolutions: Sequence[Sequence[int]] | None = None,
         transient_weight: float = 0.0,
+        speech_leakage_weight: float = 0.0,
+        speech_leakage_source: str = "speech",
+        speech_leakage_target_sources: Sequence[str] | None = None,
+        speech_leakage_n_fft: int | None = None,
+        speech_leakage_hop_length: int | None = None,
+        speech_leakage_speech_active_db: float = -45.0,
+        speech_leakage_target_relative_db: float = 12.0,
+        speech_leakage_mask_softness_db: float = 3.0,
+        speech_leakage_tolerance_ratio: float = 0.0,
         teacher_mask_loss_weight: float = 0.0,
         teacher_logit_loss_weight: float = 0.0,
         request_model_aux: bool = False,
@@ -284,6 +293,7 @@ class TeacherStudentDistillationTask(SupTask):
             "log_magnitude_weight": log_magnitude_weight,
             "multi_resolution_stft_weight": multi_resolution_stft_weight,
             "transient_weight": transient_weight,
+            "speech_leakage_weight": speech_leakage_weight,
             "teacher_mask_loss_weight": teacher_mask_loss_weight,
             "teacher_logit_loss_weight": teacher_logit_loss_weight,
             "latent_distillation_weight": latent_distillation_weight,
@@ -423,6 +433,16 @@ class TeacherStudentDistillationTask(SupTask):
             multi_resolution_stft_weight=multi_resolution_stft_weight,
             multi_resolution_stft_resolutions=multi_resolution_stft_resolutions,
             transient_weight=transient_weight,
+            source_order=self.source_order,
+            speech_leakage_weight=speech_leakage_weight,
+            speech_leakage_source=speech_leakage_source,
+            speech_leakage_target_sources=speech_leakage_target_sources,
+            speech_leakage_n_fft=speech_leakage_n_fft,
+            speech_leakage_hop_length=speech_leakage_hop_length,
+            speech_leakage_speech_active_db=speech_leakage_speech_active_db,
+            speech_leakage_target_relative_db=speech_leakage_target_relative_db,
+            speech_leakage_mask_softness_db=speech_leakage_mask_softness_db,
+            speech_leakage_tolerance_ratio=speech_leakage_tolerance_ratio,
         )
 
         if self.teacher_model is not None:
@@ -732,11 +752,24 @@ class TeacherStudentDistillationTask(SupTask):
         if self.whisper_feature_loss_weight > 0.0:
             if self.whisper_feature_loss is None:
                 raise RuntimeError("whisper_feature_loss is unexpectedly missing")
-            source_index = self.whisper_source_index
-            losses["whisper_feature"] = self.whisper_feature_loss(
-                est[:, source_index],
-                ref[:, source_index],
-            )
+            forward_with_components = getattr(self.whisper_feature_loss, "forward_with_components", None)
+            if callable(forward_with_components):
+                whisper_total, whisper_components = forward_with_components(est, ref)
+                if not isinstance(whisper_total, torch.Tensor) or whisper_total.ndim != 0:
+                    raise TypeError("Whisper forward_with_components() must return a scalar tensor total")
+                if not isinstance(whisper_components, Mapping):
+                    raise TypeError("Whisper forward_with_components() must return a component mapping")
+                losses["whisper_feature"] = whisper_total
+                for name, value in whisper_components.items():
+                    if not isinstance(value, torch.Tensor) or value.ndim != 0:
+                        raise TypeError(f"Whisper component {name!r} must be a scalar tensor")
+                    losses[f"whisper_feature_{name}"] = value
+            else:
+                source_index = self.whisper_source_index
+                losses["whisper_feature"] = self.whisper_feature_loss(
+                    est[:, source_index],
+                    ref[:, source_index],
+                )
         return losses
 
     def _source_activity_l1(self, est: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -1351,7 +1384,7 @@ class TeacherStudentDistillationTask(SupTask):
         if perceptual_losses:
             log_dict[f"{log_prefix}/perceptual_cadence_scale"] = loss.new_tensor(perceptual_scale)
         for name, component_loss in perceptual_losses.items():
-            if name.startswith("clap_semantic_"):
+            if name.startswith(("clap_semantic_", "whisper_feature_")):
                 log_dict[f"{log_prefix}/loss_{name}"] = component_loss
 
         if self.source_activity_loss_weight > 0.0:
