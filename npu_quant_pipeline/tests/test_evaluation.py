@@ -196,6 +196,26 @@ class EvaluationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bss_metrics(left, right)
 
+    def test_bss_conversion_failure_is_not_reported_as_missing_dependency(self):
+        x = torch.ones(2, 8)
+        separation = types.ModuleType("mir_eval.separation")
+        separation.bss_eval_sources = lambda *a, **k: self.fail("backend must not run")
+
+        def broken_numpy(tensor):
+            raise RuntimeError("Numpy is not available")
+
+        with patch.dict(sys.modules, {"mir_eval.separation": separation}), \
+                patch.object(torch.Tensor, "numpy", broken_numpy):
+            with self.assertRaises(RuntimeError) as caught:
+                bss_metrics(x, x)
+        self.assertNotIsInstance(caught.exception, ImportError)
+        self.assertIn("Numpy is not available", str(caught.exception))
+
+    def test_non_module_inputs_rejected(self):
+        for reference, candidate in ((nn.Identity(), object()), (object(), nn.Identity())):
+            with self.assertRaises(TypeError):
+                compare_models(reference, candidate, [(torch.ones(2),)])
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
     def test_automatic_device_movement(self):
         reference = nn.Linear(2, 2)

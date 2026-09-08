@@ -7,7 +7,8 @@ import unittest
 import torch
 from torch import nn
 
-from npu_quant.reconstruction import _capture, adaround, bias_correct
+from npu_quant import reconstruction
+from npu_quant.reconstruction import _capture, _samples, adaround, bias_correct
 
 
 class TwoInputs(nn.Module):
@@ -352,6 +353,117 @@ class ReconstructionTests(unittest.TestCase):
             candidate.bias.fill_(-1e200)
         with self.assertRaisesRegex(ValueError, "nonfinite"):
             bias_correct(reference, candidate, [(torch.zeros(1, 1, dtype=torch.float64),)])
+    def test_buffer_to_buffer_storage_alias_rejected(self):
+        for alias in ("identical", "view", "overlapping"):
+            with self.subTest(alias=alias):
+                model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+                shared = torch.randn(2, 2)
+                if alias == "identical":
+                    model[0].register_buffer("running", shared)
+                    model[1].register_buffer("running", shared)
+                elif alias == "view":
+                    model[0].register_buffer("running", shared)
+                    model[1].register_buffer("running", shared.view(4))
+                else:
+                    backing = array.array("f", [1, 2, 3, 4, 5])
+                    model[0].register_buffer("running", torch.frombuffer(
+                        backing, dtype=torch.float32, count=4))
+                    model[1].register_buffer("running", torch.frombuffer(
+                        backing, dtype=torch.float32, count=4, offset=4))
+                batch = [(torch.randn(2, 2),)]
+                plain = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+                with self.assertRaisesRegex(ValueError, "shared|aliases"):
+                    adaround(model, batch)
+                with self.assertRaisesRegex(ValueError, "shared|aliases"):
+                    bias_correct(plain, model, batch)
+                with self.assertRaisesRegex(ValueError, "shared|aliases"):
+                    bias_correct(model, plain, batch)
+
+    def test_sparse_and_meta_weights_rejected_with_value_error(self):
+        def sparse_model():
+            model = nn.Linear(2, 2)
+            model.weight = nn.Parameter(torch.eye(2).to_sparse())
+            return model
+
+        def meta_model():
+            return nn.Linear(2, 2, device="meta")
+
+        for factory, pattern in ((sparse_model, "dense"), (meta_model, "storage")):
+            with self.subTest(kind=pattern):
+                model, batch = factory(), [(torch.randn(2, 2),)]
+                # Storage probing must not leak a RuntimeError from _check_model.
+                for operation in (lambda: adaround(model, batch, iterations=0),
+                                  lambda: bias_correct(model, nn.Linear(2, 2), batch),
+                                  lambda: bias_correct(nn.Linear(2, 2), model, batch)):
+                    with self.assertRaisesRegex(ValueError, pattern):
+                        operation()
+
+    def test_meta_parameters_are_not_reported_as_aliases(self):
+        model = nn.Sequential(nn.Linear(2, 2, device="meta"), nn.Linear(2, 2, device="meta"))
+        model[0].register_buffer("extra", torch.zeros(2, device="meta"))
+        with self.assertRaisesRegex(ValueError, "storage"):
+            adaround(model, [(torch.randn(2, 2),)], iterations=0)
+
+    def test_adaround_does_not_retain_candidate_outputs(self):
+        model = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2))
+        batches = [(torch.randn(n, 3),) for n in (2, 3)]
+        original, seen = reconstruction._samples, []
+
+        def spy(*args, **kwargs):
+            samples = original(*args, **kwargs)
+            seen.append(samples)
+            return samples
+
+        reconstruction._samples = spy
+        try:
+            adaround(model, batches, iterations=2)
+            bias_correct(model, model, batches)
+        finally:
+            reconstruction._samples = original
+        adaround_samples, bias_samples = seen[:2], seen[2:]
+        self.assertTrue(adaround_samples and bias_samples)
+        for samples in adaround_samples:
+            self.assertTrue(all(output is None for _, _, _, output in samples))
+        for samples in bias_samples:
+            self.assertTrue(all(isinstance(output, torch.Tensor)
+                                for _, _, _, output in samples))
+        # The unretained output is still validated through its shape.
+        calls = _capture(model.eval(), model[0], batches, retain_output=False)
+        self.assertIsNone(calls[0][0][2])
+        self.assertEqual(calls[0][0][3], (2, 4))
+        samples = _samples(model, model, "0", batches, capture_outputs=False)
+        self.assertEqual([s[3] for s in samples], [None, None])
+        with self.assertRaisesRegex(ValueError, "shape"):
+            _samples(nn.Linear(2, 3).eval(), nn.Linear(2, 2).eval(), "",
+                     [(torch.randn(2, 2),)], capture_outputs=False)
+
+    def test_adaround_numerics_and_report_are_stable(self):
+        def run():
+            torch.manual_seed(1234)
+            model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
+            batches = [(torch.randn(n, 4) + 0.5,) for n in (2, 3)]
+            result, report = adaround(model, batches, bits=4, iterations=12)
+            return model, batches, result, report
+
+        model, batches, first, first_report = run()
+        _, _, second, second_report = run()
+        torch.testing.assert_close(first.state_dict(), second.state_dict(), rtol=0, atol=0)
+        self.assertEqual([row["layer"] for row in first_report], ["0", "2"])
+        for row, other in zip(first_report, second_report):
+            self.assertEqual(row["accepted"], other["accepted"])
+            for key in ("baseline_mse", "candidate_mse", "accepted_mse",
+                        "max_abs_alpha_gradient"):
+                self.assertEqual(row[key], other[key])
+        # Reported local error still matches an independent recomputation.
+        squared, count = 0.0, 0
+        for (x,) in batches:
+            target = model(x)
+            local = torch.func.functional_call(
+                first[2], {"weight": first[2].weight.detach(),
+                           "bias": first[2].bias.detach()}, (first[1](first[0](x)),))
+            squared += (local - target).square().sum().item()
+            count += target.numel()
+        self.assertAlmostEqual(first_report[1]["accepted_mse"], squared / count, places=7)
 
 
 if __name__ == "__main__":

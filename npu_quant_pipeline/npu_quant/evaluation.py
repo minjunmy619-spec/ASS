@@ -1,35 +1,19 @@
 """Evaluation of PyTorch outputs, not a guarantee of deployed backend accuracy."""
 
-import copy
-import itertools
 import math
 
 import torch
-from torch import nn
 
+from ._utils import single_device, tree_copy
 from .quantization import QuantizedLayer
 
 
 def _clone(value, device):
-    if isinstance(value, torch.Tensor):
-        return value.detach().to(device=device).clone()
-    if isinstance(value, tuple):
-        values = [_clone(v, device) for v in value]
-        return type(value)(*values) if hasattr(value, "_fields") else tuple(values)
-    if isinstance(value, list):
-        return [_clone(v, device) for v in value]
-    if isinstance(value, dict):
-        return {k: _clone(v, device) for k, v in value.items()}
-    return copy.deepcopy(value)
+    return tree_copy(value, device)
 
 
 def _device(model):
-    if not isinstance(model, nn.Module):
-        raise TypeError("models must be torch.nn.Module instances")
-    devices = {t.device for t in itertools.chain(model.parameters(), model.buffers())}
-    if len(devices) > 1:
-        raise ValueError("each model must be on a single device")
-    return next(iter(devices), torch.device("cpu"))
+    return single_device(model, "each model")
 
 
 def _pairs(reference, candidate):
@@ -200,8 +184,9 @@ def bss_metrics(reference, estimate):
         raise ValueError("BSS metrics require nonzero estimated stems")
     try:
         from mir_eval.separation import bss_eval_sources
-        arrays = (reference.detach().cpu().numpy(), estimate.detach().cpu().numpy())
-    except (ImportError, RuntimeError) as exc:
+    except ImportError as exc:
         raise ImportError("bss_metrics requires optional extras: install mir_eval and numpy") from exc
+    # Conversion failures are real errors, not a missing dependency.
+    arrays = (reference.detach().cpu().numpy(), estimate.detach().cpu().numpy())
     sdr, sir, sar, _ = bss_eval_sources(*arrays, compute_permutation=False)
     return {"SDR": sdr.tolist(), "SIR": sir.tolist(), "SAR": sar.tolist()}

@@ -13,6 +13,8 @@ from typing import Optional
 import torch
 from torch import nn
 
+from ._utils import find_aliased_tensors, is_excluded, storage_interval
+
 
 def _validate_bits(bits):
     if isinstance(bits, bool) or not isinstance(bits, int) or not 2 <= bits <= 16:
@@ -167,7 +169,8 @@ def calibrate_simulation(model, calibration_data, config=None, *, weight_encodin
     Calibration runs in eval mode without quantization or gradients, restoring
     each module's training flag afterwards. Shared modules and shared parameters
     (including storage shared with buffers) are rejected rather than silently
-    losing aliases. Already quantized models are rejected. Unexecuted wrappers fail
+    losing aliases. Sparse and meta parameters/buffers cannot be calibrated and are
+    rejected. Already quantized models are rejected. Unexecuted wrappers fail
     calibration. Hooks are always removed; observers are frozen before return.
 
     weight_encodings optionally maps exact layer names to AdaRound encodings:
@@ -194,22 +197,22 @@ def calibrate_simulation(model, calibration_data, config=None, *, weight_encodin
         if name not in modules:
             raise ValueError(f"unknown module name in exclusions/overrides: {name!r}")
     seen = {}
-    storage_ranges = []
     tensors = list(model.named_parameters(remove_duplicate=False)) + list(model.named_buffers(remove_duplicate=False))
     for name, parameter in tensors:
         if id(parameter) in seen:
             raise ValueError(f"shared parameter aliases are unsupported: {seen[id(parameter)]!r} and {name!r}")
         seen[id(parameter)] = name
-        if parameter.layout == torch.strided:
-            storage = parameter.untyped_storage()
-            # Distinct frombuffer storages can overlap despite different base pointers.
-            if storage.nbytes():
-                start = storage.data_ptr()
-                end = start + storage.nbytes()
-                for device, lower, upper, other_name in storage_ranges:
-                    if device == parameter.device and start < upper and lower < end:
-                        raise ValueError(f"shared parameter/buffer storage aliases are unsupported: {other_name!r} and {name!r}")
-                storage_ranges.append((parameter.device, start, end, name))
+        # Sparse and meta/fake tensors carry no usable values or addresses.
+        if parameter.numel() and storage_interval(parameter) is None:
+            raise ValueError(f"cannot calibrate non-strided or meta parameter/buffer {name!r}; "
+                             f"materialize dense tensors on a real device first")
+    # Distinct frombuffer storages can overlap despite different base pointers.
+    aliased = find_aliased_tensors(model)
+    for _, parameter in tensors:
+        if id(parameter) in aliased:
+            later, earlier = aliased[id(parameter)]
+            raise ValueError("shared parameter/buffer storage aliases are unsupported: "
+                             f"{earlier!r} and {later!r}")
     supported = (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)
     if weight_encodings is not None and not isinstance(weight_encodings, dict):
         raise ValueError("weight_encodings must map layer names to encoding dictionaries")
@@ -219,7 +222,7 @@ def calibrate_simulation(model, calibration_data, config=None, *, weight_encodin
             raise ValueError(f"unknown weight encoding layer: {name!r}")
         if type(modules[name]) not in supported:
             raise ValueError(f"unsupported weight encoding layer: {name!r}")
-        if any(ex == "" or name == ex or name.startswith(ex + ".") for ex in config.exclude):
+        if is_excluded(name, config.exclude):
             raise ValueError(f"excluded weight encoding layer: {name!r}")
         bits = (config.overrides or {}).get(name, (config.weight_bits, config.activation_bits))[0]
         qmax = (1 << (bits - 1)) - 1
@@ -249,7 +252,7 @@ def calibrate_simulation(model, calibration_data, config=None, *, weight_encodin
     wrappers = []
 
     def wrap(module, name):
-        if any(ex == "" or name == ex or name.startswith(ex + ".") for ex in config.exclude):
+        if is_excluded(name, config.exclude):
             return module
         if type(module) in supported:
             wb, ab = (config.overrides or {}).get(name, (config.weight_bits, config.activation_bits))
@@ -269,7 +272,15 @@ def calibrate_simulation(model, calibration_data, config=None, *, weight_encodin
     hooks = []
 
     def observe(module, args, kwargs, output):
-        module.input_quantizer.observe(args[0] if args else kwargs["input"])
+        if args:
+            value = args[0]
+        elif "input" in kwargs:
+            value = kwargs["input"]
+        else:
+            raise TypeError(
+                "calibration requires the quantized layer input as the first positional "
+                f"argument or as the keyword 'input'; got keywords {sorted(kwargs)}")
+        module.input_quantizer.observe(value)
         module.output_quantizer.observe(output)
 
     try:

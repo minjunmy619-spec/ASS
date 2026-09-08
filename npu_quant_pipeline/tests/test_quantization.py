@@ -306,6 +306,46 @@ class SimulationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shared parameter aliases"):
             calibrate_simulation(nn.Sequential(layer, other), [(torch.ones(1, 2),)])
 
+    def test_sparse_and_meta_tensors_rejected_with_clear_value_error(self):
+        cases = {"sparse_buffer": lambda m: m.register_buffer("extra", torch.eye(3).to_sparse()),
+                 "meta_buffer": lambda m: m.register_buffer("extra", torch.zeros(3, device="meta")),
+                 "meta_parameter": lambda m: setattr(
+                     m[0], "weight", nn.Parameter(torch.zeros(2, 2, device="meta"))),
+                 "sparse_parameter": lambda m: setattr(
+                     m[0], "weight", nn.Parameter(torch.eye(2).to_sparse()))}
+        for kind, mutate in cases.items():
+            with self.subTest(kind=kind):
+                model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+                mutate(model)
+                with patch("npu_quant.quantization.deepcopy") as copy:
+                    with self.assertRaisesRegex(ValueError, "non-strided or meta"):
+                        calibrate_simulation(model, [(torch.ones(1, 2),)])
+                    copy.assert_not_called()
+
+    def test_empty_parameters_are_not_mistaken_for_meta(self):
+        model = nn.Sequential(nn.Linear(2, 2))
+        model.register_buffer("empty", torch.empty(0))
+        q = calibrate_simulation(model, [(torch.ones(1, 2),)])
+        self.assertIsInstance(q[0], QuantizedLayer)
+
+    def test_calibration_hook_names_expected_input_argument(self):
+        original = QuantizedLayer.forward
+
+        def forward(self, *args, **kwargs):
+            return original(self, args[0] if args else kwargs["data"])
+
+        class Renamed(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = nn.Linear(2, 2)
+
+            def forward(self, x):
+                return self.layer(data=x) if isinstance(self.layer, QuantizedLayer) else self.layer(x)
+
+        with patch.object(QuantizedLayer, "forward", forward):
+            with self.assertRaisesRegex(TypeError, "keyword 'input'"):
+                calibrate_simulation(Renamed(), [(torch.ones(1, 2),)])
+
 
 if __name__ == "__main__":
     unittest.main()

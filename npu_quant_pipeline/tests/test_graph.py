@@ -503,6 +503,36 @@ class GraphTests(unittest.TestCase):
                     self.assertEqual([module.training for module in model.modules()], modes)
                     torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
 
+    def test_sparse_and_meta_tensors_skip_rewriting_without_error(self):
+        cases = {"sparse": lambda: torch.eye(3).to_sparse(),
+                 "meta": lambda: torch.zeros(3, device="meta")}
+        for kind, make in cases.items():
+            for target in ("conv", "bn"):
+                with self.subTest(kind=kind, target=target):
+                    model = nn.Sequential(nn.Conv1d(4, 4, 1), nn.BatchNorm1d(4))
+                    model[0 if target == "conv" else 1].register_buffer("extra", make())
+                    result, report = self.check(model, torch.randn(2, 4, 3))
+                    # Aliasing is undecidable, so the pair must be left alone.
+                    self.assertEqual(report, [])
+                    self.assertIn(f"{0 if target == 'conv' else 1}.extra",
+                                  dict(result.named_buffers()))
+
+    def test_folded_batchnorm_submodule_is_removed(self):
+        model = nn.Sequential(nn.Conv1d(2, 4, 3, bias=False), nn.BatchNorm1d(4))
+        with torch.no_grad():
+            model[1].running_mean.copy_(torch.randn(4))
+            model[1].running_var.copy_(torch.rand(4) + 0.5)
+        x = torch.randn(2, 2, 5)
+        result, report = self.check(model, x)
+        self.assertEqual([r["op"] for r in report], ["fold_bn"])
+        self.assertEqual(report[0]["bn"], "1")
+        names = dict(result.named_modules())
+        self.assertNotIn("1", names)
+        self.assertIn("0", names)
+        self.assertFalse([k for k in result.state_dict() if k.startswith("1.")])
+        self.assertFalse([k for k in result.state_dict() if "running_" in k])
+        torch.testing.assert_close(result(x), model(x))
+
     def test_requires_tuple(self):
         with self.assertRaises(TypeError):
             optimize_graph(nn.Identity(), torch.ones(2))

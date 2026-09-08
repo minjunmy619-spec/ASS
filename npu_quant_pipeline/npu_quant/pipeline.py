@@ -7,11 +7,12 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from ._utils import is_excluded, single_device, tree_copy
 from .evaluation import compare_models
 from .export import export_onnx, save_encodings
 from .graph import optimize_graph
 from .quantization import QuantConfig, calibrate_simulation, quantization_report
-from .reconstruction import _batches, _check_model, _device, _tree_copy, adaround, bias_correct
+from .reconstruction import _batches, _check_model, adaround, bias_correct
 
 
 @dataclass
@@ -63,11 +64,11 @@ class NPUQuantizer:
         calibration = _batches(calibration_data, max_batches)
         validation = _batches(validation_data, max_batches)
         reference = copy.deepcopy(self.model).eval()
-        device = _device(reference)
+        device = single_device(reference, "model")
 
         def calibration_on_device():
             for batch in calibration:
-                yield _tree_copy(batch, device)
+                yield tree_copy(batch, device)
 
         def evaluate(model, encodings):
             simulation = calibrate_simulation(
@@ -130,7 +131,7 @@ class NPUQuantizer:
                     for hook in hooks:
                         hook.remove()
             candidate, operations = optimize_graph(
-                best, _tree_copy(validation[0], device), fold_bn=fold_bn,
+                best, tree_copy(validation[0], device), fold_bn=fold_bn,
                 equalize=equalize, smooth=smooth, activation_max=maxima)
             # A graph rewrite must preserve float behavior before its quantized
             # quality is considered. Check held-out batches, not calibration only.
@@ -142,9 +143,8 @@ class NPUQuantizer:
         if adaround_iterations:
             layer_bits = {}
             for name, module in best.named_modules():
-                excluded = any(ex == "" or name == ex or name.startswith(ex + ".")
-                               for ex in self.config.exclude)
-                if type(module) in (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d) and not excluded:
+                if (type(module) in (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)
+                        and not is_excluded(name, self.config.exclude)):
                     layer_bits[name] = (self.config.overrides or {}).get(
                         name, (self.config.weight_bits, self.config.activation_bits))[0]
             rounding_reference = copy.deepcopy(best)

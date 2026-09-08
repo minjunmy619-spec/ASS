@@ -7,21 +7,13 @@ import torch
 from torch import fx, nn
 from torch.nn.utils.fusion import fuse_conv_bn_eval
 
+from ._utils import find_aliased_tensors, storage_interval, storages_overlap
+
 
 _CONVS = (nn.Conv1d, nn.Conv2d, nn.Conv3d)
 _BNS = {nn.Conv1d: nn.BatchNorm1d, nn.Conv2d: nn.BatchNorm2d,
         nn.Conv3d: nn.BatchNorm3d}
 _NORMS = (nn.LayerNorm,) + ((nn.RMSNorm,) if hasattr(nn, "RMSNorm") else ())
-
-
-def _storage_overlap(left, right):
-    if left.device != right.device:
-        return False
-    a, b = left.untyped_storage(), right.untyped_storage()
-    # Separate frombuffer storages can overlap despite different base pointers.
-    return (a._cdata == b._cdata or
-            (a.data_ptr() < b.data_ptr() + b.nbytes()
-             and b.data_ptr() < a.data_ptr() + a.nbytes()))
 
 
 def optimize_graph(model, example_args: tuple, *, fold_bn=True, equalize=True,
@@ -34,7 +26,8 @@ def optimize_graph(model, example_args: tuple, *, fold_bn=True, equalize=True,
     Requires every module to be in eval mode, even when rewrites are disabled;
     call ``model.eval()`` before using this inference-only API. Rewrites only
     standard, uniquely called modules with unaliased parameters and buffers
-    and no forward/pre-forward hooks. Hooks on traced-through modules (including
+    and no forward/pre-forward hooks. Modules holding sparse or meta tensors are
+    skipped because their aliasing cannot be determined. Hooks on traced-through modules (including
     the graph root) are rejected because FX cannot preserve them reliably.
     BN folding requires a batched Conv output rank observed on the example;
     callers must retain that batched/unbatched input convention after rewriting.
@@ -75,20 +68,19 @@ def optimize_graph(model, example_args: tuple, *, fold_bn=True, equalize=True,
     # FX can prune unused aliases, and deepcopy can sever storage sharing
     # between distinct Parameter wrappers or a parameter and a buffer view.
     for inspected in (model, source):
-        tensors = (list(inspected.named_parameters(remove_duplicate=False))
-                   + list(inspected.named_buffers(remove_duplicate=False)))
-        aliased = set()
-        for index, (_, tensor) in enumerate(tensors):
-            for _, other in tensors[:index]:
-                if tensor is other or _storage_overlap(tensor, other):
-                    aliased.update((id(tensor), id(other)))
+        aliased = find_aliased_tensors(inspected)
         for name, module in inspected.named_modules():
             if module._forward_hooks or module._forward_pre_hooks:
                 if not name or not tracer.is_leaf_module(module, name):
                     raise ValueError("optimize_graph: forward/pre-forward hooks on "
                                      "traced-through module %r are unsupported" % (name or "<root>"))
                 unsafe.add(id(source.get_submodule(name)))
-            if any(id(t) in aliased for t in (*module.parameters(), *module.buffers())):
+            owned = (*module.parameters(), *module.buffers())
+            if any(id(t) in aliased for t in owned):
+                unsafe.add(id(source.get_submodule(name)))
+            # Sparse/meta tensors have no comparable addresses, so aliasing is
+            # unknown; skip rewriting instead of guessing either way.
+            if any(storage_interval(t) is None for t in owned):
                 unsafe.add(id(source.get_submodule(name)))
 
     try:
@@ -107,7 +99,7 @@ def optimize_graph(model, example_args: tuple, *, fold_bn=True, equalize=True,
             if isinstance(value, torch.Tensor):
                 exposed.append(value)
     for module in graph.modules():
-        if any(_storage_overlap(t, value)
+        if any(storages_overlap(t, value)
                for t in (*module.parameters(), *module.buffers()) for value in exposed):
             unsafe.add(id(module))
 
@@ -157,13 +149,14 @@ def optimize_graph(model, example_args: tuple, *, fold_bn=True, equalize=True,
                         or ranks.get(producer.name) != _CONVS.index(type(conv)) + 3
                         or bn.running_mean is None or bn.running_var is None):
                     continue
+                bn_target = node.target
                 fused = fuse_conv_bn_eval(conv, bn)
                 graph.set_submodule(producer.target, fused)
                 calls[id(fused)] = 1
                 node.replace_all_uses_with(producer)
                 graph.graph.erase_node(node)
                 report.append({"op": "fold_bn", "conv": producer.target,
-                               "bn": node.target})
+                               "bn": bn_target})
 
         if equalize:
             for node in list(graph.graph.nodes):
@@ -177,7 +170,7 @@ def optimize_graph(model, example_args: tuple, *, fold_bn=True, equalize=True,
                         continue
                     first_node = unary_input(middle)
                 first = module_at(first_node)
-                if (type(first) is not type(second) or first is None
+                if (first is None or type(first) is not type(second)
                         or len(first_node.users) != 1):
                     continue
                 if type(first) in _CONVS and (first.groups != 1 or second.groups != 1):
@@ -229,6 +222,9 @@ def optimize_graph(model, example_args: tuple, *, fold_bn=True, equalize=True,
                 report.append({"op": "smooth", "norm": norm_node.target,
                                "consumer": node.target})
 
+        # Folded/erased submodules would otherwise linger in named_modules()
+        # and state_dict(), inflating exported artifacts.
+        graph.delete_all_unused_submodules()
         graph.graph.lint()
         graph.recompile()
     check_example(graph)
