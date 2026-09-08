@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "npu-quant-toolkit"
+version = "0.1.0"
+description = "Conservative PyTorch model preparation and quantization diagnostics for NPU deployment"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2"]
+
+[project.optional-dependencies]
+onnx = ["onnx>=1.15"]
+audio = ["mir_eval>=0.8", "numpy>=1.24"]
+
+[tool.setuptools.packages.find]
+include = ["npu_quant*"]
