@@ -97,6 +97,8 @@ _EXPORTS = {
     "SFCSmallMacaronConv2DCLNLiteNPUModel": f"{_MODEL}.sfc_small_macaron_conv2d_cln_lite_npu",
     "SFCSmallMacaronLRAttnBNNPUCore": f"{_MODEL}.sfc_small_macaron_lrattn_bn_npu",
     "SFCSmallMacaronLRAttnBNNPUModel": f"{_MODEL}.sfc_small_macaron_lrattn_bn_npu",
+    "BandDualPathNPUCore": f"{_MODEL}.band_dualpath_npu",
+    "BandDualPathNPUModel": f"{_MODEL}.band_dualpath_npu",
     "FoldedFullBandSourceAwareComplexHead2d": f"{_MODEL}.sfc_locoformer_conv2d_32b_npu",
     "SourceWiseSigmoidTanhComplexHead2d": f"{_MODEL}.sfc_locoformer_conv2d_32b_npu",
     "TVConvPyramidNPUSeparator2D": f"{_MODEL}.tvconv_pyramid_npu_separator_2d",
