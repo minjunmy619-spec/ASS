@@ -19,7 +19,7 @@ Files:
 - `spectral_feature_compression/core/model/band_dualpath_npu.py` (model, host contract, export wrapper, presets, builder)
 - `tools/online/export_band_dualpath_npu.py` (export + rule audit + ORT parity + calibration + onecc cfg/run)
 - `tools/online/synthetic_stem_benchmark.py` (controlled CPU sanity benchmark)
-- `tests/test_band_dualpath_npu.py` (17 tests)
+- `tests/test_band_dualpath_npu.py` (18 tests)
 - `recipes/dnr/models/band-dualpath-npu.{medium,medium-noattn,wide}.bs48.onfly.rt192k/config.yaml`
 
 ## 2. Existing model families (what is in the repo)
@@ -119,7 +119,7 @@ Key decisions:
 Budgets from `macs_per_frame()` (convs + attention matmuls, 86.13 frames/s) and
 the audit of the simplified ONNX (`model.sim.onnx`) that ONE imports.
 
-| Preset | Params | GMAC/s | State (fp16) | All I/O per call (fp16) | ONNX nodes | Memory ops | BMM/Softmax |
+| Preset | Params | GMAC/s | State (fp16) | All I/O per call (fp16; uint8 is half) | ONNX nodes | Memory ops | BMM/Softmax |
 |---|---:|---:|---:|---:|---:|---:|---|
 | `medium` | 1.98M | 2.55 | 46.5 KiB | 109.0 KiB | 340 | 24 | 4 / 2 |
 | `medium_noattn` | 1.97M | 2.46 | 46.5 KiB | 109.0 KiB | 302 | 12 | none |
@@ -150,7 +150,7 @@ Sigmoid 25, Slice 8, Softmax 2, Split 1, Sqrt 17, Sub 8, Tanh 11, Transpose 4
 | 9 ScatterND / unflatten | none; audit also rejects Tile, Expand, Gather, ConstantOfShape, Range, Where, Shape, Cast, Pow, Loop/If |
 | 10/11 memory ops, node count | 12-24 memory ops, ~300-340 nodes |
 | 12 causal | per-band GRU, scene GRU, in-frame attention; streaming == full sequence |
-| 13 192 KiB quota | 78-109 KiB for all inputs + outputs + state in/out (fp16) |
+| 13 192 KiB quota | 39-55 KiB (uint8 ABI, default) / 78-109 KiB (fp16) for all inputs + outputs + state in/out; float32 ABI is rejected by the export tool |
 | 14 few I/O | 5 in / 5 out |
 | 15 < 7M params, < 3 GMAC/s | 0.95-4.08M, 1.33-2.84 GMAC/s |
 | 16 ONE limits | softmax on last axis; no grouped (non-depthwise) conv; no strided conv; see section 8 |
@@ -211,6 +211,19 @@ The generated `onecc.cfg` imports `model.sim.onnx` and optimizes with
 `replace_non_const_fc_with_batch_matmul` and the repo's low-latency cleanup
 flags, then quantizes uint8 per-channel with calibration records that carry
 real sequential GRU state (not random state).
+
+Boundary type (`--io-type`, default `uint8`, matching the repo onecc template):
+the ABI bytes per call (frame inputs + masks + state in + state out) are
+
+| io type | `medium` / `medium_noattn` | fits 192 KiB |
+|---|---:|---|
+| uint8 (default) | 55,808 B (54.5 KiB) | yes |
+| int16 | 111,616 B (109 KiB) | yes |
+| float32 | 223,232 B (218 KiB) | no - the tool reports a violation and exits 1 |
+
+With uint8 I/O the carried GRU states are requantized every frame; they are
+tanh-bounded to [-1, 1], so the step is ~1/128.  If long-context drift shows up
+in the float-vs-quantized comparison, use `--io-type int16`.
 
 Known risks and fallbacks:
 

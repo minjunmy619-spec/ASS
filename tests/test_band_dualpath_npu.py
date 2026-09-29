@@ -76,8 +76,10 @@ def test_preset_budgets(preset: str) -> None:
     io = core.io_size_bytes(dtype=torch.float16)
     assert params < 6_000_000
     assert gmacs < 3.0
-    # All per-call inputs and outputs (frame, masks, state in and out) fit the 192 KiB DSP quota.
+    # All per-call inputs and outputs (frame, masks, state in and out) fit the 192 KiB DSP quota
+    # for fp16 and for the uint8 quantized ABI written into onecc.cfg by default.
     assert io["total"] < 192 * 1024
+    assert core.io_size_bytes(dtype=torch.uint8)["total"] < 192 * 1024
 
 
 def test_gru_conv_step_matches_torch_gru() -> None:
@@ -184,3 +186,12 @@ def test_mean_free_rmsnorm_fallback_is_equivalent() -> None:
         got = _stream(conv_core, feats)
     for a, b in zip(ref, got):
         torch.testing.assert_close(b, a, atol=2e-5, rtol=1e-4)
+
+
+def test_onecc_cfg_quantizes_the_boundary_by_default(tmp_path: Path) -> None:
+    from tools.online.export_band_dualpath_npu import write_onecc_cfg
+
+    text = write_onecc_cfg(tmp_path, tmp_path / "m.onnx", tmp_path / "c.h5", "channel").read_text()
+    assert "input_type=uint8" in text and "output_type=uint8" in text
+    # float32 boundary tensors would not fit the DSP quota for the medium preset.
+    assert BandDualPathNPUCore(**PRESETS["medium"]).io_size_bytes(dtype=torch.float32)["total"] > 192 * 1024

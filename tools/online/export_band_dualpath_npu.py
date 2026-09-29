@@ -77,6 +77,9 @@ FORBIDDEN_HINT = {
     "Tile", "Expand", "ConstantOfShape", "ScatterND", "Gather", "Range", "Where", "Loop", "If", "Scan",
     "GRU", "LSTM", "RNN", "Shape", "Cast", "Pow", "BatchNormalization", "Unsqueeze", "Squeeze",
 }
+# Boundary tensor types accepted by one-quantize (input_type / output_type).
+IO_TYPES = {"uint8": torch.uint8, "int16": torch.int16, "float32": torch.float32}
+DSP_QUOTA_BYTES = 192 * 1024
 DEFAULT_ONE_OPTIMIZE_FLAGS = (
     "replace_non_const_fc_with_batch_matmul",
     "convert_nchw_to_nhwc",
@@ -201,7 +204,7 @@ def _attr(node: onnx.NodeProto, name: str, default: Any = None) -> Any:
     return default
 
 
-def audit(path: Path, io_bytes_fp16: int) -> dict[str, Any]:
+def audit(path: Path, io_bytes: int) -> dict[str, Any]:
     model = shape_inference.infer_shapes(onnx.load(str(path)), strict_mode=True)
     graph = model.graph
     initializers = {init.name: init for init in graph.initializer}
@@ -271,7 +274,7 @@ def audit(path: Path, io_bytes_fp16: int) -> dict[str, Any]:
         "memory_ops": sum(ops[o] for o in MEMORY_OPS),
         "inputs": {vi.name: shapes[vi.name] for vi in graph.input},
         "outputs": {vi.name: shapes[vi.name] for vi in graph.output},
-        "io_bytes_fp16": io_bytes_fp16,
+        "io_bytes": io_bytes,
         "initializer_bytes_fp32": const_bytes,
         "violations": violations,
         "forbidden_present": sorted(set(ops) & FORBIDDEN_HINT),
@@ -308,7 +311,9 @@ def write_calibration(records: list[tuple[torch.Tensor, ...]], out_dir: Path) ->
     return list_path
 
 
-def write_onecc_cfg(out_dir: Path, onnx_path: Path, calib_h5: Path, granularity: str) -> Path:
+def write_onecc_cfg(
+    out_dir: Path, onnx_path: Path, calib_h5: Path, granularity: str, io_type: str = "uint8"
+) -> Path:
     lines = [
         "[Environment]", 'ONECC_ENV="ONECC"', "",
         "[backend]", "target=", "",
@@ -324,7 +329,7 @@ def write_onecc_cfg(out_dir: Path, onnx_path: Path, calib_h5: Path, granularity:
         "[one-quantize]", f"input_path={(out_dir / 'model.opt.circle').resolve()}",
         f"output_path={(out_dir / 'model.q.circle').resolve()}",
         f"input_data={calib_h5.resolve()}", "input_data_format=h5",
-        "quantized_dtype=uint8", f"granularity={granularity}", "input_type=float32", "output_type=float32",
+        "quantized_dtype=uint8", f"granularity={granularity}", f"input_type={io_type}", f"output_type={io_type}",
     ]
     cfg = out_dir / "onecc.cfg"
     cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -362,6 +367,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--calib-stride", type=int, default=4, help="keep one record every N streamed frames")
     p.add_argument("--granularity", default="channel", choices=["channel", "layer"])
     p.add_argument(
+        "--io-type", default="uint8", choices=sorted(IO_TYPES),
+        help="quantized model boundary type; float32 I/O exceeds the 192 KiB quota for the medium presets",
+    )
+    p.add_argument(
         "--rms-reduce", default="mean", choices=["mean", "conv"],
         help="RMSNorm channel mean as ReduceMean (fusable to RmsNorm) or as a fixed 1x1 Conv2d fallback",
     )
@@ -385,13 +394,14 @@ def main() -> int:
 
     n_frames = args.calib_records * args.calib_stride + 1
     records = stream_records(model, calibration_spectrum(args, n_frames), args.calib_records, args.calib_stride)
-    io = model.core.io_size_bytes()
+    io = model.core.io_size_bytes(dtype=IO_TYPES[args.io_type])
     report: dict[str, Any] = {
         "source": str(args.config or f"preset:{args.preset}"),
         "checkpoint": str(args.ckpt) if args.ckpt else None,
         "params": sum(t.numel() for t in model.core.parameters()),
         "gmac_per_s": model.core.macs_per_frame() * 44100 / 512 / 1e9,
-        "io_bytes_fp16": io,
+        "io_type": args.io_type,
+        "io_bytes": io,
         # model.sim.onnx is what ONE imports; the raw graph is only summarized.
         "raw_ops": dict(sorted(Counter(n.op_type for n in onnx.load(str(raw_path)).graph.node).items())),
         "sim": audit(sim_path, io["total"]),
@@ -399,7 +409,7 @@ def main() -> int:
         "ort_max_abs_err_sim": ort_parity(sim_path, wrapper, records[:16]),
     }
     list_path = write_calibration(records, out_dir)
-    cfg = write_onecc_cfg(out_dir, sim_path, out_dir / "calib.h5", args.granularity)
+    cfg = write_onecc_cfg(out_dir, sim_path, out_dir / "calib.h5", args.granularity, args.io_type)
     report["onecc_cfg"] = str(cfg)
     if args.run_one:
         if shutil.which("onecc") and shutil.which("one-create-quant-dataset"):
@@ -409,12 +419,16 @@ def main() -> int:
 
     (out_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     sim = report["sim"]
-    print(json.dumps({k: report[k] for k in ("source", "params", "gmac_per_s", "io_bytes_fp16")}, indent=2))
+    print(json.dumps({k: report[k] for k in ("source", "params", "gmac_per_s", "io_type", "io_bytes")}, indent=2))
     print(f"sim nodes={sim['nodes']} memory_ops={sim['memory_ops']} ops={sim['ops']}")
     print(f"ORT parity raw={report['ort_max_abs_err_raw']:.2e} sim={report['ort_max_abs_err_sim']:.2e}")
     if "one" in report:
         print(f"ONE: {report['one']}")
-    violations = report["sim"]["violations"]
+    violations = list(report["sim"]["violations"])
+    if io["total"] > DSP_QUOTA_BYTES:
+        violations.append(
+            f"{args.io_type} ABI (frame + masks + state in/out) is {io['total']} B > {DSP_QUOTA_BYTES} B DSP quota"
+        )
     for v in violations:
         print("VIOLATION:", v)
     return 1 if violations else 0
