@@ -196,6 +196,7 @@ def main() -> int:
     p.add_argument("--eval-clips", type=int, default=24)
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--save-state", action="store_true", help="also save the trained state_dict")
     args = p.parse_args()
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)
@@ -250,6 +251,8 @@ def main() -> int:
     result = {"model": args.model, "params": params, "steps": args.steps, "batch": args.batch,
               "seconds": args.seconds, "history": history, "final": history[-1]}
     (args.out / f"{args.model}.json").write_text(json.dumps(result, indent=2))
+    if args.save_state:
+        torch.save(net.state_dict(), args.out / f"{args.model}.pt")
     return 0
 
 

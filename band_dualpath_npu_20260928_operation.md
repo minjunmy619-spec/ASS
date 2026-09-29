@@ -161,7 +161,7 @@ Environment: Python 3.11, torch 2.14 CPU, onnx 1.23, onnxsim 0.7.3,
 onnxruntime 1.30.  The ONE toolchain could not be built here (see section 8).
 
 ```bash
-# 17 tests: layout, budgets, GRU cell == nn.GRU, streaming == full forward
+# 18 tests: layout, budgets, GRU cell == nn.GRU, streaming == full forward
 # (raw and folded), chunked state carry, waveform backward, mixture
 # consistency, ONNX export + NPU audit + ORT parity, MEAN-free fallback.
 python -m pytest -q tests/test_band_dualpath_npu.py
@@ -237,7 +237,41 @@ Known risks and fallbacks:
 
 ## 9. Synthetic benchmark results
 
-See the section appended after the runs finish.
+Setup: `tools/online/synthetic_stem_benchmark.py`, identical on-the-fly
+synthetic stems (seed 1234), `ThresSNRLossWithInactiveSource` as in the
+recipes, AdamW 1e-3 with one-cycle schedule, batch 4 x 1.5 s, 500 steps,
+gradient clip 5, CPU.  Evaluation: SI-SDR improvement over the mixture on the
+same 24 held-out 3 s clips (active stems only).  Each model uses its own
+recipe STFT (BandDualPathNPU and macaron 2048/512, Dolphin 4096/1024 with the
+fp512keep475 preprocessor).
+
+| step | BandDualPathNPU `medium` | Dolphin `slim_6m` fp512 | SFC-small macaron `lrattn` BN |
+|---:|---|---|---|
+| 83 | 4.38 | 0.97 | NaN |
+| 166 | 6.82 | 2.00 | 1.35 |
+| 249 | 8.03 | 3.17 | NaN |
+| 332 | 9.33 | 3.64 | NaN |
+| 415 | 9.87 | 3.90 | NaN |
+| 500 | **9.99** (speech 11.54 / music 11.71 / effects 6.73) | 4.06 (6.80 / 7.46 / -2.09) | 1.09 (0.38 / 4.42 / -1.52) |
+
+Parameters: 1.98M / 5.17M / 2.56M.  CPU wall time for 500 steps (parallel
+runs, 1/1/2 threads): 34 / 49 / 54 min.
+
+Caveats:
+
+- Synthetic stems, one seed, short training: this checks learnability and
+  relative behaviour under identical conditions; it is not a DnR/TV quality
+  result and the gap can shrink with long GPU training.
+- The macaron-lrattn run produced non-finite eval outputs at 4 of its 7
+  checkpoints although its training loss stayed finite.  A separate 170-step
+  run (saved weights) gave finite outputs on the same clips with 1, 2 and 4
+  threads, so the cause was not reproduced and is **not determined**; the
+  finite evaluations of that model (0.9-1.35 dB) are the comparable numbers.
+  Separately, its training forward computes the temporal EMA as
+  `cumsum(x / 0.995**t) * 0.995**t`; the divisor is 2.3e4 at 2,000 frames
+  (~23 s) and overflows float32 beyond ~17,700 frames (~3.4 min), so long
+  full-sequence (non-CSS) inference of that model is numerically unsafe.
+  Streaming uses the recurrence and is unaffected.
 
 ## 10. Next steps
 
