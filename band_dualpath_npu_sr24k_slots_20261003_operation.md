@@ -111,7 +111,30 @@ is a unit test.  The export `report.json` now records `stft` and `host_layout`
 
 ## 6. Synthetic A/B (24 kHz)
 
-See the results appended below once the runs finish.
+Same model (`medium_noattn`, R5 layout), same synthetic stems at 24 kHz, loss,
+optimizer and 500 steps (batch 4 x 1.5 s, CPU, 2 threads each); only the I/O
+layout differs.  Mean SI-SDR improvement (dB) on 24 held-out 3 s clips:
+
+| step | `regions` (per-region embed + heads) | `slots` P=16 (shared head) |
+|---:|---:|---:|
+| 83 | 6.04 | 7.33 |
+| 166 | 8.80 | 8.56 |
+| 249 | 9.90 | 9.74 |
+| 332 | 10.95 | 11.19 |
+| 415 | 11.40 | 11.97 |
+| 500 | **11.58** (speech 10.91 / music 13.91 / effects 9.91) | **12.17** (speech 11.35 / music 14.53 / effects 10.62) |
+
+The shared P=16 head with interpolated masks above 4.5 kHz does not lose
+quality here (+0.6 dB, within single-seed noise).  Synthetic stems and one
+seed: a check that the layout change is safe, not a DnR/TV result; these 24 kHz
+numbers are not comparable with the 44.1 kHz benchmark in the previous note.
+
+```bash
+python tools/online/synthetic_stem_benchmark.py --model band_dualpath_medium_noattn --sr 24000 \
+  --regions sr24k_r5 --io-layout regions --tag sr24k_r5_regions --steps 500 --batch 4 --seconds 1.5 --out logs/ab24k
+python tools/online/synthetic_stem_benchmark.py --model band_dualpath_medium_noattn --sr 24000 \
+  --regions sr24k_r5 --io-layout slots --mask-points 16 --tag sr24k_r5_slots_p16 --steps 500 --batch 4 --seconds 1.5 --out logs/ab24k
+```
 
 ## 7. Files
 
