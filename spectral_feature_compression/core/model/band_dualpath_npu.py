@@ -62,6 +62,21 @@ import torch.nn.functional as F
 # 48 band tokens in total.  Bin 1024 (Nyquist) reuses the mask of bin 1023.
 DEFAULT_REGIONS: tuple[tuple[int, int, int], ...] = ((0, 96, 4), (96, 352, 16), (352, 1024, 84))
 
+# 24 kHz, n_fft=2048 (11.72 Hz bins, Nyquist 12 kHz): each region doubles the band width.
+#   0.000-1.125 kHz: 24 bands x  46.9 Hz   (F0, F1, bass/kick, music fundamentals)
+#   1.125-2.250 kHz: 12 bands x  93.8 Hz   (F2, upper harmonics)
+#   2.250-4.500 kHz: 12 bands x 187.5 Hz   (F3, consonants: intelligibility)
+#   4.500-7.500 kHz:  8 bands x 375.0 Hz   (sibilants, presence, attacks)
+#   7.500-12.00 kHz:  6 bands x 750.0 Hz   (air, cymbals, noisy effects)
+# 62 band tokens.  Bin 1024 (Nyquist) reuses the mask of bin 1023.
+REGIONS_SR24K_R5: tuple[tuple[int, int, int], ...] = (
+    (0, 96, 4),
+    (96, 192, 8),
+    (192, 384, 16),
+    (384, 640, 32),
+    (640, 1024, 64),
+)
+
 
 def _check_span(kernel_size: int, dilation: int = 1, *, name: str) -> None:
     span = (int(kernel_size) - 1) * int(dilation)
@@ -119,6 +134,62 @@ class BandLayout:
     @property
     def band_counts(self) -> tuple[int, ...]:
         return tuple(region.n_bands for region in self.regions)
+
+    @property
+    def slot_width(self) -> int:
+        """Sum of the region band widths: channel slots per input channel in the ``slots`` layout."""
+        return sum(region.width for region in self.regions)
+
+    def pack_slots(self, x: torch.Tensor) -> torch.Tensor:
+        """``[B, C, T, F]`` -> one block-sparse ``[B, C*sum(W), T, K]`` tensor (``slots`` I/O layout).
+
+        Region ``r`` owns channels ``[C*off_r, C*(off_r + W_r))`` with ``off_r`` the summed widths of the
+        regions before it; inside its slot a band uses the same ``c * W + w`` order as ``pack``.  All
+        other channels of that band are zero, so one dense 1x1 Conv2d equals the per-region embeddings.
+        """
+        parts = self.pack(x)
+        bsz, _, n_frames, _ = parts[0].shape
+        channels = parts[0].shape[1] // self.regions[0].width
+        out = parts[0].new_zeros(bsz, channels * self.slot_width, n_frames, self.n_bands)
+        channel_offset = band_offset = 0
+        for region, part in zip(self.regions, parts):
+            out[:, channel_offset : channel_offset + part.shape[1], :, band_offset : band_offset + region.n_bands] = part
+            channel_offset += part.shape[1]
+            band_offset += region.n_bands
+        return out
+
+    def point_expansion(self, region: BandRegion, points: int, *, device=None, dtype=None) -> torch.Tensor:
+        """``[W, P]`` matrix mapping ``P`` mask points of one band to its ``W`` bins.
+
+        ``W <= P``: the first ``W`` points are the per-bin masks (exact).  ``W > P``: linear
+        interpolation between points placed evenly from the first to the last bin of the band.
+        """
+        width = region.width
+        if width <= points:
+            return torch.eye(width, points, device=device, dtype=dtype)
+        position = torch.arange(width, device=device, dtype=torch.float64) * (points - 1) / (width - 1)
+        lower = position.floor().clamp(max=points - 2).long()
+        frac = position - lower
+        basis = torch.zeros(width, points, device=device, dtype=torch.float64)
+        basis[torch.arange(width), lower] = 1.0 - frac
+        basis[torch.arange(width), lower + 1] = frac
+        return basis.to(dtype=dtype or torch.float32)
+
+    def unpack_points(self, points_tensor: torch.Tensor, channels: int, points: int) -> torch.Tensor:
+        """``[B, channels*P, T, K]`` mask points -> ``[B, channels, T, F]`` per-bin masks (host-side)."""
+        bsz, _, n_frames, _ = points_tensor.shape
+        pts = points_tensor.reshape(bsz, channels, points, n_frames, self.n_bands)
+        pieces = []
+        band_offset = 0
+        for region in self.regions:
+            chunk = pts[..., band_offset : band_offset + region.n_bands]  # [B, C, P, T, K_r]
+            basis = self.point_expansion(region, points, device=chunk.device, dtype=chunk.dtype)
+            bins = torch.einsum("wp,bcptk->bctkw", basis, chunk)
+            pieces.append(bins.reshape(bsz, channels, n_frames, region.n_bands * region.width))
+            band_offset += region.n_bands
+        if self.tail_bins:
+            pieces.append(pieces[-1][..., -1:].expand(*pieces[-1].shape[:-1], self.tail_bins))
+        return torch.cat(pieces, dim=-1)
 
     def pack(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """``[B, C, T, F]`` -> tuple of ``[B, C*W_r, T, K_r]``."""
@@ -457,6 +528,17 @@ class BandDualPathNPUCore(nn.Module):
 
     ``forward`` processes a whole causal sequence (training); ``forward_stream``
     processes exactly one frame and is the ONNX/ONE export path.
+
+    ``io_layout``:
+
+    * ``"regions"``: one input and one mask output per band region, per-region
+      embedding and mask head (a Concat after the embeddings, a Split before the heads).
+    * ``"slots"``: a single block-sparse input ``[B, 2M*sum(W), T, K]``
+      (``BandLayout.pack_slots``) embedded by one 1x1 Conv2d, and a single mask
+      head emitting ``mask_points`` points per band and output channel
+      ``[B, 2SM*P, T, K]``, expanded to bins on the host (``BandLayout.unpack_points``:
+      exact for bands of ``W <= P`` bins, linear interpolation for wider bands).
+      No Concat/Split/Reshape is added; the ABI is spectrum + 2 states.
     """
 
     def __init__(
@@ -478,11 +560,19 @@ class BandDualPathNPUCore(nn.Module):
         scene_every: int = 2,
         mask_hidden: int = 128,
         mask_bound: float = 1.0,
+        io_layout: str = "regions",
+        mask_points: int = 16,
         eps: float = 1e-5,
     ) -> None:
         super().__init__()
         if n_blocks <= 0:
             raise ValueError("n_blocks must be positive")
+        if io_layout not in ("regions", "slots"):
+            raise ValueError(f"io_layout must be 'regions' or 'slots', got {io_layout!r}")
+        if mask_points < 2:
+            raise ValueError("mask_points must be at least 2")
+        self.io_layout = io_layout
+        self.mask_points = int(mask_points)
         self.layout = BandLayout(n_freq, regions)
         self.n_freq = int(n_freq)
         self.n_src = int(n_src)
@@ -498,9 +588,12 @@ class BandDualPathNPUCore(nn.Module):
         def every(idx: int, period: int) -> bool:
             return period > 0 and idx % period == period - 1
 
-        self.embed = nn.ModuleList(
-            nn.Conv2d(self.in_channels * region.width, channels, kernel_size=1) for region in self.layout.regions
-        )
+        if io_layout == "slots":
+            self.embed = nn.ModuleList([nn.Conv2d(self.in_channels * self.layout.slot_width, channels, kernel_size=1)])
+        else:
+            self.embed = nn.ModuleList(
+                nn.Conv2d(self.in_channels * region.width, channels, kernel_size=1) for region in self.layout.regions
+            )
         self.band_pos = nn.Parameter(torch.randn(1, channels, 1, self.n_bands) * 0.02)
         self.blocks = nn.ModuleList(
             DualPathBlock(
@@ -519,21 +612,28 @@ class BandDualPathNPUCore(nn.Module):
         )
         self.n_scene = sum(block.scene is not None for block in self.blocks)
         self.out_norm = RMSNorm2d(channels, eps)
-        self.heads = nn.ModuleList(
-            RegionMaskHead(channels, mask_hidden, self.out_channels * region.width, mask_bound)
-            for region in self.layout.regions
-        )
+        if io_layout == "slots":
+            self.heads = nn.ModuleList(
+                [RegionMaskHead(channels, mask_hidden, self.out_channels * self.mask_points, mask_bound)]
+            )
+        else:
+            self.heads = nn.ModuleList(
+                RegionMaskHead(channels, mask_hidden, self.out_channels * region.width, mask_bound)
+                for region in self.layout.regions
+            )
 
     # ------------------------------------------------------------------ shared
     def _embed(self, parts: Sequence[torch.Tensor]) -> torch.Tensor:
         if len(parts) != len(self.embed):
-            raise ValueError(f"Expected {len(self.embed)} band-region inputs, got {len(parts)}")
+            raise ValueError(f"Expected {len(self.embed)} {self.io_layout} inputs, got {len(parts)}")
         tokens = [conv(part) for conv, part in zip(self.embed, parts)]
         x = tokens[0] if len(tokens) == 1 else torch.cat(tokens, dim=3)
         return x + self.band_pos
 
     def _decode(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         x = self.out_norm(x)
+        if self.io_layout == "slots":
+            return (self.heads[0](x),)
         counts = self.layout.band_counts
         chunks = (x,) if len(counts) == 1 else torch.split(x, list(counts), dim=3)
         return tuple(head(chunk) for head, chunk in zip(self.heads, chunks))
@@ -639,8 +739,12 @@ class BandDualPathNPUCore(nn.Module):
     def io_size_bytes(self, *, batch_size: int = 1, dtype: torch.dtype = torch.float16) -> dict[str, int]:
         itemsize = torch.empty((), dtype=dtype).element_size()
         regions = self.layout.regions
-        inputs = sum(self.in_channels * r.width * r.n_bands for r in regions) * batch_size * itemsize
-        outputs = sum(self.out_channels * r.width * r.n_bands for r in regions) * batch_size * itemsize
+        if self.io_layout == "slots":
+            inputs = self.in_channels * self.layout.slot_width * self.n_bands * batch_size * itemsize
+            outputs = self.out_channels * self.mask_points * self.n_bands * batch_size * itemsize
+        else:
+            inputs = sum(self.in_channels * r.width * r.n_bands for r in regions) * batch_size * itemsize
+            outputs = sum(self.out_channels * r.width * r.n_bands for r in regions) * batch_size * itemsize
         state = self.state_size_bytes(batch_size=batch_size, dtype=dtype)
         return {
             "frame_inputs": inputs,
@@ -653,7 +757,12 @@ class BandDualPathNPUCore(nn.Module):
     def macs_per_frame(self) -> int:
         """Analytic multiply-accumulate count for one streamed frame (convs + attention matmuls)."""
         k, c = self.n_bands, self.channels
-        total = sum(conv.in_channels * conv.out_channels * r.n_bands for conv, r in zip(self.embed, self.layout.regions))
+        if self.io_layout == "slots":
+            total = k * self.embed[0].in_channels * c
+        else:
+            total = sum(
+                conv.in_channels * conv.out_channels * r.n_bands for conv, r in zip(self.embed, self.layout.regions)
+            )
         for block in self.blocks:
             h = block.time.hidden
             total += k * (3 * c * h + 3 * h * h + h * c)
@@ -668,9 +777,10 @@ class BandDualPathNPUCore(nn.Module):
             ffn = block.freq
             total += k * c * ffn.depthwise.kernel_size[1]
             total += k * 3 * c * ffn.value.out_channels
-        for head, r in zip(self.heads, self.layout.regions):
+        band_counts = (k,) if self.io_layout == "slots" else self.layout.band_counts
+        for head, n_bands in zip(self.heads, band_counts):
             hid = head.value.out_channels
-            total += r.n_bands * (2 * c * hid + hid * head.out.out_channels)
+            total += n_bands * (2 * c * hid + hid * head.out.out_channels)
         return int(total)
 
 
@@ -703,13 +813,18 @@ class BandDualPathNPUModel(nn.Module):
         return torch.stack((x.real, x.imag), dim=2).reshape(x.shape[0], 2 * x.shape[1], x.shape[2], x.shape[3])
 
     def host_features(self, spec: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        packed = self.pack_complex(spec)
-        return self.core.layout.pack(compress_packed_spectrum(packed, self.compress_exponent))
+        packed = compress_packed_spectrum(self.pack_complex(spec), self.compress_exponent)
+        if self.core.io_layout == "slots":
+            return (self.core.layout.pack_slots(packed),)
+        return self.core.layout.pack(packed)
 
     def apply_masks(self, spec: torch.Tensor, masks: Sequence[torch.Tensor]) -> torch.Tensor:
         """Host post-processing: complex masks (order src, mic, re/im) times the mixture STFT."""
         bsz, n_chan, n_freq, n_frames = spec.shape
-        full = self.core.layout.unpack(masks, self.core.out_channels)  # [B, S*M*2, T, F]
+        if self.core.io_layout == "slots":
+            full = self.core.layout.unpack_points(masks[0], self.core.out_channels, self.core.mask_points)
+        else:
+            full = self.core.layout.unpack(masks, self.core.out_channels)  # [B, S*M*2, T, F]
         full = full.reshape(bsz, self.n_src, n_chan, 2, n_frames, n_freq).transpose(-1, -2)
         mask = torch.complex(full[:, :, :, 0].float(), full[:, :, :, 1].float())
         est = mask * spec.unsqueeze(1)
@@ -724,12 +839,16 @@ class BandDualPathNPUModel(nn.Module):
 
 
 class BandDualPathNPUExportWrapper(nn.Module):
-    """ONNX signature ``(x_band0..N, band_state[, scene_state]) -> (mask_band0..N, next_band_state[, next_scene_state])``."""
+    """ONNX signature ``(x..., band_state[, scene_state]) -> (mask..., next_band_state[, next_scene_state])``.
+
+    ``regions`` layout: one ``x_band{i}`` / ``mask_band{i}`` per region.  ``slots`` layout: a single
+    ``spectrum`` input and a single ``mask_points`` output.
+    """
 
     def __init__(self, core: BandDualPathNPUCore) -> None:
         super().__init__()
         self.core = core
-        self.n_regions = len(core.layout.regions)
+        self.n_regions = len(core.embed)
         self.has_scene = core.n_scene > 0
 
     def forward(self, *inputs: torch.Tensor):
@@ -740,15 +859,24 @@ class BandDualPathNPUExportWrapper(nn.Module):
         return (*masks, next_band) + ((next_scene,) if self.has_scene else ())
 
     def example_inputs(self, batch_size: int = 1) -> tuple[torch.Tensor, ...]:
-        parts = tuple(
-            torch.randn(batch_size, self.core.in_channels * r.width, 1, r.n_bands) for r in self.core.layout.regions
-        )
+        if self.core.io_layout == "slots":
+            spec = torch.randn(batch_size, self.core.in_channels, 1, self.core.n_freq)
+            parts = (self.core.layout.pack_slots(spec),)
+        else:
+            parts = tuple(
+                torch.randn(batch_size, self.core.in_channels * r.width, 1, r.n_bands)
+                for r in self.core.layout.regions
+            )
         return (*parts, *(s for s in self.core.init_stream_state(batch_size) if s is not None))
 
     def io_names(self) -> tuple[list[str], list[str]]:
         states = ["band_state"] + (["scene_state"] if self.has_scene else [])
-        inputs = [f"x_band{idx}" for idx in range(self.n_regions)] + states
-        outputs = [f"mask_band{idx}" for idx in range(self.n_regions)] + [f"next_{name}" for name in states]
+        if self.core.io_layout == "slots":
+            inputs, outputs = ["spectrum"] + states, ["mask_points"]
+        else:
+            inputs = [f"x_band{idx}" for idx in range(self.n_regions)] + states
+            outputs = [f"mask_band{idx}" for idx in range(self.n_regions)]
+        outputs += [f"next_{name}" for name in states]
         return inputs, outputs
 
 
@@ -821,6 +949,7 @@ def build_band_dualpath_npu_system(
 
 __all__ = [
     "DEFAULT_REGIONS",
+    "REGIONS_SR24K_R5",
     "PRESETS",
     "BandDualPathNPUCore",
     "BandDualPathNPUExportWrapper",

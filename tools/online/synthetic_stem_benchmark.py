@@ -90,12 +90,12 @@ def music_like(n: int, gen: torch.Generator) -> torch.Tensor:
         for idx in chord.tolist():
             f = root * 2 ** (scale[idx] / 12) * (1 + 0.002 * torch.randn(1, generator=gen))
             k = torch.arange(1, 13).view(-1, 1)
-            note = (k.float() ** -1.3 * torch.sin(2 * math.pi * k * f * t.view(1, -1)) * (k * f < 16000)).sum(0)
+            note = (k.float() ** -1.3 * torch.sin(2 * math.pi * k * f * t.view(1, -1)) * (k * f < min(16000, 0.45 * SR))).sum(0)
             out = out + note * mask
         onset += dur
     kick = torch.zeros(n)
     hat = torch.zeros(n)
-    hat_noise = _bandpass_noise(n, 6000, 16000, gen)
+    hat_noise = _bandpass_noise(n, 6000, min(16000, 0.45 * SR), gen)
     beat_t = 0.0
     while beat_t < n / SR:
         start = int(beat_t * SR)
@@ -155,11 +155,23 @@ def si_sdr(est: torch.Tensor, ref: torch.Tensor, eps: float = 1e-8) -> torch.Ten
     return 10 * torch.log10(proj.square().sum(-1) / ((est - proj).square().sum(-1) + eps) + eps)
 
 
-def build(name: str):
+def build(name: str, *, regions: str = "default", io_layout: str = "regions", mask_points: int = 16):
     if name.startswith("band_dualpath_"):
-        from spectral_feature_compression.core.model.band_dualpath_npu import build_band_dualpath_npu_system
+        from spectral_feature_compression.core.model.band_dualpath_npu import (
+            DEFAULT_REGIONS,
+            REGIONS_SR24K_R5,
+            build_band_dualpath_npu_system,
+        )
 
-        return build_band_dualpath_npu_system(n_fft=2048, hop_length=512, fs=SR, preset=name[len("band_dualpath_"):])
+        return build_band_dualpath_npu_system(
+            n_fft=2048,
+            hop_length=512,
+            fs=SR,
+            preset=name[len("band_dualpath_"):],
+            regions={"default": DEFAULT_REGIONS, "sr24k_r5": REGIONS_SR24K_R5}[regions],
+            io_layout=io_layout,
+            mask_points=mask_points,
+        )
     if name == "sfc_macaron_lrattn_bn":
         # Mirrors recipes/dnr/models/sfc-small-macaron-lrattn-bn-npu.musical36.2l.r2d64g560.onfly.rt192k
         from spectral_feature_compression.core.model.sfc_small_macaron_lrattn_bn_npu import (
@@ -189,6 +201,11 @@ def build(name: str):
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True)
+    p.add_argument("--sr", type=int, default=44100, help="sample rate of the synthetic stems and the model")
+    p.add_argument("--regions", default="default", choices=["default", "sr24k_r5"], help="band_dualpath layout")
+    p.add_argument("--io-layout", default="regions", choices=["regions", "slots"], help="band_dualpath I/O layout")
+    p.add_argument("--mask-points", type=int, default=16, help="band_dualpath mask points (slots layout)")
+    p.add_argument("--tag", default="", help="suffix for the result file name")
     p.add_argument("--steps", type=int, default=1500)
     p.add_argument("--batch", type=int, default=4)
     p.add_argument("--seconds", type=float, default=2.0)
@@ -198,12 +215,15 @@ def main() -> int:
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--save-state", action="store_true", help="also save the trained state_dict")
     args = p.parse_args()
+    global SR
+    SR = int(args.sr)
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)
 
     from spectral_feature_compression.core.loss.snr import ThresSNRLossWithInactiveSource
 
-    net = build(args.model)
+    net = build(args.model, regions=args.regions, io_layout=args.io_layout, mask_points=args.mask_points)
+    run_name = args.model + (f"_{args.tag}" if args.tag else "")
     loss_fn = ThresSNRLossWithInactiveSource(solve_perm=False, n_src=3, zeroref_weight=0.1, only_denominator=False)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.steps, pct_start=0.05)
@@ -248,11 +268,12 @@ def main() -> int:
             print(json.dumps(metrics), flush=True)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    result = {"model": args.model, "params": params, "steps": args.steps, "batch": args.batch,
+    result = {"model": args.model, "tag": args.tag, "sr": SR, "regions": args.regions,
+              "io_layout": args.io_layout, "mask_points": args.mask_points, "params": params, "steps": args.steps, "batch": args.batch,
               "seconds": args.seconds, "history": history, "final": history[-1]}
-    (args.out / f"{args.model}.json").write_text(json.dumps(result, indent=2))
+    (args.out / f"{run_name}.json").write_text(json.dumps(result, indent=2))
     if args.save_state:
-        torch.save(net.state_dict(), args.out / f"{args.model}.pt")
+        torch.save(net.state_dict(), args.out / f"{run_name}.pt")
     return 0
 
 

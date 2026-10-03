@@ -46,7 +46,9 @@ import onnx  # noqa: E402
 from onnx import numpy_helper, shape_inference  # noqa: E402
 
 from spectral_feature_compression.core.model.band_dualpath_npu import (  # noqa: E402
+    DEFAULT_REGIONS,
     PRESETS,
+    REGIONS_SR24K_R5,
     BandDualPathNPUExportWrapper,
     BandDualPathNPUModel,
 )
@@ -103,21 +105,34 @@ DEFAULT_ONE_OPTIMIZE_FLAGS = (
 )
 
 
+REGION_CHOICES = {"default": DEFAULT_REGIONS, "sr24k_r5": REGIONS_SR24K_R5}
+
+
 def build_model(args: argparse.Namespace) -> BandDualPathNPUModel:
+    """Build the model; also sets ``args.fs``, ``args.n_fft`` and ``args.hop`` (from the recipe when given)."""
     if args.config:
         from omegaconf import OmegaConf
 
         cfg = OmegaConf.to_container(OmegaConf.load(args.config), resolve=False)
         model_cfg = dict(cfg["task"]["model"])
+        args.fs = int(model_cfg.get("fs", args.fs))
+        args.n_fft = int(model_cfg.get("n_fft", args.n_fft))
+        args.hop = int(model_cfg.get("hop_length", args.hop))
         preset = model_cfg.pop("preset", None)
         for key in ("_target_", "n_fft", "hop_length", "fs", "scaling", "css_segment_size", "css_shift_size",
                     "css_batch_size"):
             model_cfg.pop(key, None)
         kwargs = dict(PRESETS[preset]) if preset else {}
         kwargs.update(model_cfg)
-        model = BandDualPathNPUModel(**kwargs)
+        model = BandDualPathNPUModel(n_freq=args.n_fft // 2 + 1, **kwargs)
     else:
-        model = BandDualPathNPUModel(**PRESETS[args.preset])
+        model = BandDualPathNPUModel(
+            n_freq=args.n_fft // 2 + 1,
+            regions=REGION_CHOICES[args.regions],
+            io_layout=args.io_layout,
+            mask_points=args.mask_points,
+            **PRESETS[args.preset],
+        )
     if args.ckpt:
         state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
         state = state.get("state_dict", state)
@@ -150,24 +165,26 @@ def stream_records(
 
 
 def calibration_spectrum(args: argparse.Namespace, n_frames: int) -> torch.Tensor:
-    window = torch.hann_window(2048)
+    window = torch.hann_window(args.n_fft)
     if args.calib_wav:
         import soundfile as sf
 
         wav, sr = sf.read(args.calib_wav, dtype="float32", always_2d=True)
-        if sr != 44100:
-            raise ValueError(f"Calibration wav must be 44.1 kHz, got {sr}")
+        if sr != args.fs:
+            raise ValueError(f"Calibration wav must be {args.fs} Hz (the model sample rate), got {sr}")
         wav = torch.from_numpy(wav.mean(axis=1))
     else:
         # Deterministic stand-in: harmonic tones + noise bursts at varying level.
         gen = torch.Generator().manual_seed(0)
-        n = n_frames * 512 + 2048
-        t = torch.arange(n) / 44100
+        n = n_frames * args.hop + args.n_fft
+        t = torch.arange(n) / args.fs
         env = 0.5 + 0.5 * torch.sin(2 * torch.pi * 0.7 * t)
         tones = sum(torch.sin(2 * torch.pi * f0 * k * t) / k for f0 in (110.0, 220.0, 330.0) for k in range(1, 6))
-        wav = 0.05 * env * tones + 0.02 * torch.randn(n, generator=gen) * (torch.rand(n // 4410 + 1, generator=gen)
-                                                                           .repeat_interleave(4410)[:n])
-    spec = torch.stft(wav, 2048, 512, window=window, return_complex=True)[..., :n_frames]
+        burst = args.fs // 10
+        wav = 0.05 * env * tones + 0.02 * torch.randn(n, generator=gen) * (
+            torch.rand(n // burst + 1, generator=gen).repeat_interleave(burst)[:n]
+        )
+    spec = torch.stft(wav, args.n_fft, args.hop, window=window, return_complex=True)[..., :n_frames]
     return spec.reshape(1, 1, spec.shape[-2], spec.shape[-1])
 
 
@@ -358,6 +375,12 @@ def parse_args() -> argparse.Namespace:
     src = p.add_mutually_exclusive_group()
     src.add_argument("--preset", default="medium", choices=sorted(PRESETS))
     src.add_argument("--config", type=Path, help="recipe config.yaml with task.model")
+    p.add_argument("--fs", type=int, default=44100, help="sample rate (taken from --config when given)")
+    p.add_argument("--n-fft", type=int, default=2048, help="STFT size (taken from --config when given)")
+    p.add_argument("--hop", type=int, default=512, help="STFT hop (taken from --config when given)")
+    p.add_argument("--regions", default="default", choices=sorted(REGION_CHOICES), help="band layout for --preset")
+    p.add_argument("--io-layout", default="regions", choices=["regions", "slots"], help="ABI layout for --preset")
+    p.add_argument("--mask-points", type=int, default=16, help="mask points per band for --io-layout slots")
     p.add_argument("--ckpt", type=Path, help="Lightning checkpoint (EMA weights are used when present)")
     p.add_argument("--no-ema", action="store_true", help="use the raw instead of the EMA weights of --ckpt")
     p.add_argument("--out-dir", type=Path, required=True)
@@ -399,7 +422,17 @@ def main() -> int:
         "source": str(args.config or f"preset:{args.preset}"),
         "checkpoint": str(args.ckpt) if args.ckpt else None,
         "params": sum(t.numel() for t in model.core.parameters()),
-        "gmac_per_s": model.core.macs_per_frame() * 44100 / 512 / 1e9,
+        "stft": {"fs": args.fs, "n_fft": args.n_fft, "hop": args.hop},
+        "io_layout": model.core.io_layout,
+        # Host contract: region (start_bin, end_bin, bins_per_band); slots layout also needs slot_width / mask_points.
+        "host_layout": {
+            "regions": [[r.start, r.end, r.width] for r in model.core.layout.regions],
+            "n_bands": model.core.n_bands,
+            "slot_width": model.core.layout.slot_width,
+            "mask_points": model.core.mask_points if model.core.io_layout == "slots" else None,
+            "compress_exponent": model.compress_exponent,
+        },
+        "gmac_per_s": model.core.macs_per_frame() * args.fs / args.hop / 1e9,
         "io_type": args.io_type,
         "io_bytes": io,
         # model.sim.onnx is what ONE imports; the raw graph is only summarized.
@@ -419,7 +452,7 @@ def main() -> int:
 
     (out_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     sim = report["sim"]
-    print(json.dumps({k: report[k] for k in ("source", "params", "gmac_per_s", "io_type", "io_bytes")}, indent=2))
+    print(json.dumps({k: report[k] for k in ("source", "stft", "io_layout", "params", "gmac_per_s", "io_type", "io_bytes")}, indent=2))
     print(f"sim nodes={sim['nodes']} memory_ops={sim['memory_ops']} ops={sim['ops']}")
     print(f"ORT parity raw={report['ort_max_abs_err_raw']:.2e} sim={report['ort_max_abs_err_sim']:.2e}")
     if "one" in report:

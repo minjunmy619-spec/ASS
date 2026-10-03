@@ -13,6 +13,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from spectral_feature_compression.core.model.band_dualpath_npu import (  # noqa: E402
     DEFAULT_REGIONS,
     PRESETS,
+    REGIONS_SR24K_R5,
     BandDualPathNPUCore,
     BandDualPathNPUExportWrapper,
     BandDualPathNPUModel,
@@ -24,6 +25,7 @@ from spectral_feature_compression.core.model.band_dualpath_npu import (  # noqa:
 )
 
 FRAMES_PER_SECOND = 44100 / 512
+FRAMES_PER_SECOND_24K = 24000 / 512
 
 
 def _randomize_identity_params(model: torch.nn.Module) -> None:
@@ -195,3 +197,158 @@ def test_onecc_cfg_quantizes_the_boundary_by_default(tmp_path: Path) -> None:
     assert "input_type=uint8" in text and "output_type=uint8" in text
     # float32 boundary tensors would not fit the DSP quota for the medium preset.
     assert BandDualPathNPUCore(**PRESETS["medium"]).io_size_bytes(dtype=torch.float32)["total"] > 192 * 1024
+
+
+# ---------------------------------------------------------------- 24 kHz "slots" I/O layout
+
+
+def _slots_model(preset: str = "medium_noattn") -> BandDualPathNPUModel:
+    return BandDualPathNPUModel(regions=REGIONS_SR24K_R5, io_layout="slots", mask_points=16, **PRESETS[preset]).eval()
+
+
+def test_sr24k_layout_doubles_band_width_per_region() -> None:
+    layout = BandLayout(1025, REGIONS_SR24K_R5)
+    assert layout.band_counts == (24, 12, 12, 8, 6)
+    assert layout.n_bands == 62 and layout.slot_width == 4 + 8 + 16 + 32 + 64
+    widths = [r.width for r in layout.regions]
+    assert all(b == 2 * a for a, b in zip(widths, widths[1:]))
+
+
+def test_pack_slots_places_each_band_in_its_region_slot() -> None:
+    layout = BandLayout(1025, REGIONS_SR24K_R5)
+    x = torch.randn(2, 2, 3, 1025)
+    slots = layout.pack_slots(x)
+    parts = layout.pack(x)
+    assert slots.shape == (2, 2 * 124, 3, 62)
+    channel_offset = band_offset = 0
+    for part in parts:
+        rows = slice(channel_offset, channel_offset + part.shape[1])
+        cols = slice(band_offset, band_offset + part.shape[3])
+        assert torch.equal(slots[:, rows, :, cols], part)
+        outside = slots[:, rows].clone()
+        outside[..., cols] = 0
+        assert torch.count_nonzero(outside) == 0  # a region's slot is zero for every other band
+        channel_offset += part.shape[1]
+        band_offset += part.shape[3]
+
+
+def test_unpack_points_exact_for_narrow_bands_and_linear_for_wide_bands() -> None:
+    layout = BandLayout(1025, REGIONS_SR24K_R5)
+    points = torch.randn(1, 6 * 16, 2, 62)
+    bins = layout.unpack_points(points, 6, 16)
+    pts = points.reshape(1, 6, 16, 2, 62)
+    assert bins.shape == (1, 6, 2, 1025)
+    # Band 0 (W=4) and the first 16-bin band (bins 192..207, band 36) are copied exactly.
+    torch.testing.assert_close(bins[..., 0:4], pts[:, :, :4, :, 0].permute(0, 1, 3, 2))
+    torch.testing.assert_close(bins[..., 192:208], pts[:, :, :, :, 36].permute(0, 1, 3, 2))
+    # First 64-bin band (bins 640..703, band 56): end points hit the first/last point, linear in between.
+    torch.testing.assert_close(bins[..., 640], pts[:, :, 0, :, 56])
+    torch.testing.assert_close(bins[..., 703], pts[:, :, 15, :, 56])
+    pos = 21 * 15 / 63
+    lo = int(pos)
+    expected = (1 - (pos - lo)) * pts[:, :, lo, :, 56] + (pos - lo) * pts[:, :, lo + 1, :, 56]
+    torch.testing.assert_close(bins[..., 640 + 21], expected)
+    torch.testing.assert_close(bins[..., 1024], bins[..., 1023])  # Nyquist tail
+
+
+def test_slots_embedding_equals_per_region_embeddings() -> None:
+    torch.manual_seed(0)
+    regions_core = BandDualPathNPUCore(regions=REGIONS_SR24K_R5, **PRESETS["medium_noattn"]).eval()
+    slots_core = BandDualPathNPUCore(
+        regions=REGIONS_SR24K_R5, io_layout="slots", mask_points=16, **PRESETS["medium_noattn"]
+    ).eval()
+    with torch.no_grad():
+        slots_core.embed[0].weight.zero_()
+        offset = 0
+        for conv in regions_core.embed:
+            slots_core.embed[0].weight[:, offset : offset + conv.in_channels] = conv.weight
+            offset += conv.in_channels
+        slots_core.embed[0].bias.zero_()
+        region_bias = torch.cat(
+            [conv.bias.view(1, -1, 1, 1).expand(1, -1, 1, r.n_bands) for conv, r in
+             zip(regions_core.embed, regions_core.layout.regions)],
+            dim=3,
+        )
+        slots_core.band_pos.copy_(regions_core.band_pos + region_bias)
+        x = torch.randn(1, 2, 4, 1025)
+        torch.testing.assert_close(
+            slots_core._embed([slots_core.layout.pack_slots(x)]), regions_core._embed(regions_core.layout.pack(x)),
+            atol=1e-5, rtol=1e-5,
+        )
+
+
+@pytest.mark.parametrize("preset", ["medium", "medium_noattn"])
+def test_slots_streaming_matches_full_sequence_and_folding(preset: str) -> None:
+    torch.manual_seed(0)
+    model = _slots_model(preset)
+    _randomize_identity_params(model)
+    spec = torch.randn(1, 1, 1025, 16, dtype=torch.complex64) * 3
+    feats = model.host_features(spec)
+    assert len(feats) == 1 and feats[0].shape == (1, 248, 16, 62)
+    with torch.no_grad():
+        full = model.core(feats)
+        streamed = _stream(model.core, feats)
+        folded = _stream(copy.deepcopy(model.core).prepare_for_export_(), feats)
+        est = model(spec)
+    assert full[0].shape == (1, 96, 16, 62)
+    torch.testing.assert_close(streamed[0], full[0], atol=2e-5, rtol=1e-4)
+    torch.testing.assert_close(folded[0], full[0], atol=2e-5, rtol=1e-4)
+    assert est.shape == (1, 3, 1, 1025, 16)
+
+
+@pytest.mark.parametrize("preset", ["medium", "medium_noattn"])
+def test_slots_sr24k_budgets(preset: str) -> None:
+    core = _slots_model(preset).core
+    assert sum(p.numel() for p in core.parameters()) < 6_000_000
+    assert core.macs_per_frame() * FRAMES_PER_SECOND_24K / 1e9 < 3.0
+    assert core.io_size_bytes(dtype=torch.uint8)["total"] < 192 * 1024
+
+
+@pytest.mark.parametrize("preset,max_memory_ops", [("medium_noattn", 10), ("medium", 22)])
+def test_slots_export_is_three_in_three_out_without_extra_memory_ops(
+    preset: str, max_memory_ops: int, tmp_path: Path
+) -> None:
+    pytest.importorskip("onnxsim")
+    ort = pytest.importorskip("onnxruntime")
+    from tools.online.export_band_dualpath_npu import audit, export_onnx, simplify
+
+    torch.manual_seed(0)
+    model = _slots_model(preset)
+    _randomize_identity_params(model)
+    wrapper = BandDualPathNPUExportWrapper(copy.deepcopy(model.core).prepare_for_export_()).eval()
+    raw, sim = tmp_path / "model.onnx", tmp_path / "model.sim.onnx"
+    export_onnx(wrapper, raw, opset=13)
+    simplify(raw, sim)
+    report = audit(sim, 0)
+    assert report["violations"] == [] and report["forbidden_present"] == []
+    assert list(report["inputs"]) == ["spectrum", "band_state", "scene_state"]
+    assert list(report["outputs"]) == ["mask_points", "next_band_state", "next_scene_state"]
+    assert report["inputs"]["spectrum"] == [1, 248, 1, 62] and report["outputs"]["mask_points"] == [1, 96, 1, 62]
+    assert report["memory_ops"] <= max_memory_ops
+    assert "Split" not in report["ops"]  # no per-region split/concat around the embedding or heads
+
+    sess = ort.InferenceSession(str(sim), providers=["CPUExecutionProvider"])
+    inputs = wrapper.example_inputs(1)
+    with torch.no_grad():
+        ref = wrapper(*inputs)
+    got = sess.run(None, {i.name: t.numpy() for i, t in zip(sess.get_inputs(), inputs)})
+    for r, g in zip(ref, got):
+        assert abs(r.numpy() - g).max() < 1e-4
+
+
+def test_numpy_host_reference_matches_training_wrapper() -> None:
+    import numpy as np
+
+    from tools.online.band_dualpath_host_reference import HostTables, apply_masks, expand_masks, pack_frame
+
+    torch.manual_seed(0)
+    model = _slots_model()
+    tables = HostTables.build(REGIONS_SR24K_R5, mask_points=16)
+    spec = torch.randn(1, 1, 1025, 1, dtype=torch.complex64) * 2
+    np.testing.assert_allclose(
+        pack_frame(spec[0, :, :, 0].numpy(), tables), model.host_features(spec)[0].numpy(), atol=1e-5, rtol=1e-4
+    )
+    points = torch.randn(1, 96, 1, 62)
+    ref = model.apply_masks(spec, (points,))[0, ..., 0].numpy()
+    got = apply_masks(spec[0, :, :, 0].numpy(), expand_masks(points.numpy(), tables))
+    np.testing.assert_allclose(got, ref, atol=1e-4, rtol=1e-4)
