@@ -352,3 +352,76 @@ def test_numpy_host_reference_matches_training_wrapper() -> None:
     ref = model.apply_masks(spec, (points,))[0, ..., 0].numpy()
     got = apply_masks(spec[0, :, :, 0].numpy(), expand_masks(points.numpy(), tables))
     np.testing.assert_allclose(got, ref, atol=1e-4, rtol=1e-4)
+
+
+# ------------------------------------------------- 48 kHz full-band host path (12-24 kHz extension)
+
+
+def test_fullband_low_bins_match_the_model_stft() -> None:
+    import math
+
+    n = 48000 * 2
+    t = torch.arange(n, dtype=torch.float64) / 48000
+    x48 = sum(torch.sin(2 * math.pi * f * t) * a for f, a in ((220, 0.3), (1375, 0.1), (4100, 0.05), (9000, 0.03)))
+    x24 = x48[::2]
+    s48 = torch.stft(x48, 4096, 1024, window=torch.hann_window(4096, dtype=torch.float64), return_complex=True)
+    s24 = torch.stft(x24, 2048, 512, window=torch.hann_window(2048, dtype=torch.float64), return_complex=True)
+    assert s48.shape[-1] == s24.shape[-1]  # same frame timing
+    err = (s48[:1025] / 2 - s24).abs().square().sum() / s24.abs().square().sum()
+    assert err < 10 ** (-35 / 10)
+
+
+def test_highband_extension_gains_sum_to_one_and_crossfade() -> None:
+    from spectral_feature_compression.core.model.band_dualpath_fullband import FullBandConfig, extend_masks
+
+    torch.manual_seed(0)
+    cfg = FullBandConfig()
+    masks = torch.complex(torch.randn(2, 3, 1, 1025, 5), torch.randn(2, 3, 1, 1025, 5))
+    spec_lo = torch.complex(torch.randn(2, 1, 1025, 5), torch.randn(2, 1, 1025, 5))
+    full = extend_masks(masks, spec_lo, cfg)
+    assert full.shape == (2, 3, 1, 2049, 5)
+    hf = full[..., 1025:, :]
+    torch.testing.assert_close(hf.sum(dim=1).real, torch.ones_like(hf[:, 0].real))  # stems' HF adds up to mixture HF
+    assert torch.all(hf.imag == 0) and torch.all(hf.real >= 0)
+    torch.testing.assert_close(full[..., : 1025 - 64, :], masks[..., : 1025 - 64, :])  # untouched below crossfade
+    # Silent reference band -> equal split.
+    silent = extend_masks(masks, torch.zeros_like(spec_lo), cfg)
+    torch.testing.assert_close(silent[..., 1025:, :].real, torch.full_like(silent[..., 1025:, :].real, 1 / 3))
+
+
+def test_numpy_highband_extension_matches_torch_with_smoothing() -> None:
+    import numpy as np
+
+    from spectral_feature_compression.core.model.band_dualpath_fullband import FullBandConfig, extend_masks
+    from tools.online.band_dualpath_host_reference import extend_masks_frame
+
+    torch.manual_seed(0)
+    cfg = FullBandConfig(smoothing=0.7)
+    masks = torch.complex(torch.randn(1, 3, 1, 1025, 6), torch.randn(1, 3, 1, 1025, 6))
+    spec_lo = torch.complex(torch.randn(1, 1, 1025, 6), torch.randn(1, 1, 1025, 6))
+    ref = extend_masks(masks, spec_lo, cfg)[0].numpy()  # [S, M, F, T]
+    energy = None
+    for t in range(6):
+        got, energy = extend_masks_frame(
+            masks[0, ..., t].numpy(), spec_lo[0, ..., t].numpy(), smoothing=0.7, prev_energy=energy
+        )
+        np.testing.assert_allclose(got, ref[..., t], atol=1e-5, rtol=1e-4)
+
+
+def test_separate_fullband_keeps_mixture_highband_and_band_only_drops_it() -> None:
+    from spectral_feature_compression.core.model.band_dualpath_fullband import separate_fullband
+
+    torch.manual_seed(0)
+    model = _slots_model()
+    wav = torch.randn(1, 1, 48000) * 0.05
+    full, band_only = separate_fullband(model, wav)
+    assert full.shape == band_only.shape == (1, 3, 1, 48000)
+
+    def hf_energy(x: torch.Tensor) -> torch.Tensor:
+        spec = torch.fft.rfft(x, dim=-1)
+        freqs = torch.fft.rfftfreq(x.shape[-1], 1 / 48000)
+        return spec[..., freqs > 12500].abs().square().sum()
+
+    mix_hf = hf_energy(wav)
+    assert torch.isclose(hf_energy(full.sum(dim=1)), mix_hf, rtol=1e-3)
+    assert hf_energy(band_only.sum(dim=1)) < 1e-3 * mix_hf

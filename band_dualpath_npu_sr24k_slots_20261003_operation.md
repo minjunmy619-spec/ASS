@@ -136,6 +136,80 @@ python tools/online/synthetic_stem_benchmark.py --model band_dualpath_medium_noa
   --regions sr24k_r5 --io-layout slots --mask-points 16 --tag sr24k_r5_slots_p16 --steps 500 --batch 4 --seconds 1.5 --out logs/ab24k
 ```
 
+## 6b. 48 kHz TV path: host-side 12-24 kHz extension
+
+The model stays a 24 kHz model; the NPU graph is unchanged.  The host runs at
+48 kHz with **one** STFT of n_fft=4096, hop=1024.  It has the same 11.72 Hz bin
+grid and the same 21.3 ms frame timing / 85 ms periodic-Hann window as the
+model's 24 kHz 2048/512 STFT, and its bins 0-1024 equal twice the model's STFT of
+the decimated signal: measured relative error **-39.3 dB** for content below
+12 kHz.  No resampler is needed.
+
+```text
+X48 = STFT_4096/1024(x48)                              [M, 2049]
+X_lo = X48[:, 0:1025] / 2                              -> pack_frame -> NPU -> expand_masks -> M_s [S, M, 1025]
+E_s = sum_{bins 768-1023 (9-12 kHz)} |M_s X_lo|^2      (optional causal EMA, `smoothing`)
+g_s = E_s / sum_s E_s        (1/S when the reference band is silent)
+mask_s[0:961]    = M_s
+mask_s[961:1025] = linear crossfade M_s -> g_s         (64 bins = 750 Hz)
+mask_s[1025:]    = g_s                                 (12-24 kHz, real, per stem and frame)
+stem_s = iSTFT_4096/1024(mask_s * X48)
+```
+
+The high-band gains of the three stems sum to one, so the stems' 12-24 kHz
+content adds up exactly to the mixture's.  Every stem keeps its share of the
+"air" (cymbals, sibilance, effect transients) instead of losing it.
+
+Implementation:
+
+- `spectral_feature_compression/core/model/band_dualpath_fullband.py`:
+  `FullBandConfig`, `highband_gains`, `extend_masks`, `separate_fullband`
+  (offline torch reference; the causal full-sequence forward equals streaming).
+- `tools/online/band_dualpath_host_reference.py`: per-frame NumPy
+  `lowband_frame` and `extend_masks_frame` (returns the energies to carry as
+  `prev_energy` when smoothing).
+- `tools/online/band_dualpath_separate_fullband.py`: 48 kHz wav in, stem wavs out
+  (`--band-only` also writes the 12 kHz-limited stems for listening comparisons).
+- `tools/online/eval_band_dualpath_fullband.py`: synthetic 48 kHz evaluation of
+  the extension variants (section 6c).
+- `BandDualPathNPUModel.complex_masks`: shared mask decoding for training and host paths.
+
+## 6c. 48 kHz extension: synthetic evaluation
+
+`medium_noattn`, R5, `slots` P=16, trained 400 steps at 24 kHz on the synthetic
+stems (`--save-state`), evaluated on 24 held-out 3 s clips generated at 48 kHz
+(hi-hats up to 16 kHz, broadband effect transients).  Full-band SI-SDR
+improvement (dB) and SDR of the 12-24 kHz band (stems with energy there):
+
+| Variant | Full-band SI-SDRi mean | speech / music / effects | 12-24 kHz SDR music | 12-24 kHz SDR effects |
+|---|---:|---|---:|---:|
+| band only (24 kHz pipeline, nothing above 12 kHz) | 9.59 | 9.20 / 12.04 / 7.52 | -0.07 | 0.00 |
+| **extension (default)** | **9.92** | 9.20 / 12.04 / **8.52** | -0.05 | **21.07** |
+| extension, smoothing 0.7 | 9.92 | 9.20 / 12.04 / 8.52 | -0.04 | 21.03 |
+| equal split (1/3 each) | 9.65 | 9.06 / 11.88 / 8.02 | -2.60 | 3.48 |
+| oracle per-frame shares (upper bound) | 9.94 | 9.20 / 12.08 / 8.54 | 18.23 | 38.13 |
+
+- The extension recovers the effects' high band (21 dB, +1.0 dB full-band for
+  effects) and is within 0.02 dB of the oracle on the full-band mean.
+- It does not recover music above 12 kHz.  Diagnosis: in its own top band the
+  model assigns ~95% of the energy to effects (true shares in 9-12 kHz: music
+  0.14, speech 0.38, effects 0.47; model: 0.00 / 0.04 / 0.95; music SDR inside
+  9-12 kHz -0.2 dB).  The extension copies the model's top-band decision, so this
+  is the short synthetic model's weakness on noise-like hi-hats and fricatives,
+  not the extension; with correct shares (oracle) the same gain mechanism gives
+  18 dB for music.  Moving the reference band to 10.5-12 kHz or 11.25-12 kHz
+  changes nothing (music -0.05 dB, effects 20.8 dB).
+- Smoothing does not matter on these clips; keep it at 0 unless listening tests
+  show high-band flicker.
+- Fundamental limit: one real gain per stem and frame cannot separate two stems
+  that overlap above 12 kHz within the same frame.
+
+```bash
+python tools/online/synthetic_stem_benchmark.py --model band_dualpath_medium_noattn --sr 24000 --regions sr24k_r5 \
+  --io-layout slots --mask-points 16 --tag hf --steps 400 --batch 4 --seconds 1.5 --save-state --out logs/hf
+python tools/online/eval_band_dualpath_fullband.py --state logs/hf/band_dualpath_medium_noattn_hf.pt
+```
+
 ## 7. Files
 
 - `spectral_feature_compression/core/model/band_dualpath_npu.py`:
@@ -149,7 +223,7 @@ python tools/online/synthetic_stem_benchmark.py --model band_dualpath_medium_noa
 - `tools/online/synthetic_stem_benchmark.py`: `--sr`, `--regions`,
   `--io-layout`, `--mask-points`, `--tag`.
 - `recipes/dnr/models/band-dualpath-npu.{medium,medium-noattn}.sr24k.bs62r5.slots-p16.onfly.rt192k/config.yaml`
-- `tests/test_band_dualpath_npu.py`: 11 new tests (29 total).
+- `tests/test_band_dualpath_npu.py`: 15 new tests (33 total), incl. the 48 kHz path.
 
 ## 8. Commands
 
@@ -173,8 +247,9 @@ python tools/online/band_dualpath_host_reference.py --check
 
 ## 9. Notes and open items
 
-- 24 kHz stems are band-limited to 12 kHz.  If the TV path is 48 kHz, either
-  accept that or extend the R4 masks to 12-24 kHz on the host (not implemented).
+- 48 kHz TV path: handled by the host-side extension (section 6b).  The
+  extension can only split the 12-24 kHz band by power share per frame; it
+  cannot separate two stems that overlap above 12 kHz in the same frame.
 - The 85 ms analysis window raises algorithmic latency from 46 ms (44.1 kHz).
 - ONE import / optimize / quantize of the `slots` graph is still to be run on
   the WSL machine; whether ONE inserts layout transposes anywhere is visible in

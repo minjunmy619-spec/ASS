@@ -818,16 +818,19 @@ class BandDualPathNPUModel(nn.Module):
             return (self.core.layout.pack_slots(packed),)
         return self.core.layout.pack(packed)
 
-    def apply_masks(self, spec: torch.Tensor, masks: Sequence[torch.Tensor]) -> torch.Tensor:
-        """Host post-processing: complex masks (order src, mic, re/im) times the mixture STFT."""
-        bsz, n_chan, n_freq, n_frames = spec.shape
+    def complex_masks(self, masks: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Core output -> complex per-bin masks ``[B, S, M, F, T]`` (host-side mask expansion)."""
         if self.core.io_layout == "slots":
             full = self.core.layout.unpack_points(masks[0], self.core.out_channels, self.core.mask_points)
         else:
             full = self.core.layout.unpack(masks, self.core.out_channels)  # [B, S*M*2, T, F]
-        full = full.reshape(bsz, self.n_src, n_chan, 2, n_frames, n_freq).transpose(-1, -2)
-        mask = torch.complex(full[:, :, :, 0].float(), full[:, :, :, 1].float())
-        est = mask * spec.unsqueeze(1)
+        bsz, _, n_frames, n_freq = full.shape
+        full = full.reshape(bsz, self.n_src, self.n_chan, 2, n_frames, n_freq).transpose(-1, -2)
+        return torch.complex(full[:, :, :, 0].float(), full[:, :, :, 1].float())
+
+    def apply_masks(self, spec: torch.Tensor, masks: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Host post-processing: complex masks (order src, mic, re/im) times the mixture STFT."""
+        est = self.complex_masks(masks) * spec.unsqueeze(1)
         if self.mixture_consistency:
             est = est + (spec.unsqueeze(1) - est.sum(dim=1, keepdim=True)) / self.n_src
         return est

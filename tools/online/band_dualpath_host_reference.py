@@ -9,6 +9,19 @@ Per STFT frame the host does two table-driven steps around one NPU call:
    per-bin complex masks (exact copy for bands of W <= P bins, two-tap linear
    interpolation for wider bands) and apply them to the *uncompressed* frame.
 
+Full-band (48 kHz) TV path around a 24 kHz model (``lowband_frame`` /
+``extend_masks_frame``): run one 48 kHz STFT with n_fft=4096, hop=1024 (same
+11.72 Hz bins and 21.3 ms hop as the model's 24 kHz 2048/512 STFT), feed bins
+0-1024 divided by 2 to steps 1-2, then give bins 1025-2048 (12-24 kHz) real
+per-stem gains from each stem's power share in 9-12 kHz, crossfaded over the
+last 64 model bins, and run one 48 kHz iSTFT per stem::
+
+    lo = lowband_frame(X48)                      # [M, 1025]
+    pts = npu(pack_frame(lo, tables), state)     # [1, 96, 1, 62]
+    masks_lo = expand_masks(pts, tables)         # [S, M, 1025]
+    masks, energy = extend_masks_frame(masks_lo, lo, prev_energy=energy)  # [S, M, 2049]
+    stems = apply_masks(X48, masks)              # [S, M, 2049] -> iSTFT 4096/1024
+
 All index / weight tables are precomputed once by ``HostTables.build`` and are
 plain integer and float arrays, so the per-frame work is gathers and
 multiply-adds that map directly to DSP code.  ``python
@@ -126,6 +139,43 @@ def expand_masks(mask_points: np.ndarray, tables: HostTables) -> np.ndarray:
 def apply_masks(frame: np.ndarray, masks: np.ndarray) -> np.ndarray:
     """Complex frame ``[M, F]`` and masks ``[S, M, F]`` -> separated frames ``[S, M, F]``."""
     return masks * frame[None]
+
+
+def lowband_frame(frame_full: np.ndarray, *, ratio: int = 2, n_freq_model: int = 1025) -> np.ndarray:
+    """Full-rate complex frame ``[M, F_full]`` -> model-band frame ``[M, F_model]`` at the model's scale."""
+    return frame_full[:, :n_freq_model] / ratio
+
+
+def extend_masks_frame(
+    masks: np.ndarray,
+    frame_lo: np.ndarray,
+    *,
+    n_freq_full: int = 2049,
+    ref_bins: tuple[int, int] = (768, 1024),
+    crossfade_bins: int = 64,
+    smoothing: float = 0.0,
+    prev_energy: np.ndarray | None = None,
+    eps: float = 1e-10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Model masks ``[S, M, F_lo]`` -> full-band masks ``[S, M, F_full]`` and the reference energies ``[S, M]``.
+
+    Pass the returned energies back as ``prev_energy`` on the next frame when ``smoothing > 0``.
+    """
+    n_src, _, f_lo = masks.shape
+    lo, hi = ref_bins
+    energy = np.sum(np.abs(masks[:, :, lo:hi] * frame_lo[None, :, lo:hi]) ** 2, axis=-1)
+    if smoothing > 0.0 and prev_energy is not None:
+        energy = smoothing * prev_energy + (1.0 - smoothing) * energy
+    total = energy.sum(axis=0, keepdims=True)
+    gains = np.where(total > eps, energy / np.maximum(total, eps), 1.0 / n_src)  # [S, M], sums to 1 over S
+    out = np.empty((n_src, masks.shape[1], n_freq_full), dtype=np.complex64)
+    out[:, :, :f_lo] = masks
+    if crossfade_bins > 0:
+        weight = np.arange(1, crossfade_bins + 1, dtype=np.float32) / (crossfade_bins + 1)
+        tail = slice(f_lo - crossfade_bins, f_lo)
+        out[:, :, tail] = (1.0 - weight) * masks[:, :, tail] + weight * gains[..., None]
+    out[:, :, f_lo:] = gains[..., None]
+    return out, energy
 
 
 def _check() -> None:
